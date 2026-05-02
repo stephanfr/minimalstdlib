@@ -2,8 +2,8 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-TOOLS := ${HOME}/dev_tools
-THIRD_PARTY := ${HOME}/dev/third-party
+TOOLS ?= ${HOME}/dev_tools
+THIRD_PARTY ?= ${HOME}/dev/third-party
 
 # Variables for AArch64 builds follow
 # Detect host architecture for cross-compiler toolchain path

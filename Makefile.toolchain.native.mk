@@ -2,8 +2,8 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-TOOLS := ${HOME}/dev_tools
-THIRD_PARTY := ${HOME}/dev/third-party
+TOOLS ?= ${HOME}/dev_tools
+THIRD_PARTY ?= ${HOME}/dev/third-party
 
 # Detect host architecture
 
@@ -43,7 +43,7 @@ endif
 
 #	Variables for test and coverage follow
 
-CPPUTEST_PATH := $(THIRD_PARTY)/cpputest
+CPPUTEST_PATH ?= $(THIRD_PARTY)/cpputest
 
 TEST_CFLAGS := -g -DCPPUTEST_USE_STD_CPP_LIB=0 -DCPPUTEST_USE_STD_C_LIB=0 -DCHAR_BIT=8 -DCPPUTEST_HAVE_LONG_LONG_INT=0 -DCPPUTEST_USE_MEM_LEAK_DETECTION=0 -DINCLUDE_TEST_HELPERS
 TEST_CPP_FLAGS := $(TEST_CFLAGS)
