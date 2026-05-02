@@ -40,7 +40,8 @@ COVERAGE_EXE    := $(COVERAGE_OBJ_DIR)/cpputest_correctness_coverage.exe
 CDEFINES     := -D__MINIMAL_STD_TEST__
 INCLUDE_DIRS := -I. -Iinclude -Itest/shared -I$(CPPUTEST_PATH)/include $(INCLUDE_DIRS)
 
-LDLIBS   := -L../minimalclib/lib/$(NATIVE_BUILD_DIR) -lminimalclib
+MINIMALCLIB_DIR ?= ../minimalclib
+LDLIBS   := -L$(MINIMALCLIB_DIR)/lib/$(NATIVE_BUILD_DIR) -lminimalclib
 TEST_LIB := -L$(CPPUTEST_PATH)/lib -lCppUTest -lCppUTestExt
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,9 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-include ../Makefile.arm64.mk
+include Makefile.toolchain.arm64.mk
+
+MINIMALCLIB_DIR ?= ../minimalclib
 
 CPP_SRC_DIR := src
 
@@ -14,7 +16,7 @@ CPP_SRC := $(wildcard $(CPP_SRC_DIR)/*.cpp)
 CPP_OBJ := $(CPP_SRC:$(CPP_SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
 C_DEFINES := 
-INCLUDE_DIRS :=  -I../minimalclib/include -Iinclude $(INCLUDE_DIRS)
+INCLUDE_DIRS :=  -I$(MINIMALCLIB_DIR)/include -Iinclude $(INCLUDE_DIRS)
 
 
 $(LIB) : $(CPP_OBJ)
