@@ -4,8 +4,8 @@
 
 #pragma once
 
-#include <CppUTest/MemoryLeakWarningPlugin.h>
 #include <CppUTest/TestHarness.h>
+#include <CppUTest/MemoryLeakWarningPlugin.h>
 
 #include <minstdconfig.h>
 
