@@ -22,7 +22,8 @@ INCLUDE_DIRS :=  -I$(MINIMALCLIB_DIR)/include -Iinclude $(INCLUDE_DIRS)
 $(LIB) : $(CPP_OBJ)
 	$(AR) rcs $(LIB) $(CPP_OBJ)
 
-$(OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp 
+$(OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(OBJ_DIR) $(LIB_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) -c $< -o $@
 
 
