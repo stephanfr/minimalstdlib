@@ -154,27 +154,33 @@ $(COVERAGE_EXE): $(COVERAGE_LIB_OBJ) $(COVERAGE_OBJ)
 # Compile rules — correctness
 # ---------------------------------------------------------------------------
 $(CORRECTNESS_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(CORRECTNESS_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 $(CORRECTNESS_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(CORRECTNESS_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — performance
 # ---------------------------------------------------------------------------
 $(PERFORMANCE_OBJ_DIR)/%.o: $(PERFORMANCE_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 $(PERFORMANCE_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — soak
 # ---------------------------------------------------------------------------
 $(SOAK_OBJ_DIR)/%.o: $(SOAK_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(SOAK_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 $(SOAK_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(SOAK_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 # ---------------------------------------------------------------------------
@@ -190,18 +196,22 @@ $(HOST_PERF_OBJ_DIR)/%.o: $(HOST_PERF_SRC_DIR)/%.cpp
 # Compile rules — library (shared across all test binaries)
 # ---------------------------------------------------------------------------
 $(LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(LIB_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — coverage (correctness only)
 # ---------------------------------------------------------------------------
 $(COVERAGE_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(COVERAGE_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 $(COVERAGE_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(COVERAGE_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 $(COVERAGE_LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(COVERAGE_LIB_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
 
 # ---------------------------------------------------------------------------
