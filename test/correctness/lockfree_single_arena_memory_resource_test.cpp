@@ -509,7 +509,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentAllocDeallocChurn)
             //  Occasionally hold the allocation briefly
             if ((next_rng() % 8) == 0)
             {
-                for (volatile int spin = 0; spin < 10; ++spin)
+                for (int spin = 0; spin < 10; ++spin)
                 {
                 }
             }

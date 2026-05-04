@@ -50,6 +50,6 @@ TEST_CPP_FLAGS := $(TEST_CFLAGS)
 TEST_OPTIMIZATION_FLAGS := -O3
 TEST_LDFLAGS :=
 
-COVERAGE_CFLAGS := $(TEST_CFLAGS) -fprofile-arcs -ftest-coverage
+COVERAGE_CFLAGS := $(TEST_CFLAGS) -fprofile-arcs -ftest-coverage -fprofile-update=atomic -fno-inline -fno-inline-functions -fno-default-inline
 COVERAGE_CPP_FLAGS := $(COVERAGE_CFLAGS)
 COVERAGE_OPTIMIZATION_FLAGS := -O0

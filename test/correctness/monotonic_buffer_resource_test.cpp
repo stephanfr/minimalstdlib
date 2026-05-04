@@ -77,9 +77,11 @@ TEST(MonotonicBufferResourceTests, TestRelease)
     
     {
         minstd::pmr::monotonic_buffer_resource r(64, &upstream);
-        
-        r.allocate(128, 8);
-        r.allocate(256, 8);
+
+        void *alloc1 = r.allocate(128, 8);
+        void *alloc2 = r.allocate(256, 8);
+        CHECK(alloc1 != nullptr);
+        CHECK(alloc2 != nullptr);
         
         // Before release, memory is in use in upstream
         CHECK(upstream.current_bytes_allocated() > 0);

@@ -54,6 +54,55 @@ namespace
     using list_static_heap_allocator = minstd::pmr::polymorphic_allocator<test_element_list::node_type>;
     using list_monotonic_allocator = minstd::pmr::polymorphic_allocator<test_element_list::node_type>;
 
+    class poison_on_deallocate_allocator : public list_allocator
+    {
+    public:
+        static constexpr size_t max_nodes = 32;
+
+        size_t max_size() const noexcept override
+        {
+            return max_nodes;
+        }
+
+        test_element_list::node_type *allocate(size_t num_elements) override
+        {
+            if ((num_elements != 1) || (next_slot_ >= max_nodes))
+            {
+                return nullptr;
+            }
+
+            allocations_++;
+
+            return reinterpret_cast<test_element_list::node_type *>(&slots_[next_slot_++][0]);
+        }
+
+        void deallocate(test_element_list::node_type *ptr, size_t) override
+        {
+            if (ptr == nullptr)
+            {
+                return;
+            }
+
+            deallocations_++;
+        }
+
+        size_t allocations() const
+        {
+            return allocations_;
+        }
+
+        size_t deallocations() const
+        {
+            return deallocations_;
+        }
+
+    private:
+        alignas(test_element_list::node_type) unsigned char slots_[max_nodes][sizeof(test_element_list::node_type)] = {{0}};
+        size_t next_slot_ = 0;
+        size_t allocations_ = 0;
+        size_t deallocations_ = 0;
+    };
+
     void testListFunctionality(list_allocator &allocator)
     {
         test_element_list list1(allocator);
@@ -606,6 +655,25 @@ namespace
         CHECK(list1.empty());
         CHECK(list1.size() == 0);
         CHECK(list1.max_size() == heap_allocator.max_size());
+    }
+
+    TEST(ListTests, ClearDeallocatesAllNodes)
+    {
+        poison_on_deallocate_allocator allocator;
+        test_element_list list1(allocator);
+
+        list1.push_back(test_element(1));
+        list1.push_back(test_element(2));
+        list1.push_back(test_element(3));
+
+        CHECK_EQUAL(3u, allocator.allocations());
+        CHECK_EQUAL(0u, allocator.deallocations());
+
+        list1.clear();
+
+        CHECK(list1.empty());
+        CHECK_EQUAL(0u, list1.size());
+        CHECK_EQUAL(3u, allocator.deallocations());
     }
 
 }

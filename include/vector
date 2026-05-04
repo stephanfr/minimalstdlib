@@ -40,9 +40,9 @@ namespace MINIMAL_STD_NAMESPACE
         vector(allocator_type &allocator,
                size_t initial_size = INITIAL_SIZE > 0 ? INITIAL_SIZE : DEFAULT_INITIAL_SIZE)
             : allocator_(allocator),
-              begin_(allocator_.allocate(initial_size)),
+              begin_(allocator_.allocate(minstd::min(initial_size, MAX_SIZE))),
               end_(begin_),
-              current_allocated_size_(initial_size)
+              current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
         }
 
@@ -50,9 +50,9 @@ namespace MINIMAL_STD_NAMESPACE
                allocator_type &allocator,
                size_t initial_size = INITIAL_SIZE > 0 ? INITIAL_SIZE : DEFAULT_INITIAL_SIZE)
             : allocator_(allocator),
-              begin_(allocator_.allocate(initial_size)),
+                            begin_(allocator_.allocate(minstd::min(initial_size, MAX_SIZE))),
               end_(begin_),
-              current_allocated_size_(initial_size)
+                            current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
             for (const T& element : initial_values)
             {
@@ -215,12 +215,20 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr void push_back(const T &new_element)
         {
-            *end_++ = new_element;
+            if (size() >= max_size() || size() >= current_allocated_size_)
+            {
+                return;
+            }
+
+            new (end_++) T(new_element);
         }
 
         template <class... Args>
         constexpr reference &emplace_back(Args &&...args)
         {
+            MINIMAL_STD_ASSERT(size() < max_size());
+            MINIMAL_STD_ASSERT(size() < current_allocated_size_);
+
             T *new_node = new (end_++) T(minstd::forward<Args>(args)...);
 
             return *new_node;
@@ -228,12 +236,14 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr void pop_back()
         {
+            if (end_ <= begin_)
+            {
+                return;
+            }
+
             if (minstd::is_class<T>::value)
             {
-                if (end_ > begin_)
-                {
-                    (end_-- - 1)->~T();
-                }
+                (end_-- - 1)->~T();
             }
             else
             {
@@ -559,18 +569,33 @@ namespace MINIMAL_STD_NAMESPACE
         MINIMAL_STD_ASSERT((pos.current_location_ >= begin_) && (pos.current_location_ <= end_));
         MINIMAL_STD_ASSERT(size_t(end_ - begin_) < current_allocated_size_);
 
+        if (size() >= max_size() || size() >= current_allocated_size_)
+        {
+            return end();
+        }
+
         if (pos.current_location_ == end_)
         {
             push_back(value);
             return --end();
         }
 
-        memmove(pos.current_location_ + 1, pos.current_location_, reinterpret_cast<char *>(end_) - reinterpret_cast<char *>(pos.current_location_));
-        end_++;
+        T value_to_insert(value);
+        T *insert_location = pos.current_location_;
+        T *old_end = end_;
 
-        *pos.current_location_ = value;
+        new (old_end) T(minstd::move(*(old_end - 1)));
 
-        return iterator(*pos.vector_, pos.current_location_);
+        for (T *current = old_end - 1; current > insert_location; --current)
+        {
+            *current = minstd::move(*(current - 1));
+        }
+
+        *insert_location = minstd::move(value_to_insert);
+
+        end_ = old_end + 1;
+
+        return iterator(*this, insert_location);
     }
 
     template <typename T, size_t INITIAL_SIZE, size_t MAX_SIZE>
@@ -580,18 +605,33 @@ namespace MINIMAL_STD_NAMESPACE
         MINIMAL_STD_ASSERT((pos.current_location_ >= begin_) && (pos.current_location_ <= end_));
         MINIMAL_STD_ASSERT(size_t(end_ - begin_) < current_allocated_size_);
 
+        if (size() >= max_size() || size() >= current_allocated_size_)
+        {
+            return end();
+        }
+
         if (pos.current_location_ == end_)
         {
-            emplace_back(args...);
+            emplace_back(minstd::forward<Args>(args)...);
             return --end();
         }
 
-        memmove(pos.current_location_ + 1, pos.current_location_, reinterpret_cast<char *>(end_) - reinterpret_cast<char *>(pos.current_location_));
-        end_++;
+        T value_to_insert(minstd::forward<Args>(args)...);
+        T *insert_location = pos.current_location_;
+        T *old_end = end_;
 
-        new (pos.current_location_) T(minstd::forward<Args>(args)...);
+        new (old_end) T(minstd::move(*(old_end - 1)));
 
-        return iterator(*pos.vector_, pos.current_location_);
+        for (T *current = old_end - 1; current > insert_location; --current)
+        {
+            *current = minstd::move(*(current - 1));
+        }
+
+        *insert_location = minstd::move(value_to_insert);
+
+        end_ = old_end + 1;
+
+        return iterator(*this, insert_location);
     }
 
 }

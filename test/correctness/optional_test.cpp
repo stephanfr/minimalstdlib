@@ -62,6 +62,58 @@ namespace
         uint32_t value2_;
     };
 
+    class lifecycle_probe
+    {
+    public:
+        lifecycle_probe() = default;
+
+        explicit lifecycle_probe(uint32_t value)
+            : value_(value)
+        {
+            live_instances_++;
+            constructed_++;
+        }
+
+        lifecycle_probe(const lifecycle_probe &other)
+            : value_(other.value_)
+        {
+            live_instances_++;
+            constructed_++;
+        }
+
+        lifecycle_probe &operator=(const lifecycle_probe &other) = default;
+
+        ~lifecycle_probe()
+        {
+            destroyed_++;
+            live_instances_--;
+        }
+
+        static void reset_counters()
+        {
+            live_instances_ = 0;
+            constructed_ = 0;
+            destroyed_ = 0;
+        }
+
+        static int live_instances()
+        {
+            return live_instances_;
+        }
+
+        static int destroyed()
+        {
+            return destroyed_;
+        }
+
+    private:
+        uint32_t value_ = 0;
+
+        inline static int live_instances_ = 0;
+        inline static int constructed_ = 0;
+        inline static int destroyed_ = 0;
+    };
+
     TEST(OptionalTests, PrimitivesTest)
     {
         minstd::optional<uint32_t> test_uint32_t1;
@@ -201,5 +253,79 @@ namespace
         CHECK((*test_elem2).value1() == 11);
         CHECK((*test_elem2).value2() == 12);
 
+    }
+
+    TEST(OptionalTests, ResetCallsDestructor)
+    {
+        lifecycle_probe::reset_counters();
+        lifecycle_probe source(7);
+
+        {
+            minstd::optional<lifecycle_probe> opt(source);
+
+            CHECK(opt.has_value());
+            CHECK_EQUAL(2, lifecycle_probe::live_instances());
+
+            opt.reset();
+
+            CHECK(!opt.has_value());
+            CHECK_EQUAL(1, lifecycle_probe::live_instances());
+            CHECK_EQUAL(1, lifecycle_probe::destroyed());
+        }
+    }
+
+    TEST(OptionalTests, AssignFromEmptyClearsDestination)
+    {
+        lifecycle_probe::reset_counters();
+        lifecycle_probe source(1);
+
+        minstd::optional<lifecycle_probe> src_empty;
+        minstd::optional<lifecycle_probe> dst(source);
+
+        CHECK(dst.has_value());
+        CHECK_EQUAL(2, lifecycle_probe::live_instances());
+
+        dst = src_empty;
+
+        CHECK(!dst.has_value());
+        CHECK_EQUAL(1, lifecycle_probe::live_instances());
+        CHECK_EQUAL(1, lifecycle_probe::destroyed());
+    }
+
+    TEST(OptionalTests, MoveConstructorPreservesSourceEngagement)
+    {
+        minstd::optional<uint32_t> source(42);
+
+        minstd::optional<uint32_t> moved(minstd::move(source));
+
+        CHECK(moved.has_value());
+        CHECK_EQUAL(42u, moved.value());
+
+        // std::optional keeps the source engaged after move construction.
+        CHECK(source.has_value());
+    }
+
+    TEST(OptionalTests, MoveAssignmentPreservesSourceEngagement)
+    {
+        minstd::optional<uint32_t> source(77);
+        minstd::optional<uint32_t> destination;
+
+        destination = minstd::move(source);
+
+        CHECK(destination.has_value());
+        CHECK_EQUAL(77u, destination.value());
+
+        // std::optional keeps the source engaged after move assignment.
+        CHECK(source.has_value());
+    }
+
+    TEST(OptionalTests, MoveAssignmentFromEmptyClearsDestination)
+    {
+        minstd::optional<uint32_t> source;
+        minstd::optional<uint32_t> destination(13);
+
+        destination = minstd::move(source);
+
+        CHECK(!destination.has_value());
     }
 }

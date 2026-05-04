@@ -100,7 +100,7 @@ namespace
         return SKIPLIST_STRESS_ITERATIONS_PER_THREAD * static_cast<size_t>(clamped_multiplier);
     }
 
-    size_t skiplist_perf_num_arenas()
+    [[maybe_unused]] size_t skiplist_perf_num_arenas()
     {
         long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
 
