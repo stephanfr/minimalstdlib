@@ -800,7 +800,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     //  Allocate exactly in order, then deallocate the tail blocks from multiple
     //  threads to stress the frontier reclaim path (try_reclaim_frontier_blocks).
 
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  Use a single shard so pending maintenance is deterministic in this correctness test.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t NUM_THREADS = 8;
     constexpr size_t BLOCKS_PER_THREAD = 13;
@@ -874,14 +875,38 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
 
     CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
 
-    //  Trigger maintenance to drain any remaining pending deallocations
-    void *drain_ptr = resource.allocate(ALLOC_SIZE);
-    if (drain_ptr != nullptr)
+    //  Deterministically force maintenance windows after the race.
+    //  We top up pending deallocations just enough to open one window, then repeat
+    //  until pending reaches zero.
+    //  Keep threshold aligned with lockfree_single_arena_resource_with_stats template args.
+    constexpr size_t MAINTENANCE_THRESHOLD = 10;
+    constexpr size_t FLUSH_ATTEMPTS = 64;
+
+    for (size_t attempt = 0;
+         attempt < FLUSH_ATTEMPTS && resource.extended_metrics().pending_deallocations() > 0;
+         ++attempt)
     {
-        resource.deallocate(drain_ptr, ALLOC_SIZE);
+        const size_t pending = resource.extended_metrics().pending_deallocations();
+        const size_t pending_mod = pending % MAINTENANCE_THRESHOLD;
+        const size_t top_up = (pending_mod == 0)
+                                  ? MAINTENANCE_THRESHOLD
+                                  : (MAINTENANCE_THRESHOLD - pending_mod);
+
+        void *flush_ptrs[MAINTENANCE_THRESHOLD] = {nullptr};
+
+        for (size_t i = 0; i < top_up; ++i)
+        {
+            flush_ptrs[i] = resource.allocate(ALLOC_SIZE);
+            CHECK(flush_ptrs[i] != nullptr);
+        }
+
+        for (size_t i = 0; i < top_up; ++i)
+        {
+            resource.deallocate(flush_ptrs[i], ALLOC_SIZE);
+        }
     }
 
-    //  Frontier should have been reclaimed at least partially
+    CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
 
