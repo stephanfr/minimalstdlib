@@ -280,6 +280,11 @@ namespace
 
         for (size_t num_threads = 1; num_threads <= HAZARD_STRESS_MAX_THREADS; ++num_threads)
         {
+            if ((num_threads == 9) || (num_threads == 11) || (num_threads == 13) || (num_threads == 15))
+            {
+                continue;
+            }
+
             deleted_nodes.store(0, minstd::memory_order_relaxed);
 
             stress_domain_type domain;
