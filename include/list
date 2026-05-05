@@ -88,11 +88,12 @@ namespace MINIMAL_STD_NAMESPACE
             while (front_ != nullptr)
             {
                 node_type *node_to_delete = front_;
+                node_type *next_node = front_->next_;
 
                 node_to_delete->~node_type();
                 allocator_.deallocate(node_to_delete, 1);
 
-                front_ = front_->next_;
+                front_ = next_node;
             }
 
             back_ = nullptr;

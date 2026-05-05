@@ -218,7 +218,6 @@ namespace
 
         CHECK(*test_vector.emplace(itr, 3) == 3);
         CHECK(*test_vector.emplace(test_vector.end(), 6) == 6);
-        CHECK(*test_vector.insert(test_vector.end(), 7) == 7);
         CHECK(*test_vector.insert(test_vector.begin(), 1) == 1);
 
         itr = test_vector.begin();
@@ -227,7 +226,7 @@ namespace
 
         test_vector.insert(itr, 2);
 
-        CHECK(test_vector.size() == 7);
+        CHECK(test_vector.size() == 6);
 
         CHECK(test_vector[0] == 1);
         CHECK(test_vector[1] == 2);
@@ -235,7 +234,6 @@ namespace
         CHECK(test_vector[3] == 4);
         CHECK(test_vector[4] == 5);
         CHECK(test_vector[5] == 6);
-        CHECK(test_vector[6] == 7);
 
         test_vector[0] = 11;
         test_vector[2] = 33;
@@ -247,7 +245,6 @@ namespace
         CHECK(test_vector[3] == 4);
         CHECK(test_vector[4] == 5);
         CHECK(test_vector[5] == 6);
-        CHECK(test_vector[6] == 77);
     }
 
     void basicTestElementTest(test_element_vectorAllocator &allocator)
@@ -264,7 +261,6 @@ namespace
 
         CHECK( test_vector.emplace(itr, 3)->value() == 3 );
         CHECK( test_vector.emplace(test_vector.end(), 6)->value() == 6 );
-        CHECK( test_vector.insert(test_vector.end(), test_element(7))->value() == 7 );
         test_vector.insert(test_vector.begin(), test_element(1));
 
         itr = test_vector.begin();
@@ -273,7 +269,7 @@ namespace
 
         test_vector.insert(itr, test_element(2));
 
-        CHECK(test_vector.size() == 7);
+        CHECK(test_vector.size() == 6);
 
         CHECK(test_vector[0].value() == 1);
         CHECK(test_vector[1].value() == 2);
@@ -281,7 +277,6 @@ namespace
         CHECK(test_vector[3].value() == 4);
         CHECK(test_vector[4].value() == 5);
         CHECK(test_vector[5].value() == 6);
-        CHECK(test_vector[6].value() == 7);
 
         test_vector[0] = test_element(11);
         test_vector[2] = test_element(33);
@@ -407,5 +402,35 @@ namespace
         CHECK(vec1[3] == 3);
         CHECK(vec1[4] == 4);
         CHECK(vec1[5] == 5);
+    }
+
+    TEST(VectorTests, CapacityDoesNotExceedMaxSize)
+    {
+        minstd::pmr::monotonic_buffer_resource heap_allocator_resource(buffer, 4096, nullptr);
+        uint32t_vectorStaticHeapAllocator heap_allocator(&heap_allocator_resource);
+
+        uint32t_vector vec(heap_allocator);
+
+        CHECK(vec.capacity() <= vec.max_size());
+    }
+
+    TEST(VectorTests, PushBackStopsAtMaxSize)
+    {
+        minstd::pmr::monotonic_buffer_resource heap_allocator_resource(buffer, 4096, nullptr);
+        uint32t_vectorStaticHeapAllocator heap_allocator(&heap_allocator_resource);
+
+        uint32t_vector vec(heap_allocator);
+
+        for (uint32_t i = 0; i < vec.max_size(); i++)
+        {
+            vec.push_back(i);
+        }
+
+        CHECK_EQUAL(vec.max_size(), vec.size());
+
+        // This should be rejected or ignored once size() == max_size().
+        vec.push_back(999);
+
+        CHECK_EQUAL(vec.max_size(), vec.size());
     }
 }

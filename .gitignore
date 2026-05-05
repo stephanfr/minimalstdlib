@@ -7,6 +7,10 @@ test/build/
 test/coverage/
 test/stats
 
+# Coverage intermediates (gcov/lcov scratch files)
+*.gcov
+*##*.gcov
+
 # OS / editor files
 .DS_Store
 *.log

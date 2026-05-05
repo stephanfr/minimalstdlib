@@ -249,14 +249,26 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr size_t find_last_of(T ch, size_t pos = npos) const noexcept
         {
-            size_t search_start_index = (pos != npos) ? minstd::min(pos, length_) : length_;
-
-            for (int i = search_start_index; i >= 0; i--)
+            if (length_ == 0)
             {
-                if (buffer_[i] == ch)
+                return npos;
+            }
+
+            size_t search_start_index = ((pos == npos) || (pos >= length_)) ? (length_ - 1) : pos;
+
+            while (true)
+            {
+                if (buffer_[search_start_index] == ch)
                 {
-                    return i;
+                    return search_start_index;
                 }
+
+                if (search_start_index == 0)
+                {
+                    break;
+                }
+
+                search_start_index--;
             }
 
             return npos;
@@ -264,14 +276,24 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr size_t find(const T *string_to_search_for, size_t pos = 0) const
         {
-            char *location = strnstr(buffer_, string_to_search_for, length_);
+            if (pos > length_)
+            {
+                return npos;
+            }
 
-            return location == NULL ? npos : location - buffer_;
+            if (string_to_search_for[0] == 0)
+            {
+                return pos;
+            }
+
+            char *location = strnstr(buffer_ + pos, string_to_search_for, length_ - pos);
+
+            return location == NULL ? npos : static_cast<size_t>(location - buffer_);
         }
 
         constexpr size_t find(const T char_to_search_for, size_t pos = 0) const
         {
-            for (size_t i = 0; i < length_; i++)
+            for (size_t i = pos; i < length_; i++)
             {
                 if (buffer_[i] == char_to_search_for)
                 {

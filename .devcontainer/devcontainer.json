@@ -1,6 +1,7 @@
 {
     "name": "minimalstdlib",
     "image": "ghcr.io/stephanfr/aarch64-bare-metal-toolchain:13.3.rel1",
+    "postCreateCommand": "apt-get update && apt-get install -y --no-install-recommends lcov && git clone https://github.com/stephanfr/minimalclib.git ${containerWorkspaceFolder}/../minimalclib && make -C ${containerWorkspaceFolder}/../minimalclib lib native",
     "remoteEnv": {
         "TOOLS": "/opt",
         "THIRD_PARTY": "/opt",

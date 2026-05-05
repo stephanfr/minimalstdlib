@@ -39,6 +39,7 @@ COVERAGE_EXE    := $(COVERAGE_OBJ_DIR)/cpputest_correctness_coverage.exe
 # ---------------------------------------------------------------------------
 CDEFINES     := -D__MINIMAL_STD_TEST__
 INCLUDE_DIRS := -I. -Iinclude -Itest/shared -I$(CPPUTEST_PATH)/include $(INCLUDE_DIRS)
+DEPFLAGS     := -MMD -MP
 
 MINIMALCLIB_DIR ?= ../minimalclib
 LDLIBS   := -L$(MINIMALCLIB_DIR)/lib/$(NATIVE_BUILD_DIR) -lminimalclib
@@ -48,9 +49,9 @@ TEST_LIB := -L$(CPPUTEST_PATH)/lib -lCppUTest -lCppUTestExt
 # Source file lists
 # ---------------------------------------------------------------------------
 SHARED_SRC      := $(wildcard $(SHARED_SRC_DIR)/*.cpp)
-CORRECTNESS_SRC := $(wildcard $(CORRECTNESS_SRC_DIR)/*.cpp) $(SHARED_SRC)
-PERFORMANCE_SRC := $(wildcard $(PERFORMANCE_SRC_DIR)/*.cpp) $(SHARED_SRC)
-SOAK_SRC        := $(wildcard $(SOAK_SRC_DIR)/*.cpp) $(SHARED_SRC)
+ALL_CORRECTNESS_SRC := $(wildcard $(CORRECTNESS_SRC_DIR)/*.cpp)
+PERFORMANCE_SRC := $(wildcard $(PERFORMANCE_SRC_DIR)/*.cpp)
+SOAK_SRC        := $(wildcard $(SOAK_SRC_DIR)/*.cpp)
 HOST_PERF_SRC   := $(wildcard $(HOST_PERF_SRC_DIR)/*.cpp)
 
 # Library sources (compiled into every test binary)
@@ -60,9 +61,6 @@ LIB_SRC := $(CPP_SRC)
 # Object file lists — each binary gets its own object directory to avoid
 # conflicts when the same shared source is compiled with different flags.
 # ---------------------------------------------------------------------------
-CORRECTNESS_SRC_DIR := test/correctness
-SHARED_SRC_DIR      := test/shared
-ALL_CORRECTNESS_SRC := $(wildcard $(CORRECTNESS_SRC_DIR)/*.cpp)
 LOCKFREE_CORRECTNESS_SRC := \
 	$(CORRECTNESS_SRC_DIR)/lockfree_single_arena_memory_resource_test.cpp \
 	$(CORRECTNESS_SRC_DIR)/lockfree_single_arena_memory_resource_multithread_test.cpp
@@ -78,11 +76,11 @@ LOCKFREE_CORRECTNESS_OBJ := $(patsubst $(CORRECTNESS_SRC_DIR)/%.cpp,$(CORRECTNES
 	                        $(CORRECTNESS_OBJ_DIR)/cpputest_correctness_main.o \
 	                        $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(CORRECTNESS_OBJ_DIR)/shared_%.o,$(SHARED_SRC))
 PERFORMANCE_OBJ := $(patsubst $(PERFORMANCE_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR)/%.o,\
-	                  $(wildcard $(PERFORMANCE_SRC_DIR)/*.cpp)) \
+	                  $(PERFORMANCE_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR)/shared_%.o,\
 	                  $(SHARED_SRC))
 SOAK_OBJ        := $(patsubst $(SOAK_SRC_DIR)/%.cpp,$(SOAK_OBJ_DIR)/%.o,\
-	                  $(wildcard $(SOAK_SRC_DIR)/*.cpp)) \
+	                  $(SOAK_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(SOAK_OBJ_DIR)/shared_%.o,\
 	                  $(SHARED_SRC))
 HOST_PERF_OBJ   := $(patsubst $(HOST_PERF_SRC_DIR)/%.cpp,$(HOST_PERF_OBJ_DIR)/%.o,$(HOST_PERF_SRC))
@@ -90,10 +88,19 @@ HOST_PERF_OBJ   := $(patsubst $(HOST_PERF_SRC_DIR)/%.cpp,$(HOST_PERF_OBJ_DIR)/%.
 LIB_OBJ         := $(patsubst $(CPP_SRC_DIR)/%.cpp,$(LIB_OBJ_DIR)/%.o,$(LIB_SRC))
 
 COVERAGE_OBJ    := $(patsubst $(CORRECTNESS_SRC_DIR)/%.cpp,$(COVERAGE_OBJ_DIR)/%.o,\
-	                  $(wildcard $(CORRECTNESS_SRC_DIR)/*.cpp)) \
+	                  $(ALL_CORRECTNESS_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(COVERAGE_OBJ_DIR)/shared_%.o,\
 	                  $(SHARED_SRC))
 COVERAGE_LIB_OBJ := $(patsubst $(CPP_SRC_DIR)/%.cpp,$(COVERAGE_LIB_OBJ_DIR)/%.o,$(LIB_SRC))
+
+DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
+	$(LOCKFREE_CORRECTNESS_OBJ:.o=.d) \
+	$(PERFORMANCE_OBJ:.o=.d) \
+	$(SOAK_OBJ:.o=.d) \
+	$(HOST_PERF_OBJ:.o=.d) \
+	$(LIB_OBJ:.o=.d) \
+	$(COVERAGE_OBJ:.o=.d) \
+	$(COVERAGE_LIB_OBJ:.o=.d)
 
 # ---------------------------------------------------------------------------
 # Phony targets
@@ -122,11 +129,15 @@ test-coverage:
 	$(MAKE) -f Makefile.test.mk clean_test
 	$(MAKE) -f Makefile.test.mk $(COVERAGE_EXE)
 	cd $(COVERAGE_OBJ_DIR) && \
-	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . ; \
-	lcov --capture --directory . --output-file test_coverage.info ; \
-	lcov --remove test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
-	     --output-file test_coverage_filtered.info ; \
-	genhtml test_coverage_filtered.info --output-directory coverage_report
+	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . -o /tmp > /dev/null ; \
+	lcov --capture --directory . --output-file /tmp/test_coverage.info --ignore-errors mismatch,negative ; \
+	lcov --remove /tmp/test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
+	     --output-file /tmp/test_coverage_filtered.info --ignore-errors unused ; \
+	genhtml /tmp/test_coverage_filtered.info --output-directory coverage_report ; \
+	rm -f /tmp/test_coverage.info /tmp/test_coverage_filtered.info /tmp/*.gcov
+	find $(COVERAGE_OBJ_DIR) $(COVERAGE_LIB_OBJ_DIR) -name "*.o" -o -name "*.gcno" -o -name "*.gcda" | xargs rm -f
+	rm -f $(COVERAGE_EXE)
+	rm -f *.gcov *##*.gcov
 
 # ---------------------------------------------------------------------------
 # Link rules
@@ -155,33 +166,33 @@ $(COVERAGE_EXE): $(COVERAGE_LIB_OBJ) $(COVERAGE_OBJ)
 # ---------------------------------------------------------------------------
 $(CORRECTNESS_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(CORRECTNESS_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 $(CORRECTNESS_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(CORRECTNESS_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — performance
 # ---------------------------------------------------------------------------
 $(PERFORMANCE_OBJ_DIR)/%.o: $(PERFORMANCE_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 $(PERFORMANCE_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — soak
 # ---------------------------------------------------------------------------
 $(SOAK_OBJ_DIR)/%.o: $(SOAK_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(SOAK_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 $(SOAK_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(SOAK_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — host-only std performance
@@ -190,29 +201,31 @@ $(SOAK_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 # ---------------------------------------------------------------------------
 $(HOST_PERF_OBJ_DIR)/%.o: $(HOST_PERF_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(HOST_PERF_OBJ_DIR)
-	$(CC) -I. $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) -c $< -o $@
+	$(CC) -I. $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — library (shared across all test binaries)
 # ---------------------------------------------------------------------------
 $(LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(LIB_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — coverage (correctness only)
 # ---------------------------------------------------------------------------
 $(COVERAGE_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(COVERAGE_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 $(COVERAGE_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(COVERAGE_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
 $(COVERAGE_LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(COVERAGE_LIB_OBJ_DIR)
-	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) -c $< -o $@
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(COVERAGE_OPTIMIZATION_FLAGS) $(COVERAGE_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
+
+-include $(DEP_FILES)
 
 # ---------------------------------------------------------------------------
 # Clean
