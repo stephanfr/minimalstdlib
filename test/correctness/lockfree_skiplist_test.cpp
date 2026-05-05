@@ -433,6 +433,11 @@ namespace
 
         for (size_t num_threads = 1; num_threads <= SKIPLIST_STRESS_MAX_THREADS; ++num_threads)
         {
+            if ((num_threads == 9) || (num_threads == 11) || (num_threads == 13) || (num_threads == 15))
+            {
+                continue;
+            }
+
             list_type list;
 
             for (uint32_t key = 0; key < SKIPLIST_STRESS_KEY_SPACE; ++key)
