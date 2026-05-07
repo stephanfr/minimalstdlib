@@ -6,8 +6,8 @@
 
 #include "minstdconfig.h"
 
-#include <stddef.h>
 #include "type_traits"
+#include <stddef.h>
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -38,25 +38,20 @@ namespace MINIMAL_STD_NAMESPACE
             MINIMAL_STD_ASSERT(validate_pointer(ptr));
             MINIMAL_STD_ASSERT(num_elements_in_block(ptr) == num_elements);
 
-            //  If T is a class or struct type, then we want to insure we call the destructor
-
-            if (minstd::is_class<T>::value)
-            {
-                for (size_t i = 0; i < num_elements; i++)
-                {
-                    (ptr + i)->~T();
-                }
-            }
-
-            deallocate_raw_block((void*)(ptr));
+            deallocate_raw_block((void *)(ptr));
         }
 
-        virtual size_t bytes_allocated() const noexcept = 0;
-        virtual size_t blocks_allocated() const noexcept = 0;
+        virtual size_t bytes_in_use() const noexcept = 0;
+        virtual size_t blocks_in_use() const noexcept = 0;
+
+        virtual size_t bytes_reserved() const noexcept = 0;
+        virtual size_t blocks_reserved() const noexcept = 0;
 
         virtual size_t raw_block_size(const void *block) const noexcept = 0;
         virtual size_t num_elements_in_block(const void *block) const noexcept = 0;
+
         virtual bool validate_pointer(const void *block) const noexcept = 0;
+        virtual size_t actual_block_size(const void *block) const noexcept = 0;
 
     protected:
         virtual void *allocate_raw_block(size_t element_size_in_bytes, size_t num_elements) = 0;

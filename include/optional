@@ -6,10 +6,11 @@
 
 #include "minstdconfig.h"
 
+#include "new"
 #include "type_traits"
 #include <stddef.h>
 
-#include "minstd_utility.h"
+#include "utility"
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -18,42 +19,40 @@ namespace MINIMAL_STD_NAMESPACE
     class optional
     {
     public:
-        optional() : has_value_(false)
+        optional()
+            : has_value_(false),
+              dummy_(0)
         {
         }
 
-        explicit optional(optional &optional_to_copy)
-            : has_value_(optional_to_copy.has_value_)
+        explicit optional(const optional &optional_to_copy)
+            : has_value_(false),
+              dummy_(0)
         {
-            if (has_value_)
+            if (optional_to_copy.has_value_)
             {
-                new (&value_) T(optional_to_copy.value_);
+                construct_value(optional_to_copy.value_);
             }
         }
 
         explicit optional(optional &&optional_to_copy)
-            : has_value_(optional_to_copy.has_value_)
+            : has_value_(false),
+              dummy_(0)
         {
-            if (has_value_)
+            if (optional_to_copy.has_value_)
             {
-                new (&value_) T(minstd::move(optional_to_copy.value_));
-                optional_to_copy.has_value_ = false;
+                construct_value(minstd::move(optional_to_copy.value_));
             }
         }
 
         optional(const T &value)
-            : has_value_(true),
-              value_(value)
+            : has_value_(false),
+              dummy_(0)
         {
+            construct_value(value);
         }
 
-        optional(T &value)
-            : has_value_(true),
-              value_(value)
-        {
-        }
-
-        template <class... Args>
+        template <class... Args, enable_if_t<is_constructible_v<T, Args...>, int> = 0>
         explicit optional(Args &&...args)
             : has_value_(true)
         {
@@ -62,10 +61,78 @@ namespace MINIMAL_STD_NAMESPACE
 
         ~optional()
         {
+            destroy_value();
+        }
+
+        optional& operator=( const T &new_value )
+        {
             if (has_value_)
             {
-                (&value_)->~T();
+                value_ = new_value;
             }
+            else
+            {
+                construct_value(new_value);
+            }
+
+            return *this;
+        }
+
+        optional& operator=( const optional &optional_to_copy )
+        {
+            if (this == &optional_to_copy)
+            {
+                return *this;
+            }
+
+            if (optional_to_copy.has_value_)
+            {
+                if (has_value_)
+                {
+                    value_ = optional_to_copy.value_;
+                }
+                else
+                {
+                    construct_value(optional_to_copy.value_);
+                }
+            }
+            else
+            {
+                destroy_value();
+            }
+
+            return *this;
+        }
+
+        optional& operator=( optional &&optional_to_move )
+        {
+            if (this == &optional_to_move)
+            {
+                return *this;
+            }
+
+            if (optional_to_move.has_value_)
+            {
+                if (has_value_)
+                {
+                    value_ = minstd::move(optional_to_move.value_);
+                }
+                else
+                {
+                    construct_value(minstd::move(optional_to_move.value_));
+                }
+            }
+            else
+            {
+                destroy_value();
+            }
+
+            return *this;
+        }
+
+        void reset()
+        {
+            destroy_value();
         }
 
         constexpr bool has_value() const noexcept
@@ -104,6 +171,22 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
     private:
+        void destroy_value()
+        {
+            if (has_value_)
+            {
+                (&value_)->~T();
+                has_value_ = false;
+            }
+        }
+
+        template <typename U>
+        void construct_value(U &&value)
+        {
+            new (&value_) T(minstd::forward<U>(value));
+            has_value_ = true;
+        }
+
         bool has_value_;
         union
         {

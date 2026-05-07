@@ -4,9 +4,10 @@
 
 #pragma once
 
+#include "new"
 #include "allocator"
 
-#include "minstd_utility.h" //  For forward<>()
+#include "utility" //  For forward<>()
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -107,7 +108,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             front_ = front_->next_;
 
-            allocator_.deallocate(node_to_delete, 1); //  Allocator will delete the instance
+            node_to_delete->~node_type();
+            allocator_.deallocate(node_to_delete, 1);
         }
 
         iterator insert_after(const_iterator pos, const_reference value);
@@ -311,7 +313,8 @@ namespace MINIMAL_STD_NAMESPACE
 
         pos.node_->next_ = pos.node_->next_->next_;
 
-        allocator_.deallocate(node_to_delete, 1); //  Allocator will delete the instance
+        node_to_delete->~node_type();
+        allocator_.deallocate(node_to_delete, 1);
     }
 
     template <typename T>

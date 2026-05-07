@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  TOOLS: /opt
+  THIRD_PARTY: /opt
+  CPPUTEST_PATH: /opt/cpputest
+  MINIMALCLIB_DIR: /tmp/minimalclib
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/stephanfr/aarch64-bare-metal-toolchain:13.3.rel1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone and build minimalclib
+        run: |
+          git clone https://github.com/stephanfr/minimalclib.git ${{ env.MINIMALCLIB_DIR }}
+          make -C ${{ env.MINIMALCLIB_DIR }} lib
+          make -C ${{ env.MINIMALCLIB_DIR }} native
+
+      - name: Build aarch64 library
+        run: make lib
+
+      - name: Build and run correctness tests
+        run: make test-correctness
+
+      - name: Build and run performance tests
+        run: make test-performance
