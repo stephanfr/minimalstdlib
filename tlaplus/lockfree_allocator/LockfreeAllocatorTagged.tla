@@ -1,6 +1,6 @@
 ---------------------------- MODULE LockfreeAllocatorTagged ----------------------------
 (***************************************************************************)
-(* TLA+ specification of lock-free allocator with TAGGED POINTERS,         *)
+(* TLA+ specification of lock-free allocator with PACKED BLOCK STATE,      *)
 (* PER-CPU SHARDED FREE LISTS, BUMP ALLOCATOR, and METADATA RECLAMATION.   *)
 (*                                                                         *)
 (* Block states match C++ enum allocation_state exactly:                   *)
@@ -8,11 +8,11 @@
 (*   METADATA_AVAILABLE (4), LOCKED (5)                                    *)
 (*                                                                         *)
 (* PACKED BLOCK STATE (C++ block_state_):                                  *)
-(* The C++ implementation packs memory_block pointer, state, and version   *)
+(* The C++ implementation packs block offset, state, and version            *)
 (* into a single atomic<uint64_t>:                                         *)
-(*   Layout: [ptr:48][state:8][version:8] = 64 bits                        *)
+(*   Layout: [offset:48][state:4][version:12] = 64 bits                    *)
 (*                                                                         *)
-(* This allows the deallocation CAS to atomically verify BOTH the pointer  *)
+(* This allows the deallocation CAS to atomically verify block identity    *)
 (* AND state, providing stronger ABA protection. The version counter       *)
 (* increments on every state transition, preventing the ABA problem where  *)
 (* a block cycles through states and ends up back at IN_USE.               *)
@@ -42,8 +42,8 @@ CONSTANTS
 
 VARIABLES
     \* ===== BLOCK MEMORY STATE (models C++ block_state_) =====
-    \* The C++ code packs pointer + state + version into atomic<uint64_t>:
-    \*   block_state_ = [ptr:48][state:8][version:8]
+    \* The C++ code packs block-offset + state + version into atomic<uint64_t>:
+    \*   block_state_ = [offset:48][state:4][version:12]
     \* We model this as separate variables but the CAS semantics check both
     \* state AND version atomically, matching the packed CAS behavior.
     \* Note: SOFT_DELETED and METADATA_AVAILABLE apply to metadata records
@@ -397,7 +397,7 @@ StartDeallocation(cpu, block) ==
     /\ cpuInterruptsEnabled[cpu] = TRUE
     /\ blockState[block] = "IN_USE"
     \* Packed CAS(IN_USE -> LOCKED) with version increment
-    \* In C++: CAS checks packed [ptr:48][state:8][version:8] atomically
+    \* In C++: CAS checks packed [offset:48][state:4][version:12] atomically
     /\ blockState' = [blockState EXCEPT ![block] = "LOCKED"]
     /\ blockStateVersion' = [blockStateVersion EXCEPT ![block] = IncVersion(blockStateVersion[block])]
     /\ cpuDeallocState' = [cpuDeallocState EXCEPT ![cpu] = "DEALLOC_LOCKED"]

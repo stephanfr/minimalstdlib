@@ -1,6 +1,6 @@
 # TLA+ Model for Lock-Free Allocator
 
-This directory contains a TLA+ specification for formally verifying the lock-free single block memory allocator with tagged pointers for ABA protection and safe metadata reclamation.
+This directory contains a TLA+ specification for formally verifying the lock-free single block memory allocator with packed block-state versioning for ABA protection and safe metadata reclamation.
 
 ## Specification Files
 
@@ -12,7 +12,7 @@ Models the current C++ implementation with full fidelity including:
 - **Block states matching C++ enum exactly** - INVALID, IN_USE, AVAILABLE, LOCKED
 - **Metadata states** - INVALID, IN_USE, SOFT_DELETED, METADATA_AVAILABLE
 - **Bump allocator** - `nextEmptyBlock` and `nextMetadataIndex` for fresh allocation
-- **Tagged pointers** - Version counters for ABA protection on all CAS operations
+- **Packed block state** - Offset+state+version in `block_state_` for ABA protection on deallocation CAS
 - **Per-CPU sharding** - Separate free lists per CPU to reduce contention
 
 **Ownership Semantics:**
@@ -34,7 +34,7 @@ Models the current C++ implementation with full fidelity including:
 
 ## What This Model Verifies
 
-1. **No ABA Problem** - Tagged pointers prevent corrupted CAS operations
+1. **No ABA Problem** - Packed versioned CAS prevents corrupted state transitions
 2. **No Double-Free** - CAS(IN_USE -> LOCKED) ensures only one CPU can deallocate
 3. **No Concurrent Dealloc** - LOCKED state serializes deallocation attempts
 4. **Block Conservation** - INVALID + IN_USE + LOCKED + AVAILABLE = NumBlocks

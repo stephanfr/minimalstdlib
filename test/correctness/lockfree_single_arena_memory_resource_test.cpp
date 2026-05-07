@@ -910,6 +910,72 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
 
+TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPendingMaintenance)
+{
+    //  Regression guard for packed block-state transitions when metadata is
+    //  repeatedly recycled and reused across maintenance windows.
+
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
+
+    constexpr size_t BLOCKS = 10;
+    constexpr size_t ROUNDS = 20;
+    constexpr size_t MAINTENANCE_THRESHOLD = 10;
+    constexpr size_t FLUSH_ATTEMPTS = 16;
+
+    const size_t sizes[BLOCKS] = {128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+    void *ptrs[BLOCKS] = {nullptr};
+
+    for (size_t round = 0; round < ROUNDS; ++round)
+    {
+        for (size_t i = 0; i < BLOCKS; ++i)
+        {
+            size_t size = sizes[(i + round) % BLOCKS];
+            ptrs[i] = resource.allocate(size);
+            CHECK(ptrs[i] != nullptr);
+
+            auto info = resource.get_allocation_info(ptrs[i]);
+            CHECK(info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+            CHECK_EQUAL(size, info.size);
+        }
+
+        for (size_t i = BLOCKS; i > 0; --i)
+        {
+            size_t size = sizes[(i - 1 + round) % BLOCKS];
+            resource.deallocate(ptrs[i - 1], size);
+            ptrs[i - 1] = nullptr;
+        }
+
+        for (size_t attempt = 0;
+             attempt < FLUSH_ATTEMPTS && resource.extended_metrics().pending_deallocations() > 0;
+             ++attempt)
+        {
+            const size_t pending = resource.extended_metrics().pending_deallocations();
+            const size_t pending_mod = pending % MAINTENANCE_THRESHOLD;
+            const size_t top_up = (pending_mod == 0)
+                                      ? MAINTENANCE_THRESHOLD
+                                      : (MAINTENANCE_THRESHOLD - pending_mod);
+
+            void *flush_ptrs[MAINTENANCE_THRESHOLD] = {nullptr};
+
+            for (size_t i = 0; i < top_up; ++i)
+            {
+                size_t flush_size = 512 + (i * 64);
+                flush_ptrs[i] = resource.allocate(flush_size);
+                CHECK(flush_ptrs[i] != nullptr);
+            }
+
+            for (size_t i = 0; i < top_up; ++i)
+            {
+                size_t flush_size = 512 + (i * 64);
+                resource.deallocate(flush_ptrs[i], flush_size);
+            }
+        }
+
+        CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
+        CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
+    }
+}
+
 TEST(LockfreeSingleArenaMemoryResourceTests, SignalDuringDeallocation)
 {
     //  Exercise the allocator with SIGUSR1 bombing specifically during

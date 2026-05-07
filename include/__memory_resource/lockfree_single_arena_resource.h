@@ -78,7 +78,7 @@ namespace MINIMAL_STD_NAMESPACE
             struct alignas(64) block_metadata
             {
                 // 8-byte aligned fields
-                // Packed pointer + state + version: [ptr:48][state:4][version:12]
+                // Packed offset + state + version: [offset:48][state:4][version:12]
                 // This allows atomic CAS to verify both pointer AND state simultaneously
                 atomic<uint64_t> block_state_;  // 0x00, 8B
                 atomic<block_metadata *> next_; // 0x08, 8B
@@ -99,9 +99,9 @@ namespace MINIMAL_STD_NAMESPACE
                 uint8_t reserved_[30]; // 0x22, 30B
 
                 // Helper methods to access packed fields
-                block_header *get_memory_block() const
+                block_header *get_memory_block(const void *arena_base) const
                 {
-                    return block_state_ptr::unpack_ptr(block_state_.load(memory_order_acquire));
+                    return block_state_ptr::unpack_ptr(block_state_.load(memory_order_acquire), arena_base);
                 }
 
                 uint8_t get_state() const
@@ -206,6 +206,9 @@ namespace MINIMAL_STD_NAMESPACE
                 //  Allocate the per-CPU shard arrays from the start of the managed block.
                 //  Layout: [pending_shards][free_block_bins][metadata_block_managers][64-byte align][allocations...]
 
+                MINIMAL_STD_ASSERT(block_ != nullptr);
+                MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
+
                 uint8_t *current_ptr = static_cast<uint8_t *>(internal::align_pointer(block, DEFAULT_ALIGNMENT));
 
                 //  Allocate pending_shards_ array (cpu_shards_ elements)
@@ -293,65 +296,90 @@ namespace MINIMAL_STD_NAMESPACE
             using metadata_tag = lockfree::tagged_ptr<block_metadata, uint16_t>;
             using block_tag = lockfree::tagged_ptr<block_header, uint16_t>;
 
-            // Packed pointer + state + version for atomic state transitions
-            // Layout: [ptr:48][state:4][version:12] = 64 bits
-            // This allows atomic CAS to verify both pointer AND state simultaneously,
-            // providing stronger guarantees against ABA issues during deallocation.
+            // Packed block offset + state + version for atomic state transitions.
+            // Layout: [offset:48][state:4][version:12] = 64 bits.
+            // Offsets are relative to block_ and avoid canonical-address assumptions.
             struct block_state_ptr
             {
                 using pointer = block_header *;
                 using storage_type = uint64_t;
 
-                static constexpr int PTR_BITS = 48;
+                static constexpr int OFFSET_BITS = 48;
                 static constexpr int STATE_BITS = 4;
                 static constexpr int VERSION_BITS = 12;
 
-                static constexpr storage_type PTR_MASK = (1ULL << PTR_BITS) - 1;
+                static_assert(OFFSET_BITS + STATE_BITS + VERSION_BITS == 64,
+                              "block_state_ptr bit allocation must sum to 64");
+
+                static constexpr storage_type OFFSET_MASK = (1ULL << OFFSET_BITS) - 1;
                 static constexpr storage_type STATE_MASK = (1ULL << STATE_BITS) - 1;
                 static constexpr storage_type VERSION_MASK = (1ULL << VERSION_BITS) - 1;
+                static constexpr storage_type NULL_OFFSET = OFFSET_MASK;
 
-                static constexpr storage_type pack(pointer ptr, uint8_t state, uint16_t version = 0)
+                static storage_type pack(pointer ptr, const void *arena_base, uint8_t state, uint16_t version = 0)
                 {
-                    return (static_cast<storage_type>(reinterpret_cast<uintptr_t>(ptr)) & PTR_MASK) | ((static_cast<storage_type>(state) & STATE_MASK) << PTR_BITS) | ((static_cast<storage_type>(version) & VERSION_MASK) << (PTR_BITS + STATE_BITS));
+                    storage_type offset = encode_offset(ptr, arena_base);
+                    return (offset & OFFSET_MASK) | ((static_cast<storage_type>(state) & STATE_MASK) << OFFSET_BITS) | ((static_cast<storage_type>(version) & VERSION_MASK) << (OFFSET_BITS + STATE_BITS));
                 }
 
-                static constexpr pointer unpack_ptr(storage_type value)
+                static pointer unpack_ptr(storage_type value, const void *arena_base)
                 {
-                    uintptr_t raw = static_cast<uintptr_t>(value & PTR_MASK);
-// Sign-extend from bit 47 for AArch64 canonical addresses
-#ifndef __MINIMAL_STD_TEST__
-                    if (raw & (1ULL << 47))
+                    storage_type offset = value & OFFSET_MASK;
+
+                    if (offset == NULL_OFFSET)
                     {
-                        raw |= ~PTR_MASK;
+                        return nullptr;
                     }
-#endif
-                    return reinterpret_cast<pointer>(raw);
+
+                    uintptr_t base = reinterpret_cast<uintptr_t>(arena_base);
+                    return reinterpret_cast<pointer>(base + static_cast<uintptr_t>(offset));
                 }
 
                 static constexpr uint8_t unpack_state(storage_type value)
                 {
-                    return static_cast<uint8_t>((value >> PTR_BITS) & STATE_MASK);
+                    return static_cast<uint8_t>((value >> OFFSET_BITS) & STATE_MASK);
                 }
 
                 static constexpr uint16_t unpack_version(storage_type value)
                 {
-                    return static_cast<uint16_t>((value >> (PTR_BITS + STATE_BITS)) & VERSION_MASK);
+                    return static_cast<uint16_t>((value >> (OFFSET_BITS + STATE_BITS)) & VERSION_MASK);
                 }
 
                 static constexpr storage_type with_state(storage_type value, uint8_t state)
                 {
-                    return (value & ~(STATE_MASK << PTR_BITS)) | ((static_cast<storage_type>(state) & STATE_MASK) << PTR_BITS);
+                    return (value & ~(STATE_MASK << OFFSET_BITS)) | ((static_cast<storage_type>(state) & STATE_MASK) << OFFSET_BITS);
                 }
 
                 static constexpr storage_type increment_version(storage_type value)
                 {
                     uint16_t new_version = static_cast<uint16_t>(unpack_version(value) + 1);
-                    return (value & ~(VERSION_MASK << (PTR_BITS + STATE_BITS))) | ((static_cast<storage_type>(new_version) & VERSION_MASK) << (PTR_BITS + STATE_BITS));
+                    return (value & ~(VERSION_MASK << (OFFSET_BITS + STATE_BITS))) | ((static_cast<storage_type>(new_version) & VERSION_MASK) << (OFFSET_BITS + STATE_BITS));
                 }
 
                 static constexpr storage_type with_state_and_increment_version(storage_type value, uint8_t state)
                 {
                     return increment_version(with_state(value, state));
+                }
+
+            private:
+                static storage_type encode_offset(pointer ptr, const void *arena_base)
+                {
+                    if (ptr == nullptr)
+                    {
+                        return NULL_OFFSET;
+                    }
+
+                    uintptr_t base = reinterpret_cast<uintptr_t>(arena_base);
+                    uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
+
+                    MINIMAL_STD_ASSERT(raw >= base);
+
+                    uintptr_t offset = raw - base;
+
+                    MINIMAL_STD_ASSERT(offset < NULL_OFFSET);
+                    MINIMAL_STD_ASSERT((offset % alignof(block_header)) == 0);
+
+                    return static_cast<storage_type>(offset);
                 }
             };
 
@@ -614,7 +642,7 @@ namespace MINIMAL_STD_NAMESPACE
                 uint16_t new_version = static_cast<uint16_t>(block_state_ptr::unpack_version(current));
 
                 metadata.block_state_.store(
-                    block_state_ptr::pack(nullptr, METADATA_AVAILABLE, new_version),
+                    block_state_ptr::pack(nullptr, block_, METADATA_AVAILABLE, new_version),
                     memory_order_release);
 
                 uint32_t metadata_index = metadata_to_index(&metadata);
@@ -659,7 +687,7 @@ namespace MINIMAL_STD_NAMESPACE
                             continue;
                         }
 
-                        block_header *memory_block = block_state_ptr::unpack_ptr(block_state);
+                        block_header *memory_block = block_state_ptr::unpack_ptr(block_state, block_);
                         block_header *expected_frontier_position = reinterpret_cast<block_header *>(
                             reinterpret_cast<uint8_t *>(memory_block) + metadata->total_size_);
 
@@ -691,7 +719,7 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    block_header *memory_block = block_state_ptr::unpack_ptr(candidate_state);
+                    block_header *memory_block = block_state_ptr::unpack_ptr(candidate_state, block_);
                     uint64_t new_frontier_tag = block_tag::pack(
                         memory_block,
                         static_cast<uint16_t>(block_tag::unpack_counter(frontier_tag) + 1));
@@ -835,7 +863,7 @@ namespace MINIMAL_STD_NAMESPACE
                         memory_order_release);
 
                     auto free_block_bin = free_block_bin_index(metadata->total_size_);
-                    auto addr_bin = address_bin_for(metadata->get_memory_block());
+                    auto addr_bin = address_bin_for(metadata->get_memory_block(block_));
                     auto target_shard = metadata->original_shard_ % cpu_shards_;
                     size_t bin_index = free_block_bin * cpu_shards_ + target_shard;
 
@@ -1071,7 +1099,7 @@ namespace MINIMAL_STD_NAMESPACE
                 uint16_t version = block_state_ptr::unpack_version(metadata->block_state_.load(memory_order_relaxed));
                 // Set pointer and state atomically in a single store
                 metadata->block_state_.store(
-                    block_state_ptr::pack(free_block, IN_USE, version),
+                    block_state_ptr::pack(free_block, block_, IN_USE, version),
                     memory_order_release);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -1127,7 +1155,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     uint64_t current_block_state = block_to_deallocate->block_state_.load(memory_order_acquire);
                     uint8_t current_state = block_state_ptr::unpack_state(current_block_state);
-                    block_header *current_block = block_state_ptr::unpack_ptr(current_block_state);
+                    block_header *current_block = block_state_ptr::unpack_ptr(current_block_state, block_);
 
                     if ((current_state != IN_USE) || (current_block != &header))
                     {
@@ -1238,7 +1266,7 @@ namespace MINIMAL_STD_NAMESPACE
                     //  Verify the metadata actually points back to this block
                     uint64_t block_state = meta->block_state_.load(memory_order_acquire);
 
-                    if (block_state_ptr::unpack_ptr(block_state) != prev)
+                    if (block_state_ptr::unpack_ptr(block_state, block_) != prev)
                     {
                         return reclaimed_any; // Stale metadata — pointer doesn't match
                     }
@@ -1576,7 +1604,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         //  CAS AVAILABLE -> LOCKED succeeded — we own the block.
                         //  Caller will either reuse this metadata record directly or recycle it.
-                        return {claimed_head->get_memory_block(), claimed_head};
+                        return {claimed_head->get_memory_block(block_), claimed_head};
                     }
 
                     // We completed a full scan of all bins/shards and found no blocks.
