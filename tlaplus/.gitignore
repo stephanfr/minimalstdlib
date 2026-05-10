@@ -5,5 +5,9 @@ states/
 # TLC tool jar
 /tla2tools.jar
 
+# TLC counter-example trace artifacts
+**/TTrace_*.tla
+**/TTrace_*.bin
+
 # OS files
 .DS_Store
