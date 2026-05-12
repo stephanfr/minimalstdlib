@@ -27,6 +27,7 @@ namespace std {
         static constexpr uint32_t max() { return 4294967295U; }
     };
     template <> struct numeric_limits<size_t> {
+        static constexpr size_t min() { return 0; }
         static constexpr size_t max() { return (size_t)(~0ULL); }
     };
 }

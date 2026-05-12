@@ -6,36 +6,53 @@
 
 #include "minstdconfig.h"
 
-#include "__random/engine.h"
-
 #include <atomic>
+#include <limits>
 
 namespace MINIMAL_STD_NAMESPACE
 {
+    //
+    //  Lock-free low-quality XOR-shift PRNG.
+    //
+    //  Satisfies uniform_random_bit_generator.  Thread-safe via an atomic CAS loop.
+    //  Suitable for use cases that require low overhead and can tolerate reduced
+    //  statistical quality (e.g. backoff jitter, load-balancing, non-cryptographic
+    //  sampling).  Not suitable where high statistical quality is required.
+    //
 
-    class fast_lockfree_low_quality_rng : public RandomNumberGeneratorEngine<uint64_t>
+    class fast_lockfree_low_quality_rng
     {
-    private :
-
-        static constexpr uint64_t DEFAULT_SEED = 88172645463325252ULL;
-
-        static uint64_t default_seed_provider()
-        {
-            return DEFAULT_SEED;
-        }
-
     public:
-        explicit fast_lockfree_low_quality_rng(seed_provider_type seed_provider = default_seed_provider)
-            : rng_state_(resolve_seed(seed_provider, DEFAULT_SEED))
+        using result_type = uint64_t;
+
+        static constexpr result_type min() noexcept
+        {
+            return std::numeric_limits<result_type>::min();
+        }
+
+        static constexpr result_type max() noexcept
+        {
+            return std::numeric_limits<result_type>::max();
+        }
+
+        //  Default constructor — uses built-in default seed.
+        fast_lockfree_low_quality_rng() noexcept
+            : rng_state_(DEFAULT_SEED)
         {
         }
 
-        explicit fast_lockfree_low_quality_rng(uint64_t seed)
+        explicit fast_lockfree_low_quality_rng(uint64_t seed) noexcept
             : rng_state_(seed == 0 ? DEFAULT_SEED : seed)
         {
         }
 
-        result_type operator()() override
+        //  Re-seed.  A zero seed is replaced by the default.
+        void seed(uint64_t s) noexcept
+        {
+            rng_state_.store(s == 0 ? DEFAULT_SEED : s, memory_order_relaxed);
+        }
+
+        result_type operator()()
         {
             uint64_t initial_state = rng_state_.load(memory_order_relaxed);
             uint64_t next_value;
@@ -53,7 +70,7 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 retries++;
-                
+
                 next_value = initial_state;
                 next_value ^= next_value << 13;
                 next_value ^= next_value >> 7;
@@ -63,7 +80,7 @@ namespace MINIMAL_STD_NAMESPACE
             return next_value;
         }
 
-        void discard(unsigned long long z) override
+        void discard(unsigned long long z)
         {
             for (unsigned long long i = 0; i < z; ++i)
             {
@@ -71,8 +88,19 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
-    private :
+        bool operator==(const fast_lockfree_low_quality_rng &other) const noexcept
+        {
+            return rng_state_.load(memory_order_relaxed) == other.rng_state_.load(memory_order_relaxed);
+        }
 
-        atomic<uint64_t> rng_state_ = DEFAULT_SEED;
+        bool operator!=(const fast_lockfree_low_quality_rng &other) const noexcept
+        {
+            return !(*this == other);
+        }
+
+    private:
+        static constexpr uint64_t DEFAULT_SEED = 88172645463325252ULL;
+
+        atomic<uint64_t> rng_state_;
     };
 }

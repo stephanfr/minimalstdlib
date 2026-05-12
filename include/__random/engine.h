@@ -6,46 +6,18 @@
 
 #include "minstdconfig.h"
 
-#include <limits>
-#include <__type_traits/is_arithmetic.h>
+#include <__concepts/same_as.h>
 
 namespace MINIMAL_STD_NAMESPACE
 {
-    template <typename RESULT_TYPE>
-        requires is_arithmetic_v<RESULT_TYPE>
-    class RandomNumberGeneratorEngine
-    {
-        public :
+    template <typename Generator>
+    concept uniform_random_bit_generator =
+        requires(Generator gen) {
+            typename Generator::result_type;
+            { Generator::min() } -> same_as<typename Generator::result_type>;
+            { Generator::max() } -> same_as<typename Generator::result_type>;
+            { gen() } -> same_as<typename Generator::result_type>;
+        } &&
+        Generator::min() < Generator::max();
 
-        using result_type = RESULT_TYPE;
-        using seed_provider_type = result_type (*)();
-
-        static constexpr result_type min(void)
-        {
-            return std::numeric_limits<result_type>::min();
-        }
-
-        static constexpr result_type max(void)
-        {
-            return std::numeric_limits<result_type>::max();
-        }
-
-        protected:
-
-        static constexpr result_type resolve_seed(seed_provider_type seed_provider, result_type default_seed)
-        {
-            if (seed_provider == nullptr)
-            {
-                return default_seed;
-            }
-
-            const result_type provided_seed = seed_provider();
-            return provided_seed == 0 ? default_seed : provided_seed;
-        }
-
-        public:
-
-        virtual result_type operator()() = 0;
-        virtual void discard(unsigned long long z) = 0;
-    };
 } // namespace MINIMAL_STD_NAMESPACE

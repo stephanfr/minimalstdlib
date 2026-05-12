@@ -100,7 +100,7 @@ namespace
     {
         allocator_thread_arguments *args = static_cast<allocator_thread_arguments *>(arguments);
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         minstd::array<size_t, NUM_ALLOCATIONS_PER_THREAD> sizes;
         minstd::array<bool, NUM_ALLOCATIONS_PER_THREAD> deallocate_operation;

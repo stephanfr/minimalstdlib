@@ -58,7 +58,7 @@ namespace
     {
         auto *args = static_cast<skiplist_soak_peaky_worker_args *>(arg);
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(100, args->thread_id_ + 1000));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(100, args->thread_id_ + 1000));
 
         args->ready_count_->fetch_add(1, minstd::memory_order_release);
         while (!args->start_->load(minstd::memory_order_acquire))
