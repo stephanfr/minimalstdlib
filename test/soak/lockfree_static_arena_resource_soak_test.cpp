@@ -45,7 +45,7 @@ namespace
             // wait
         }
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
         
         constexpr size_t MAX_LIVE_ALLOCS = 1000;
         minstd::array<void*, MAX_LIVE_ALLOCS> live_allocs = {nullptr};

@@ -215,7 +215,7 @@ namespace
     static void *soak_worker_thread(void *arg)
     {
         auto *args = static_cast<soak_thread_args *>(arg);
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         constexpr size_t MAX_LIVE = 4000;
         void *pointers[MAX_LIVE]{};
@@ -507,7 +507,7 @@ TEST(LockfreeSingleArenaMemoryResourceSoakTests, SoakTest)
         base_seed += time(nullptr);
     }
 
-    printf("\nRunning Allocator SoakTest for %zu seconds (Base Seed: %llu)...\n", SOAK_DURATION_SEC, (unsigned long long)base_seed);
+    printf("\nRunning Allocator SoakTest for %zu seconds (Base seed_type: %llu)...\n", SOAK_DURATION_SEC, (unsigned long long)base_seed);
 
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, minstd::pmr::test::os_abstractions::get_cpu_count());
     const size_t initial_frontier = resource.extended_metrics().frontier_offset();
@@ -566,7 +566,7 @@ TEST(LockfreeSingleArenaMemoryResourceSoakTests, SoakTest)
         fflush(stdout);
     }
 
-    minstd::Xoroshiro128PlusPlusRNG main_rng(minstd::Xoroshiro128PlusPlusRNG::Seed(123456789ULL ^ base_seed, base_seed));
+    minstd::xoroshiro128_plus_plus main_rng(minstd::xoroshiro128_plus_plus::seed_type(123456789ULL ^ base_seed, base_seed));
     int main_phase = 0;
     int main_cycle_count = 0;
     bool main_shared_mode = true;

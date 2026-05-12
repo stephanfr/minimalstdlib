@@ -37,7 +37,7 @@ namespace
     constexpr size_t NUM_ALLOCATIONS_PER_THREAD = 2000;
     constexpr size_t MAX_ALLOCATION_SIZE = 16384;
 
-    size_t lognormal_sample(minstd::Xoroshiro128PlusPlusRNG &rng)
+    size_t lognormal_sample(minstd::xoroshiro128_plus_plus &rng)
     {
         double u1, u2;
         do
@@ -92,7 +92,7 @@ namespace
     {
         allocator_thread_arguments *args = static_cast<allocator_thread_arguments *>(arguments);
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         while (!start_allocations)
         {

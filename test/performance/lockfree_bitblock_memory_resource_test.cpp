@@ -68,7 +68,7 @@ namespace
     constexpr size_t NUM_PERF_ALLOCATIONS_PER_THREAD = 2000;
     constexpr size_t MAX_ALLOCATION_SIZE = 1000;
 
-    size_t lognormal_sample(minstd::Xoroshiro128PlusPlusRNG &rng)
+    size_t lognormal_sample(minstd::xoroshiro128_plus_plus &rng)
     {
         double u1, u2;
         do
@@ -95,7 +95,7 @@ namespace
     {
         allocator_thread_arguments *args = static_cast<allocator_thread_arguments *>(arguments);
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         minstd::array<size_t, NUM_ELEMENTS_IN_MULTITHREAD_TEST> sizes;
 
@@ -156,7 +156,7 @@ namespace
     {
         perf_thread_arguments *args = static_cast<perf_thread_arguments *>(arguments);
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         while (!start_allocations)
         {
@@ -297,7 +297,7 @@ namespace
             static_cast<minstd::pmr::memory_resource *>(&upstream_resource),
             get_number_of_arenas());
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(123, 456));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(123, 456));
 
         size_t total_bytes_allocated = 0;
         size_t total_allocations = 0;
@@ -330,7 +330,7 @@ namespace
 
         minstd::pmr::malloc_free_wrapper_memory_resource malloc_free_resource(static_cast<minstd::pmr::memory_resource *>(&upstream_resource));
 
-        minstd::Xoroshiro128PlusPlusRNG rng1(minstd::Xoroshiro128PlusPlusRNG::Seed(123, 456));
+        minstd::xoroshiro128_plus_plus rng1(minstd::xoroshiro128_plus_plus::seed_type(123, 456));
 
         start = clock();
 
@@ -643,7 +643,7 @@ namespace
             {
                 minstd::pmr::single_block_resource resource(buffer, BUFFER_SIZE);
 
-                minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(100, 1000));
+                minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(100, 1000));
 
                 constexpr size_t NUM_ALLOCATIONS = 5000;
 

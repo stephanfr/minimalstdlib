@@ -33,7 +33,7 @@ TEST(SingleBlockMemoryResourcePerformanceTests, Benchmark)
 {
     minstd::pmr::single_block_resource resource(buffer, buffer_size);
 
-    minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(100, 1000));
+    minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(100, 1000));
 
     constexpr size_t NUM_ALLOCATIONS = 5000;
 

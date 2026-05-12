@@ -49,7 +49,7 @@ namespace
             // wait
         }
 
-        minstd::Xoroshiro128PlusPlusRNG rng(minstd::Xoroshiro128PlusPlusRNG::Seed(args->rng_seed, args->rng_seed * 10));
+        minstd::xoroshiro128_plus_plus rng(minstd::xoroshiro128_plus_plus::seed_type(args->rng_seed, args->rng_seed * 10));
 
         for (size_t i = 0; i < PERF_ALLOCATIONS_PER_THREAD; i++)
         {

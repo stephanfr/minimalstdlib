@@ -4,6 +4,9 @@
 
 #pragma once
 
-#include "__random/xoroshiro128PlusPlus.h"
+#include "__random/engine.h"
+#include "__random/random_device.h"
+#include "__random/xoroshiro128_plus_plus.h"
 #include "__random/fast_lockfree_low_quality_rng.h"
 #include "__random/fast_single_threaded_low_quality_rng.h"
+#include "__random/uniform_int_distribution.h"
