@@ -19,7 +19,7 @@ namespace MINIMAL_STD_NAMESPACE
         class hazard_pointer_domain
         {
         private:
-            static constexpr size_t INVALID_SLOT_INDEX = std::numeric_limits<size_t>::max();
+            static constexpr size_t INVALID_SLOT_INDEX = numeric_limits<size_t>::max();
 
             using pointer_type = T *;
             using deleter_type = void (*)(pointer_type);

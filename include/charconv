@@ -1,0 +1,200 @@
+// Copyright 2024 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+// Freestanding implementation of <charconv> (integer from_chars only).
+//
+// Conforms to the C++17/20 specification:
+//   std::from_chars_result from_chars(const char* first, const char* last,
+//                                     T& value, int base = 10)
+// for all standard signed and unsigned integer types.
+//
+// Floating-point from_chars is NOT implemented (requires locale/errno/libm).
+
+#include "minstdconfig.h"
+#include <stdint.h>
+#include <stddef.h>
+#include "limits"
+#include "type_traits"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    // -----------------------------------------------------------------------
+    // errc — minimal subset, mirrors <system_error> values used by charconv
+    // -----------------------------------------------------------------------
+    enum class errc : int
+    {
+        // success — no error
+        value_too_large   = 75,   // EOVERFLOW
+        invalid_argument  = 22,   // EINVAL
+    };
+
+    // -----------------------------------------------------------------------
+    // from_chars_result
+    // -----------------------------------------------------------------------
+    struct from_chars_result
+    {
+        const char *ptr;  // points past the last character consumed, or first on error
+        errc        ec;   // errc{} (zero) on success
+
+        // C++26 equality; useful in tests
+        friend bool operator==(const from_chars_result &, const from_chars_result &) = default;
+
+        explicit operator bool() const noexcept { return ec == errc{}; }
+    };
+
+    // -----------------------------------------------------------------------
+    // Implementation detail — not part of the public API
+    // -----------------------------------------------------------------------
+    namespace __detail
+    {
+        // digit value for a character in the given base; returns -1 if invalid
+        constexpr int digit_value(char c, int base) noexcept
+        {
+            int d;
+            if (c >= '0' && c <= '9')      d = c - '0';
+            else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+            else                           return -1;
+            return d < base ? d : -1;
+        }
+
+        // Core implementation for unsigned integer types.
+        // Returns from_chars_result; value is written to *out only on success.
+        template <typename U>
+        from_chars_result from_chars_unsigned(const char *first, const char *last,
+                                              U &out, int base) noexcept
+        {
+            static_assert(!numeric_limits<U>::is_signed, "unsigned only");
+
+            if (first == last)
+                return {first, errc::invalid_argument};
+
+            const U max_val = numeric_limits<U>::max();
+            const U max_div = max_val / static_cast<U>(base);
+            const U max_mod = max_val % static_cast<U>(base);
+
+            const char *p = first;
+            bool        any = false;
+            U           val = 0;
+
+            while (p != last)
+            {
+                int d = digit_value(*p, base);
+                if (d < 0) break;
+
+                U ud = static_cast<U>(d);
+
+                // overflow check: val * base + ud > max_val
+                if (val > max_div || (val == max_div && ud > max_mod))
+                    return {first, errc::value_too_large};
+
+                val = val * static_cast<U>(base) + ud;
+                any = true;
+                ++p;
+            }
+
+            if (!any)
+                return {first, errc::invalid_argument};
+
+            out = val;
+            return {p, errc{}};
+        }
+
+        // Core implementation for signed integer types.
+        template <typename S>
+        from_chars_result from_chars_signed(const char *first, const char *last,
+                                            S &out, int base) noexcept
+        {
+            static_assert(numeric_limits<S>::is_signed, "signed only");
+
+            using U = typename make_unsigned<S>::type;
+
+            if (first == last)
+                return {first, errc::invalid_argument};
+
+            const bool negative = (*first == '-');
+            const char *p = negative ? first + 1 : first;
+
+            // Compute unsigned magnitude limit for this sign.
+            // For negative: limit is -min (which is max+1 as unsigned).
+            // For positive: limit is max.
+            const U pos_max = static_cast<U>(numeric_limits<S>::max());
+            const U limit   = negative
+                                  ? pos_max + U(1)   // -INT_MIN as unsigned
+                                  : pos_max;
+
+            const U base_u   = static_cast<U>(base);
+            const U max_div  = limit / base_u;
+            const U max_mod  = limit % base_u;
+
+            U   val = 0;
+            bool any = false;
+
+            while (p != last)
+            {
+                int d = digit_value(*p, base);
+                if (d < 0) break;
+
+                U ud = static_cast<U>(d);
+
+                if (val > max_div || (val == max_div && ud > max_mod))
+                    return {first, errc::value_too_large};
+
+                val = val * base_u + ud;
+                any = true;
+                ++p;
+            }
+
+            if (!any || (negative && p == first + 1))
+                return {first, errc::invalid_argument};
+
+            out = negative
+                      ? static_cast<S>(~val + U(1))   // two's-complement negate
+                      : static_cast<S>(val);
+
+            return {p, errc{}};
+        }
+    } // namespace __detail
+
+    // -----------------------------------------------------------------------
+    // Public API — from_chars for integer types
+    // -----------------------------------------------------------------------
+
+    // Unsigned overloads
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        uint8_t &value, int base = 10) noexcept
+    { return __detail::from_chars_unsigned(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        uint16_t &value, int base = 10) noexcept
+    { return __detail::from_chars_unsigned(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        uint32_t &value, int base = 10) noexcept
+    { return __detail::from_chars_unsigned(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        uint64_t &value, int base = 10) noexcept
+    { return __detail::from_chars_unsigned(first, last, value, base); }
+
+    // Signed overloads
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        int8_t &value, int base = 10) noexcept
+    { return __detail::from_chars_signed(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        int16_t &value, int base = 10) noexcept
+    { return __detail::from_chars_signed(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        int32_t &value, int base = 10) noexcept
+    { return __detail::from_chars_signed(first, last, value, base); }
+
+    inline from_chars_result from_chars(const char *first, const char *last,
+                                        int64_t &value, int base = 10) noexcept
+    { return __detail::from_chars_signed(first, last, value, base); }
+
+} // namespace MINIMAL_STD_NAMESPACE

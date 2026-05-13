@@ -54,20 +54,20 @@ namespace MINIMAL_STD_NAMESPACE
                 requires is_same_v<_Dp, decay_t<_Up>> && is_floating_point_v<_Dp>
             _MINIMAL_STD_HIDDEN static constexpr strong_ordering __go(_Tp &&__t, _Up &&__u, __priority_tag<1>) noexcept
             {
-                if constexpr (std::numeric_limits<_Dp>::is_iec559 && sizeof(_Dp) == sizeof(int32_t))
+                if constexpr (numeric_limits<_Dp>::is_iec559 && sizeof(_Dp) == sizeof(int32_t))
                 {
                     int32_t __rx = bit_cast<int32_t>(__t);
                     int32_t __ry = bit_cast<int32_t>(__u);
-                    __rx = (__rx < 0) ? (std::numeric_limits<int32_t>::min() - __rx - 1) : __rx;
-                    __ry = (__ry < 0) ? (std::numeric_limits<int32_t>::min() - __ry - 1) : __ry;
+                    __rx = (__rx < 0) ? (numeric_limits<int32_t>::min() - __rx - 1) : __rx;
+                    __ry = (__ry < 0) ? (numeric_limits<int32_t>::min() - __ry - 1) : __ry;
                     return (__rx <=> __ry);
                 }
-                else if constexpr (std::numeric_limits<_Dp>::is_iec559 && sizeof(_Dp) == sizeof(int64_t))
+                else if constexpr (numeric_limits<_Dp>::is_iec559 && sizeof(_Dp) == sizeof(int64_t))
                 {
                     int64_t __rx = bit_cast<int64_t>(__t);
                     int64_t __ry = bit_cast<int64_t>(__u);
-                    __rx = (__rx < 0) ? (std::numeric_limits<int64_t>::min() - __rx - 1) : __rx;
-                    __ry = (__ry < 0) ? (std::numeric_limits<int64_t>::min() - __ry - 1) : __ry;
+                    __rx = (__rx < 0) ? (numeric_limits<int64_t>::min() - __rx - 1) : __rx;
+                    __ry = (__ry < 0) ? (numeric_limits<int64_t>::min() - __ry - 1) : __ry;
                     return (__rx <=> __ry);
                 }
                 else if (__t < __u)
@@ -80,7 +80,7 @@ namespace MINIMAL_STD_NAMESPACE
                 }
                 else if (__t == __u)
                 {
-                    if constexpr (std::numeric_limits<_Dp>::radix == 2)
+                    if constexpr (numeric_limits<_Dp>::radix == 2)
                     {
                         return __math::signbit(__u) <=> __math::signbit(__t);
                     }

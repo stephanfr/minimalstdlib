@@ -25,12 +25,12 @@ namespace MINIMAL_STD_NAMESPACE
 
         static constexpr result_type min() noexcept
         {
-            return std::numeric_limits<result_type>::min();
+            return numeric_limits<result_type>::min();
         }
 
         static constexpr result_type max() noexcept
         {
-            return std::numeric_limits<result_type>::max();
+            return numeric_limits<result_type>::max();
         }
 
         //  Default constructor — uses built-in default seed.
