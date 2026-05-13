@@ -34,7 +34,7 @@ namespace MINIMAL_STD_NAMESPACE
             using distribution_type = uniform_int_distribution;
 
             explicit param_type(result_type a = 0,
-                                result_type b = std::numeric_limits<result_type>::max()) noexcept
+                                result_type b = numeric_limits<result_type>::max()) noexcept
                 : a_(a), b_(b)
             {
             }
@@ -58,12 +58,12 @@ namespace MINIMAL_STD_NAMESPACE
         };
 
         uniform_int_distribution() noexcept
-            : param_(0, std::numeric_limits<result_type>::max())
+            : param_(0, numeric_limits<result_type>::max())
         {
         }
 
         explicit uniform_int_distribution(result_type a,
-                                          result_type b = std::numeric_limits<result_type>::max()) noexcept
+                                          result_type b = numeric_limits<result_type>::max()) noexcept
             : param_(a, b)
         {
         }

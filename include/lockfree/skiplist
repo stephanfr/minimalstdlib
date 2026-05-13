@@ -990,14 +990,14 @@ namespace MINIMAL_STD_NAMESPACE
                 active_instance_count_.fetch_add(1, memory_order_relaxed);
                 forward_link_type::set_block_memory_resource(memory_resource_);
 
-                NIL_ = allocate_skip_node(std::numeric_limits<KeyType>::max(), MAX_LEVELS + 1, nullptr);
+                NIL_ = allocate_skip_node(numeric_limits<KeyType>::max(), MAX_LEVELS + 1, nullptr);
 
                 if (NIL_ == nullptr)
                 {
                     return;
                 }
 
-                head_ = allocate_skip_node(std::numeric_limits<KeyType>::min(), MAX_LEVELS + 1, NIL_);
+                head_ = allocate_skip_node(numeric_limits<KeyType>::min(), MAX_LEVELS + 1, NIL_);
 
                 if (head_ == nullptr)
                 {
@@ -1579,7 +1579,7 @@ namespace MINIMAL_STD_NAMESPACE
                 uint32_t size = 0;
                 bool node_is_tombstoned = false;
 
-                while (current_node->key != std::numeric_limits<KeyType>::max())
+                while (current_node->key != numeric_limits<KeyType>::max())
                 {
                     current_node->next_node[0].get(node_is_tombstoned);
 

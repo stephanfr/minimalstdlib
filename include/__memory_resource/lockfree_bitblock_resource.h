@@ -277,7 +277,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             static size_t bytes_with_header(size_t num_bytes) noexcept
             {
-                if (num_bytes > (std::numeric_limits<size_t>::max() - HEADER_SIZE))
+                if (num_bytes > (numeric_limits<size_t>::max() - HEADER_SIZE))
                 {
                     return 0;
                 }
