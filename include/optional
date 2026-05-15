@@ -14,6 +14,12 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
+    struct nullopt_t
+    {
+        explicit constexpr nullopt_t(int) noexcept {}
+    };
+
+    inline constexpr nullopt_t nullopt{0};
 
     template <typename T>
     class optional
@@ -25,7 +31,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
         }
 
-        explicit optional(const optional &optional_to_copy)
+        optional(const optional &optional_to_copy)
             : has_value_(false),
               dummy_(0)
         {
@@ -35,7 +41,7 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
-        explicit optional(optional &&optional_to_copy)
+        optional(optional &&optional_to_copy)
             : has_value_(false),
               dummy_(0)
         {
@@ -43,6 +49,12 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 construct_value(minstd::move(optional_to_copy.value_));
             }
+        }
+
+        optional(nullopt_t) noexcept
+            : has_value_(false),
+              dummy_(0)
+        {
         }
 
         optional(const T &value)
@@ -75,6 +87,12 @@ namespace MINIMAL_STD_NAMESPACE
                 construct_value(new_value);
             }
 
+            return *this;
+        }
+
+        optional& operator=(nullopt_t) noexcept
+        {
+            reset();
             return *this;
         }
 
@@ -135,6 +153,25 @@ namespace MINIMAL_STD_NAMESPACE
             destroy_value();
         }
 
+        template <class... Args>
+        T &emplace(Args &&...args)
+        {
+            destroy_value();
+            new (&value_) T(minstd::forward<Args>(args)...);
+            has_value_ = true;
+            return value_;
+        }
+
+        template <typename U>
+        T value_or(U &&default_value) const
+        {
+            if (has_value_)
+            {
+                return value_;
+            }
+            return static_cast<T>(minstd::forward<U>(default_value));
+        }
+
         constexpr bool has_value() const noexcept
         {
             return has_value_;
@@ -162,11 +199,19 @@ namespace MINIMAL_STD_NAMESPACE
 
         T &value()
         {
+            if (!has_value_)
+            {
+                __builtin_trap();
+            }
             return value_;
         }
 
         const T &value() const
         {
+            if (!has_value_)
+            {
+                __builtin_trap();
+            }
             return value_;
         }
 
@@ -194,5 +239,73 @@ namespace MINIMAL_STD_NAMESPACE
             T value_;
         };
     };
+
+    template <typename T>
+    bool operator==(const optional<T> &lhs, const optional<T> &rhs)
+    {
+        if (lhs.has_value() != rhs.has_value())
+        {
+            return false;
+        }
+        if (!lhs.has_value())
+        {
+            return true;
+        }
+        return *lhs == *rhs;
+    }
+
+    template <typename T>
+    bool operator!=(const optional<T> &lhs, const optional<T> &rhs)
+    {
+        return !(lhs == rhs);
+    }
+
+    template <typename T>
+    bool operator==(const optional<T> &lhs, const T &rhs)
+    {
+        return lhs.has_value() && *lhs == rhs;
+    }
+
+    template <typename T>
+    bool operator!=(const optional<T> &lhs, const T &rhs)
+    {
+        return !(lhs == rhs);
+    }
+
+    template <typename T>
+    bool operator==(const T &lhs, const optional<T> &rhs)
+    {
+        return rhs.has_value() && lhs == *rhs;
+    }
+
+    template <typename T>
+    bool operator!=(const T &lhs, const optional<T> &rhs)
+    {
+        return !(lhs == rhs);
+    }
+
+    template <typename T>
+    bool operator==(const optional<T> &lhs, nullopt_t) noexcept
+    {
+        return !lhs.has_value();
+    }
+
+    template <typename T>
+    bool operator!=(const optional<T> &lhs, nullopt_t) noexcept
+    {
+        return lhs.has_value();
+    }
+
+    template <typename T>
+    bool operator==(nullopt_t, const optional<T> &rhs) noexcept
+    {
+        return !rhs.has_value();
+    }
+
+    template <typename T>
+    bool operator!=(nullopt_t, const optional<T> &rhs) noexcept
+    {
+        return rhs.has_value();
+    }
 
 }
