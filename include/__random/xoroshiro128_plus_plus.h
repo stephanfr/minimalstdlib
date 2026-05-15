@@ -7,6 +7,7 @@
 #include "minstdconfig.h"
 
 #include <limits>
+#include "__random/engine.h"
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -48,6 +49,14 @@ namespace MINIMAL_STD_NAMESPACE
             return numeric_limits<result_type>::max();
         }
 
+        //  SeedSequence constructor — seeds the engine from a SeedSequence.
+        //  Generates four 32-bit words and assembles them into the 128-bit state.
+        template <seed_sequence SeedSeq>
+        explicit xoroshiro128_plus_plus(SeedSeq &seq) noexcept
+        {
+            seed(seq);
+        }
+
         //  Default constructor — uses built-in default seed.
         xoroshiro128_plus_plus() noexcept
             : state_(DEFAULT_SEED_LOW, DEFAULT_SEED_HIGH)
@@ -69,6 +78,19 @@ namespace MINIMAL_STD_NAMESPACE
         xoroshiro128_plus_plus(const xoroshiro128_plus_plus &) = default;
         xoroshiro128_plus_plus &operator=(const xoroshiro128_plus_plus &) = default;
 
+        //  Re-seed from a SeedSequence.  Generates four 32-bit words and assembles
+        //  them into the 128-bit state.  Guards against the all-zero state.
+        template <seed_sequence SeedSeq>
+        void seed(SeedSeq &seq) noexcept
+        {
+            uint_least32_t s[4];
+            seq.generate(s, s + 4);
+            state_.low  = (uint64_t(s[0]) << 32) | uint64_t(s[1]);
+            state_.high = (uint64_t(s[2]) << 32) | uint64_t(s[3]);
+            if (state_.low == 0u && state_.high == 0u)
+                state_ = seed_type(DEFAULT_SEED_LOW, DEFAULT_SEED_HIGH);
+        }
+
         //  Re-seed from a single 64-bit value.  A zero seed is replaced by the default.
         void seed(uint64_t s) noexcept
         {
@@ -80,6 +102,11 @@ namespace MINIMAL_STD_NAMESPACE
         {
             state_ = s;
         }
+
+        //  Returns the current engine state as a seed_type.  Combined with the
+        //  seed_type constructor or seed(const seed_type&), this provides full
+        //  state save/restore (the embedded equivalent of streaming).
+        seed_type state() const noexcept { return state_; }
 
         result_type operator()() noexcept
         {
