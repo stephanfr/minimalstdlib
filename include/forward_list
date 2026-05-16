@@ -86,13 +86,27 @@ namespace MINIMAL_STD_NAMESPACE
 
         void push_front(const_reference value)
         {
-            front_ = new (allocator_.allocate(1)) node_type(front_, value);
+            node_type *new_node_storage = allocator_.allocate(1);
+
+            if (new_node_storage == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+            }
+
+            front_ = new (new_node_storage) node_type(front_, value);
         }
 
         template <class... Args>
         reference &emplace_front(Args &&...args)
         {
-            front_ = new (allocator_.allocate(1)) node_type(front_, minstd::forward<Args>(args)...);
+            node_type *new_node_storage = allocator_.allocate(1);
+
+            if (new_node_storage == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+            }
+
+            front_ = new (new_node_storage) node_type(front_, minstd::forward<Args>(args)...);
 
             return front_->element_;
         }
@@ -279,7 +293,14 @@ namespace MINIMAL_STD_NAMESPACE
     {
         MINIMAL_STD_ASSERT(pos.node_ != nullptr); //  Neither begin() nor end() are legal
 
-        node_type *new_node = new (allocator_.allocate(1)) node_type(pos.node_->next_, value);
+        node_type *new_node_storage = allocator_.allocate(1);
+
+        if (new_node_storage == nullptr)
+        {
+            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+        }
+
+        node_type *new_node = new (new_node_storage) node_type(pos.node_->next_, value);
 
         pos.node_->next_ = new_node;
 
@@ -292,7 +313,14 @@ namespace MINIMAL_STD_NAMESPACE
     {
         MINIMAL_STD_ASSERT(pos.node_ != nullptr);
 
-        node_type *new_node = new (allocator_.allocate(1)) node_type(pos.node_->next_, minstd::forward<Args>(args)...);
+        node_type *new_node_storage = allocator_.allocate(1);
+
+        if (new_node_storage == nullptr)
+        {
+            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+        }
+
+        node_type *new_node = new (new_node_storage) node_type(pos.node_->next_, minstd::forward<Args>(args)...);
 
         pos.node_->next_ = new_node;
 

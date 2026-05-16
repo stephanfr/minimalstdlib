@@ -44,6 +44,10 @@ namespace MINIMAL_STD_NAMESPACE
               end_(begin_),
               current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
+            if (current_allocated_size_ != 0 && begin_ == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+            }
         }
 
         vector(const ::std::initializer_list<T>&  initial_values,
@@ -54,6 +58,11 @@ namespace MINIMAL_STD_NAMESPACE
               end_(begin_),
                             current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
+            if (current_allocated_size_ != 0 && begin_ == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+            }
+
             for (const T& element : initial_values)
             {
                 emplace_back(element);
@@ -94,6 +103,11 @@ namespace MINIMAL_STD_NAMESPACE
 
                 begin_ = allocator_.allocate(minstd::min( other.size(), MAX_SIZE));
                 current_allocated_size_ = minstd::min( other.size(), MAX_SIZE);
+
+                if (current_allocated_size_ != 0 && begin_ == nullptr)
+                {
+                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+                }
             }
 
             for (const T& element : other)

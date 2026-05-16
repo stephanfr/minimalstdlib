@@ -348,7 +348,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if (new_node_block == nullptr)
                 {
-                    return nullptr;
+                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type), return nullptr);
                 }
 
                 size_++;

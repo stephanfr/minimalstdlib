@@ -36,6 +36,10 @@ namespace MINIMAL_STD_NAMESPACE
               read_index_(0),
               write_index_(0)
         {
+            if (size_ != 0 && elements_ == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(value_type) * size_, alignof(value_type));
+            }
         }
 
         spsc_queue(const spsc_queue &) = delete;

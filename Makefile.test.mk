@@ -8,6 +8,7 @@ include Makefile.native.mk
 # Source directories
 # ---------------------------------------------------------------------------
 CORRECTNESS_SRC_DIR := test/correctness
+FAILURE_MODE_SRC_DIR := test/failure_modes
 PERFORMANCE_SRC_DIR := test/performance
 HOST_PERF_SRC_DIR   := test/performance_host
 SOAK_SRC_DIR        := test/soak
@@ -17,6 +18,7 @@ SHARED_SRC_DIR      := test/shared
 # Build/output directories
 # ---------------------------------------------------------------------------
 CORRECTNESS_OBJ_DIR := test/build/correctness
+FAILURE_MODE_OBJ_DIR := test/build/failure_modes
 PERFORMANCE_OBJ_DIR := test/build/performance
 HOST_PERF_OBJ_DIR   := test/build/performance_host
 SOAK_OBJ_DIR        := test/build/soak
@@ -29,6 +31,7 @@ COVERAGE_LIB_OBJ_DIR := test/coverage/lib
 # ---------------------------------------------------------------------------
 CORRECTNESS_EXE := $(CORRECTNESS_OBJ_DIR)/cpputest_correctness.exe
 LOCKFREE_CORRECTNESS_EXE := $(CORRECTNESS_OBJ_DIR)/cpputest_lockfree_correctness.exe
+FAILURE_MODE_EXE := $(FAILURE_MODE_OBJ_DIR)/cpputest_failure_modes.exe
 PERFORMANCE_EXE := $(PERFORMANCE_OBJ_DIR)/cpputest_performance.exe
 HOST_PERF_EXE   := $(HOST_PERF_OBJ_DIR)/std_containers_perf.exe
 SOAK_EXE        := $(SOAK_OBJ_DIR)/cpputest_soak.exe
@@ -38,6 +41,7 @@ COVERAGE_EXE    := $(COVERAGE_OBJ_DIR)/cpputest_correctness_coverage.exe
 # Compiler / flag settings
 # ---------------------------------------------------------------------------
 CDEFINES     := -D__MINIMAL_STD_TEST__
+FAILURE_MODE_DEFINES := $(CDEFINES) -DMINIMAL_STD_FAILURE_POLICY=MINIMAL_STD_FAILURE_POLICY_TEST -DMINIMAL_STD_ALLOCATION_FAILURE_POLICY=MINIMAL_STD_ALLOCATION_FAILURE_POLICY_TRAP
 INCLUDE_DIRS := -I. -Iinclude -Itest/shared -I$(CPPUTEST_PATH)/include $(INCLUDE_DIRS)
 DEPFLAGS     := -MMD -MP
 
@@ -50,6 +54,7 @@ TEST_LIB := -L$(CPPUTEST_PATH)/lib -lCppUTest -lCppUTestExt
 # ---------------------------------------------------------------------------
 SHARED_SRC      := $(wildcard $(SHARED_SRC_DIR)/*.cpp)
 ALL_CORRECTNESS_SRC := $(wildcard $(CORRECTNESS_SRC_DIR)/*.cpp)
+FAILURE_MODE_SRC := $(wildcard $(FAILURE_MODE_SRC_DIR)/*.cpp)
 PERFORMANCE_SRC := $(wildcard $(PERFORMANCE_SRC_DIR)/*.cpp)
 SOAK_SRC        := $(wildcard $(SOAK_SRC_DIR)/*.cpp)
 HOST_PERF_SRC   := $(wildcard $(HOST_PERF_SRC_DIR)/*.cpp)
@@ -75,6 +80,8 @@ LOCKFREE_CORRECTNESS_OBJ := $(patsubst $(CORRECTNESS_SRC_DIR)/%.cpp,$(CORRECTNES
 	                          $(LOCKFREE_CORRECTNESS_SRC)) \
 	                        $(CORRECTNESS_OBJ_DIR)/cpputest_correctness_main.o \
 	                        $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(CORRECTNESS_OBJ_DIR)/shared_%.o,$(SHARED_SRC))
+FAILURE_MODE_OBJ := $(patsubst $(FAILURE_MODE_SRC_DIR)/%.cpp,$(FAILURE_MODE_OBJ_DIR)/%.o,\
+	                  $(FAILURE_MODE_SRC))
 PERFORMANCE_OBJ := $(patsubst $(PERFORMANCE_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR)/%.o,\
 	                  $(PERFORMANCE_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR)/shared_%.o,\
@@ -95,6 +102,7 @@ COVERAGE_LIB_OBJ := $(patsubst $(CPP_SRC_DIR)/%.cpp,$(COVERAGE_LIB_OBJ_DIR)/%.o,
 
 DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 	$(LOCKFREE_CORRECTNESS_OBJ:.o=.d) \
+	$(FAILURE_MODE_OBJ:.o=.d) \
 	$(PERFORMANCE_OBJ:.o=.d) \
 	$(SOAK_OBJ:.o=.d) \
 	$(HOST_PERF_OBJ:.o=.d) \
@@ -105,7 +113,7 @@ DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 # ---------------------------------------------------------------------------
 # Phony targets
 # ---------------------------------------------------------------------------
-.PHONY: test test-correctness test-performance test-performance-host-std test-soak test-coverage clean_test
+.PHONY: test test-correctness test-failure-modes test-performance test-performance-host-std test-soak test-coverage clean_test
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
@@ -115,6 +123,9 @@ test: test-correctness test-performance test-soak
 test-correctness: lib $(CORRECTNESS_EXE) $(LOCKFREE_CORRECTNESS_EXE)
 	./$(CORRECTNESS_EXE)
 	./$(LOCKFREE_CORRECTNESS_EXE)
+
+test-failure-modes: lib $(FAILURE_MODE_EXE)
+	./$(FAILURE_MODE_EXE)
 
 test-performance: lib $(PERFORMANCE_EXE)
 	./$(PERFORMANCE_EXE)
@@ -148,6 +159,9 @@ $(CORRECTNESS_EXE): $(LIB_OBJ) $(CORRECTNESS_OBJ)
 $(LOCKFREE_CORRECTNESS_EXE): $(LIB_OBJ) $(LOCKFREE_CORRECTNESS_OBJ)
 	$(LD) $(TEST_LDFLAGS) $(LIB_OBJ) $(LOCKFREE_CORRECTNESS_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
 
+$(FAILURE_MODE_EXE): $(LIB_OBJ) $(FAILURE_MODE_OBJ)
+	$(LD) $(TEST_LDFLAGS) $(LIB_OBJ) $(FAILURE_MODE_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
+
 $(PERFORMANCE_EXE): $(LIB_OBJ) $(PERFORMANCE_OBJ)
 	$(LD) $(TEST_LDFLAGS) $(LIB_OBJ) $(PERFORMANCE_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
 
@@ -171,6 +185,13 @@ $(CORRECTNESS_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
 $(CORRECTNESS_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(CORRECTNESS_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# Compile rules — failure modes
+# ---------------------------------------------------------------------------
+$(FAILURE_MODE_OBJ_DIR)/%.o: $(FAILURE_MODE_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(FAILURE_MODE_OBJ_DIR)
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(FAILURE_MODE_DEFINES) $(DEPFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — performance
@@ -233,6 +254,7 @@ $(COVERAGE_LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
 clean_test:
 	/bin/rm -rf test/build test/coverage > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(CORRECTNESS_OBJ_DIR) > /dev/null 2> /dev/null || true
+	/bin/mkdir -p $(FAILURE_MODE_OBJ_DIR) > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(PERFORMANCE_OBJ_DIR) > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(HOST_PERF_OBJ_DIR) > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(SOAK_OBJ_DIR) > /dev/null 2> /dev/null || true

@@ -201,7 +201,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (!has_value_)
             {
-                __builtin_trap();
+                minstd::invalid_optional_access(__FILE__, __LINE__);
             }
             return value_;
         }
@@ -210,7 +210,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (!has_value_)
             {
-                __builtin_trap();
+                minstd::invalid_optional_access(__FILE__, __LINE__);
             }
             return value_;
         }
