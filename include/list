@@ -5,6 +5,7 @@
 #pragma once
 
 #include "allocator"
+#include "allocator_traits"
 
 #include "utility" //  For forward<>()
 
@@ -57,6 +58,7 @@ namespace MINIMAL_STD_NAMESPACE
         using const_pointer = const T *;
         using node_type = node;
         using allocator_type = allocator<node_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         class iterator;
         friend class iterator;
@@ -90,8 +92,8 @@ namespace MINIMAL_STD_NAMESPACE
                 node_type *node_to_delete = front_;
                 node_type *next_node = front_->next_;
 
-                node_to_delete->~node_type();
-                allocator_.deallocate(node_to_delete, 1);
+                allocator_traits_type::destroy(allocator_, node_to_delete);
+                allocator_traits_type::deallocate(allocator_, node_to_delete, 1);
 
                 front_ = next_node;
             }
@@ -113,7 +115,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         [[nodiscard]] size_t max_size() const noexcept
         {
-            return allocator_.max_size();
+            return allocator_traits_type::max_size(allocator_);
         }
 
         [[nodiscard]] reference front()
@@ -138,14 +140,15 @@ namespace MINIMAL_STD_NAMESPACE
 
         void push_front(const_reference value)
         {
-            node_type *new_node_storage = allocator_.allocate(1);
+            node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
             if (new_node_storage == nullptr)
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
             }
 
-            node_type *new_node = new (new_node_storage) node_type(front_, nullptr, value);
+            allocator_traits_type::construct(allocator_, new_node_storage, front_, nullptr, value);
+            node_type *new_node = new_node_storage;
 
             if (front_ != nullptr)
             {
@@ -165,14 +168,15 @@ namespace MINIMAL_STD_NAMESPACE
         template <class... Args>
         reference &emplace_front(Args &&...args)
         {
-            node_type *new_node_storage = allocator_.allocate(1);
+            node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
             if (new_node_storage == nullptr)
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
             }
 
-            node_type *new_node = new (new_node_storage) node_type(front_, nullptr, minstd::forward<Args>(args)...);
+            allocator_traits_type::construct(allocator_, new_node_storage, front_, nullptr, minstd::forward<Args>(args)...);
+            node_type *new_node = new_node_storage;
 
             if (front_ != nullptr)
             {
@@ -193,14 +197,15 @@ namespace MINIMAL_STD_NAMESPACE
 
         void push_back(const_reference value)
         {
-            node_type *new_node_storage = allocator_.allocate(1);
+            node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
             if (new_node_storage == nullptr)
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
             }
 
-            node_type *new_node = new (new_node_storage) node_type(nullptr, back_, value);
+            allocator_traits_type::construct(allocator_, new_node_storage, nullptr, back_, value);
+            node_type *new_node = new_node_storage;
 
             if (back_ != nullptr)
             {
@@ -225,14 +230,15 @@ namespace MINIMAL_STD_NAMESPACE
         template <class... Args>
         reference &emplace_back(Args &&...args)
         {
-            node_type *new_node_storage = allocator_.allocate(1);
+            node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
             if (new_node_storage == nullptr)
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
             }
 
-            node_type *new_node = new (new_node_storage) node_type(nullptr, back_, minstd::forward<Args>(args)...);
+            allocator_traits_type::construct(allocator_, new_node_storage, nullptr, back_, minstd::forward<Args>(args)...);
+            node_type *new_node = new_node_storage;
 
             if (back_ != nullptr)
             {
@@ -276,8 +282,8 @@ namespace MINIMAL_STD_NAMESPACE
                 back_ = nullptr;
             }
 
-            node_to_delete->~node_type();
-            allocator_.deallocate(node_to_delete, 1);
+            allocator_traits_type::destroy(allocator_, node_to_delete);
+            allocator_traits_type::deallocate(allocator_, node_to_delete, 1);
 
             size_--;
         }
@@ -302,8 +308,8 @@ namespace MINIMAL_STD_NAMESPACE
                 front_ = nullptr;
             }
 
-            node_to_delete->~node_type();
-            allocator_.deallocate(node_to_delete, 1);
+            allocator_traits_type::destroy(allocator_, node_to_delete);
+            allocator_traits_type::deallocate(allocator_, node_to_delete, 1);
 
             size_--;
         }
@@ -324,7 +330,7 @@ namespace MINIMAL_STD_NAMESPACE
         void erase_after(const_iterator pos);
 
     private:
-        allocator<node_type> &allocator_;
+        allocator_type &allocator_;
 
         node_type *front_;
         node_type *back_;
@@ -638,14 +644,15 @@ namespace MINIMAL_STD_NAMESPACE
     {
         MINIMAL_STD_ASSERT(pos.node_ != nullptr);
 
-        node_type *new_node_storage = allocator_.allocate(1);
+        node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
         if (new_node_storage == nullptr)
         {
             MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
         }
 
-        node_type *new_node = new (new_node_storage) node_type(pos.node_->next_, pos.node_, value);
+        allocator_traits_type::construct(allocator_, new_node_storage, pos.node_->next_, pos.node_, value);
+        node_type *new_node = new_node_storage;
 
         pos.node_->next_ = new_node;
 
@@ -669,14 +676,15 @@ namespace MINIMAL_STD_NAMESPACE
     {
         MINIMAL_STD_ASSERT(pos.node_ != nullptr); //  Neither begin() nor end() are legal
 
-        node_type *new_node_storage = allocator_.allocate(1);
+        node_type *new_node_storage = allocator_traits_type::allocate(allocator_, 1);
 
         if (new_node_storage == nullptr)
         {
             MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
         }
 
-        node_type *new_node = new (new_node_storage) node_type(pos.node_->next_, pos.node_, minstd::forward<Args>(args)...);
+        allocator_traits_type::construct(allocator_, new_node_storage, pos.node_->next_, pos.node_, minstd::forward<Args>(args)...);
+        node_type *new_node = new_node_storage;
 
         pos.node_->next_ = new_node;
 
@@ -719,8 +727,8 @@ namespace MINIMAL_STD_NAMESPACE
             back_ = pos.node_->prev_;
         }
 
-        node_to_delete->~node_type();
-        allocator_.deallocate(node_to_delete, 1);
+        allocator_traits_type::destroy(allocator_, node_to_delete);
+        allocator_traits_type::deallocate(allocator_, node_to_delete, 1);
 
         size_--;
     }
@@ -748,8 +756,8 @@ namespace MINIMAL_STD_NAMESPACE
             back_ = pos.node_;
         }
 
-        node_to_delete->~node_type();
-        allocator_.deallocate(node_to_delete, 1);
+        allocator_traits_type::destroy(allocator_, node_to_delete);
+        allocator_traits_type::deallocate(allocator_, node_to_delete, 1);
 
         size_--;
     }

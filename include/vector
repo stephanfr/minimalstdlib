@@ -13,6 +13,7 @@
 #include "initializer_list"
 
 #include "allocator"
+#include "allocator_traits"
 #include "type_traits"
 
 #define DEFAULT_INITIAL_SIZE 12
@@ -30,6 +31,7 @@ namespace MINIMAL_STD_NAMESPACE
         using const_pointer = const T *;
         using element_type = T;
         using allocator_type = allocator<element_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         class iterator;
         friend class iterator;
@@ -40,7 +42,7 @@ namespace MINIMAL_STD_NAMESPACE
         vector(allocator_type &allocator,
                size_t initial_size = INITIAL_SIZE > 0 ? INITIAL_SIZE : DEFAULT_INITIAL_SIZE)
             : allocator_(allocator),
-              begin_(allocator_.allocate(minstd::min(initial_size, MAX_SIZE))),
+              begin_(allocator_traits_type::allocate(allocator_, minstd::min(initial_size, MAX_SIZE))),
               end_(begin_),
               current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
@@ -54,7 +56,7 @@ namespace MINIMAL_STD_NAMESPACE
                allocator_type &allocator,
                size_t initial_size = INITIAL_SIZE > 0 ? INITIAL_SIZE : DEFAULT_INITIAL_SIZE)
             : allocator_(allocator),
-                            begin_(allocator_.allocate(minstd::min(initial_size, MAX_SIZE))),
+                                     begin_(allocator_traits_type::allocate(allocator_, minstd::min(initial_size, MAX_SIZE))),
               end_(begin_),
                             current_allocated_size_(minstd::min(initial_size, MAX_SIZE))
         {
@@ -80,11 +82,11 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 for (T *current_element = begin_; current_element < end_; current_element++)
                 {
-                    current_element->~T();
+                    allocator_traits_type::destroy(allocator_, current_element);
                 }
             }
 
-            allocator_.deallocate(begin_, current_allocated_size_);
+            allocator_traits_type::deallocate(allocator_, begin_, current_allocated_size_);
         }
 
         vector& operator=(const vector& other)
@@ -99,9 +101,9 @@ namespace MINIMAL_STD_NAMESPACE
             if ((current_allocated_size_ < other.size()) &&
                (current_allocated_size_ < MAX_SIZE))
             {
-                allocator_.deallocate(begin_, current_allocated_size_);
+                allocator_traits_type::deallocate(allocator_, begin_, current_allocated_size_);
 
-                begin_ = allocator_.allocate(minstd::min( other.size(), MAX_SIZE));
+                begin_ = allocator_traits_type::allocate(allocator_, minstd::min( other.size(), MAX_SIZE));
                 current_allocated_size_ = minstd::min( other.size(), MAX_SIZE);
 
                 if (current_allocated_size_ != 0 && begin_ == nullptr)
@@ -234,7 +236,8 @@ namespace MINIMAL_STD_NAMESPACE
                 return;
             }
 
-            new (end_++) T(new_element);
+            allocator_traits_type::construct(allocator_, end_, new_element);
+            end_++;
         }
 
         template <class... Args>
@@ -243,7 +246,9 @@ namespace MINIMAL_STD_NAMESPACE
             MINIMAL_STD_ASSERT(size() < max_size());
             MINIMAL_STD_ASSERT(size() < current_allocated_size_);
 
-            T *new_node = new (end_++) T(minstd::forward<Args>(args)...);
+            T *new_node = end_;
+            allocator_traits_type::construct(allocator_, end_, minstd::forward<Args>(args)...);
+            end_++;
 
             return *new_node;
         }
@@ -257,7 +262,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (minstd::is_class<T>::value)
             {
-                (end_-- - 1)->~T();
+                end_--;
+                allocator_traits_type::destroy(allocator_, end_);
             }
             else
             {
@@ -271,7 +277,7 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 for (T *current_element = begin_; current_element < end_; current_element++)
                 {
-                    current_element->~T();
+                    allocator_traits_type::destroy(allocator_, current_element);
                 }
             }
 
@@ -598,7 +604,7 @@ namespace MINIMAL_STD_NAMESPACE
         T *insert_location = pos.current_location_;
         T *old_end = end_;
 
-        new (old_end) T(minstd::move(*(old_end - 1)));
+        allocator_traits_type::construct(allocator_, old_end, minstd::move(*(old_end - 1)));
 
         for (T *current = old_end - 1; current > insert_location; --current)
         {
@@ -634,7 +640,7 @@ namespace MINIMAL_STD_NAMESPACE
         T *insert_location = pos.current_location_;
         T *old_end = end_;
 
-        new (old_end) T(minstd::move(*(old_end - 1)));
+        allocator_traits_type::construct(allocator_, old_end, minstd::move(*(old_end - 1)));
 
         for (T *current = old_end - 1; current > insert_location; --current)
         {

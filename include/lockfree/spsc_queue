@@ -9,6 +9,7 @@
 #include <minimalcstdlib.h>
 
 #include <allocator>
+#include "allocator_traits"
 #include <functional>
 #include <new>
 #include <optional>
@@ -27,12 +28,13 @@ namespace MINIMAL_STD_NAMESPACE
     public:
         using value_type = T;
         using allocator_type = allocator<value_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         explicit spsc_queue(allocator_type &allocator,
                             size_t capacity)
             : allocator_(allocator),
               size_(capacity),
-              elements_(allocator_.allocate(size_)),
+              elements_(allocator_traits_type::allocate(allocator_, size_)),
               read_index_(0),
               write_index_(0)
         {
@@ -47,7 +49,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         ~spsc_queue()
         {
-            allocator_.deallocate(elements_, size_); //
+            allocator_traits_type::deallocate(allocator_, elements_, size_); //
         }
 
         spsc_queue &operator=(const spsc_queue &) = delete;
@@ -108,7 +110,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (next != read_index_.load(memory_order_acquire))
             {
-                new (&elements_[current]) T(forward<Args>(args)...);
+                allocator_traits_type::construct(allocator_, &elements_[current], forward<Args>(args)...);
                 write_index_.store(next, memory_order_release);
 
                 return true;
@@ -137,7 +139,7 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
             front = minstd::move(elements_[current]);
-            elements_[current].~T();
+            allocator_traits_type::destroy(allocator_, &elements_[current]);
             read_index_.store(next, memory_order_release);
 
             return true;
@@ -168,7 +170,7 @@ namespace MINIMAL_STD_NAMESPACE
                 next = 0;
             }
 
-            elements_[current].~T();
+            allocator_traits_type::destroy(allocator_, &elements_[current]);
             read_index_.store(next, memory_order_release);
         }
 

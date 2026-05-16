@@ -11,6 +11,7 @@
 
 #include "algorithm"
 #include "allocator"
+#include "allocator_traits"
 #include "basic_string"
 
 namespace MINIMAL_STD_NAMESPACE
@@ -22,9 +23,10 @@ namespace MINIMAL_STD_NAMESPACE
         static constexpr size_t npos = SIZE_MAX;
 
         using allocator_type = allocator<T>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         explicit basic_dynamic_string(allocator_type &allocator)
-            : basic_string<T>(allocator.allocate(minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 )), minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 ), MAX_SIZE),
+            : basic_string<T>(allocator_traits_type::allocate(allocator, minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 )), minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 ), MAX_SIZE),
               allocator_(allocator)
         {
             if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
@@ -34,7 +36,7 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         explicit basic_dynamic_string(const T *value, allocator_type &allocator)
-            : basic_string<T>(allocator.allocate(compute_buffer_size(value)), compute_buffer_size(value), MAX_SIZE, value),
+                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(value)), compute_buffer_size(value), MAX_SIZE, value),
               allocator_(allocator)
         {
             if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
@@ -44,7 +46,7 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         explicit basic_dynamic_string(const T *value, size_t length, allocator_type &allocator)
-            : basic_string<T>(allocator.allocate(compute_buffer_size(value, length)), compute_buffer_size(value, length), MAX_SIZE, value, length),
+                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(value, length)), compute_buffer_size(value, length), MAX_SIZE, value, length),
               allocator_(allocator)
         {
             if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
@@ -54,7 +56,7 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         explicit basic_dynamic_string(const basic_string<T> &string_to_copy, allocator_type &allocator)
-            : basic_string<T>(allocator.allocate(compute_buffer_size(string_to_copy.length())), compute_buffer_size(string_to_copy.length()), MAX_SIZE, string_to_copy),
+                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(string_to_copy.length())), compute_buffer_size(string_to_copy.length()), MAX_SIZE, string_to_copy),
               allocator_(allocator)
         {
             if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
@@ -67,7 +69,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (basic_string<T>::buffer_ != nullptr)
             {
-                allocator_.deallocate(basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
             }
         }
 
@@ -77,10 +79,10 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (new_length > basic_string<T>::buffer_size_)
             {
-                allocator_.deallocate(basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
 
                 basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_.allocate(basic_string<T>::buffer_size_);
+                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
 
                 if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
                 {
@@ -99,10 +101,10 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (new_length > basic_string<T>::buffer_size_)
             {
-                allocator_.deallocate(basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
 
                 basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_.allocate(basic_string<T>::buffer_size_);
+                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
 
                 if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
                 {
@@ -121,10 +123,10 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (new_length > basic_string<T>::buffer_size_)
             {
-                allocator_.deallocate(basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
 
                 basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_.allocate(basic_string<T>::buffer_size_);
+                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
 
                 if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
                 {
@@ -169,7 +171,7 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 size_t new_buffer_size = minstd::min((size_t)((basic_string<T>::length_ + chars_needed + 1) * DYNAMIC_STRING_OVERALLOCATION_PERCENTAGE), basic_string<T>::max_size_ + 1 );
 
-                char *new_buffer = allocator_.allocate(new_buffer_size);
+                T *new_buffer = allocator_traits_type::allocate(allocator_, new_buffer_size);
 
                 if (new_buffer_size != 0 && new_buffer == nullptr)
                 {
@@ -178,7 +180,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 strlcpy(new_buffer, basic_string<T>::buffer_, basic_string<T>::length_ + 1);
 
-                allocator_.deallocate(basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
 
                 basic_string<T>::buffer_ = new_buffer;
 

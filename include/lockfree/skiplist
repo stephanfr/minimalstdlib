@@ -13,9 +13,11 @@
 #include <utility>
 
 #include "__extensions/skiplist_statistics.h"
+#include "allocator_traits"
 #include "epoch_policy"
 #include "epoch_reclaimer_core"
 #include "__memory_resource/memory_resource.h"
+#include "__memory_resource/polymorphic_allocator.h"
 
 #ifdef __MINIMAL_STD_TEST__
 #include <stdlib.h>
@@ -31,6 +33,25 @@ namespace MINIMAL_STD_NAMESPACE
 {
     namespace skiplist_internal
     {
+#ifdef __MINIMAL_STD_TEST__
+        template <typename value_type_t>
+        class malloc_backed_allocator
+        {
+        public:
+            using value_type = value_type_t;
+
+            value_type *allocate(size_t num_elements)
+            {
+                return static_cast<value_type *>(malloc(sizeof(value_type) * num_elements));
+            }
+
+            void deallocate(value_type *ptr, size_t /*num_elements*/)
+            {
+                free(ptr);
+            }
+        };
+#endif
+
         //  Embedded atomic forward link: packs pointer handle + tombstone flag.
         //  into a single 64-bit atomic word, eliminating heap allocation and spin
         //  locks from the CAS path.
@@ -81,6 +102,13 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             };
 
+            using slot_block_allocator_type = pmr::polymorphic_allocator<slot_block>;
+            using slot_block_allocator_traits_type = minstd::allocator_traits<slot_block_allocator_type>;
+#ifdef __MINIMAL_STD_TEST__
+            using slot_block_test_allocator_type = skiplist_internal::malloc_backed_allocator<slot_block>;
+            using slot_block_test_allocator_traits_type = minstd::allocator_traits<slot_block_test_allocator_type>;
+#endif
+
             static inline atomic<uint32_t> next_free_slot_{1};
             static inline atomic<uint32_t> high_water_slot_{0};
             static inline atomic<uint32_t> high_water_block_{0};
@@ -100,24 +128,36 @@ namespace MINIMAL_STD_NAMESPACE
 
             static slot_block* new_block()
             {
-                void* buf;
                 if (block_memory_resource_ != nullptr)
                 {
-                    buf = block_memory_resource_->allocate(sizeof(slot_block), alignof(slot_block));
+                    slot_block_allocator_type allocator(block_memory_resource_);
+                    slot_block *block = slot_block_allocator_traits_type::allocate(allocator, 1);
+
+                    if (block == nullptr)
+                    {
+                        return nullptr;
+                    }
+
+                    slot_block_allocator_traits_type::construct(allocator, block);
+
+                    return block;
                 }
-                else
-                {
+
 #ifdef __MINIMAL_STD_TEST__
-                    buf = malloc(sizeof(slot_block));
-#else
-                    return nullptr;  // production: a memory resource must always be provided
-#endif
-                }
-                if (buf == nullptr)
+                slot_block_test_allocator_type test_allocator;
+                slot_block *block = slot_block_test_allocator_traits_type::allocate(test_allocator, 1);
+
+                if (block == nullptr)
                 {
                     return nullptr;
                 }
-                return new (buf) slot_block();
+
+                slot_block_test_allocator_traits_type::construct(test_allocator, block);
+
+                return block;
+#else
+                return nullptr;  // production: a memory resource must always be provided
+#endif
             }
 
             static void delete_block(slot_block* block)
@@ -126,15 +166,19 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     return;
                 }
-                block->~slot_block();
+
                 if (block_memory_resource_ != nullptr)
                 {
-                    block_memory_resource_->deallocate(block, sizeof(slot_block), alignof(slot_block));
+                    slot_block_allocator_type allocator(block_memory_resource_);
+                    slot_block_allocator_traits_type::destroy(allocator, block);
+                    slot_block_allocator_traits_type::deallocate(allocator, block, 1);
                 }
 #ifdef __MINIMAL_STD_TEST__
                 else
                 {
-                    free(block);
+                    slot_block_test_allocator_type test_allocator;
+                    slot_block_test_allocator_traits_type::destroy(test_allocator, block);
+                    slot_block_test_allocator_traits_type::deallocate(test_allocator, block, 1);
                 }
 #endif
             }
@@ -649,19 +693,27 @@ namespace MINIMAL_STD_NAMESPACE
 
                 void update_cache(const KeyType& k, const ValueType& v)
                 {
+                    using cache_allocator_type = pmr::polymorphic_allocator<value_type>;
+                    using cache_allocator_traits_type = minstd::allocator_traits<cache_allocator_type>;
+                    cache_allocator_type cache_allocator((list_ != nullptr) ? list_->memory_resource_ : nullptr);
+
                     if (has_value_)
                     {
-                        cached_kv()->~value_type();
+                        cache_allocator_traits_type::destroy(cache_allocator, cached_kv());
                     }
-                    new (cached_kv_storage_) value_type(k, v);
+                    cache_allocator_traits_type::construct(cache_allocator, cached_kv(), k, v);
                     has_value_ = true;
                 }
 
                 void clear_cache()
                 {
+                    using cache_allocator_type = pmr::polymorphic_allocator<value_type>;
+                    using cache_allocator_traits_type = minstd::allocator_traits<cache_allocator_type>;
+                    cache_allocator_type cache_allocator((list_ != nullptr) ? list_->memory_resource_ : nullptr);
+
                     if (has_value_)
                     {
-                        cached_kv()->~value_type();
+                        cache_allocator_traits_type::destroy(cache_allocator, cached_kv());
                         has_value_ = false;
                     }
                 }
@@ -800,19 +852,27 @@ namespace MINIMAL_STD_NAMESPACE
 
                 void update_cache(const KeyType& k, const ValueType& v)
                 {
+                    using cache_allocator_type = pmr::polymorphic_allocator<value_type>;
+                    using cache_allocator_traits_type = minstd::allocator_traits<cache_allocator_type>;
+                    cache_allocator_type cache_allocator((list_ != nullptr) ? list_->memory_resource_ : nullptr);
+
                     if (has_value_)
                     {
-                        cached_kv()->~value_type();
+                        cache_allocator_traits_type::destroy(cache_allocator, cached_kv());
                     }
-                    new (cached_kv_storage_) value_type(k, v);
+                    cache_allocator_traits_type::construct(cache_allocator, cached_kv(), k, v);
                     has_value_ = true;
                 }
 
                 void clear_cache()
                 {
+                    using cache_allocator_type = pmr::polymorphic_allocator<value_type>;
+                    using cache_allocator_traits_type = minstd::allocator_traits<cache_allocator_type>;
+                    cache_allocator_type cache_allocator((list_ != nullptr) ? list_->memory_resource_ : nullptr);
+
                     if (has_value_)
                     {
-                        cached_kv()->~value_type();
+                        cache_allocator_traits_type::destroy(cache_allocator, cached_kv());
                         has_value_ = false;
                     }
                 }
@@ -1674,6 +1734,13 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
         private:
+            using skip_node_allocator_type = pmr::polymorphic_allocator<skip_node>;
+            using skip_node_allocator_traits_type = minstd::allocator_traits<skip_node_allocator_type>;
+#ifdef __MINIMAL_STD_TEST__
+            using skip_node_test_allocator_type = skiplist_internal::malloc_backed_allocator<skip_node>;
+            using skip_node_test_allocator_traits_type = minstd::allocator_traits<skip_node_test_allocator_type>;
+#endif
+
             static inline atomic<size_t> active_instance_count_{0};
 
             skip_node *head_ = nullptr;
@@ -1951,26 +2018,36 @@ namespace MINIMAL_STD_NAMESPACE
             template <typename... Args>
             skip_node *allocate_skip_node(Args &&...args)
             {
-                void *buffer;
                 if (memory_resource_ != nullptr)
                 {
-                    buffer = memory_resource_->allocate(sizeof(skip_node), alignof(skip_node));
-                }
-                else
-                {
-#ifdef __MINIMAL_STD_TEST__
-                    buffer = malloc(sizeof(skip_node));
-#else
-                    return nullptr;  // production: a memory resource must always be provided
-#endif
+                    skip_node_allocator_type allocator(memory_resource_);
+                    skip_node *node = skip_node_allocator_traits_type::allocate(allocator, 1);
+
+                    if (node == nullptr)
+                    {
+                        return nullptr;
+                    }
+
+                    skip_node_allocator_traits_type::construct(allocator, node, minstd::forward<Args>(args)...);
+
+                    return node;
                 }
 
-                if (buffer == nullptr)
+#ifdef __MINIMAL_STD_TEST__
+                skip_node_test_allocator_type test_allocator;
+                skip_node *node = skip_node_test_allocator_traits_type::allocate(test_allocator, 1);
+
+                if (node == nullptr)
                 {
                     return nullptr;
                 }
 
-                return new (buffer) skip_node(minstd::forward<Args>(args)...);
+                skip_node_test_allocator_traits_type::construct(test_allocator, node, minstd::forward<Args>(args)...);
+
+                return node;
+#else
+                return nullptr;  // production: a memory resource must always be provided
+#endif
             }
 
             void destroy_skip_node(skip_node *node)
@@ -1980,16 +2057,18 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
-                node->~skip_node();
-
                 if (memory_resource_ != nullptr)
                 {
-                    memory_resource_->deallocate(node, sizeof(skip_node), alignof(skip_node));
+                    skip_node_allocator_type allocator(memory_resource_);
+                    skip_node_allocator_traits_type::destroy(allocator, node);
+                    skip_node_allocator_traits_type::deallocate(allocator, node, 1);
                 }
 #ifdef __MINIMAL_STD_TEST__
                 else
                 {
-                    free(node);
+                    skip_node_test_allocator_type test_allocator;
+                    skip_node_test_allocator_traits_type::destroy(test_allocator, node);
+                    skip_node_test_allocator_traits_type::deallocate(test_allocator, node, 1);
                 }
 #endif
             }

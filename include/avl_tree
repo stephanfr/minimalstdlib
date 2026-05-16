@@ -10,6 +10,7 @@
 
 #include "algorithm"
 #include "allocator"
+#include "allocator_traits"
 
 #include "array"
 
@@ -151,6 +152,7 @@ namespace MINIMAL_STD_NAMESPACE
         using const_pointer = const value_type *;
         using node_type = avl_node;
         using allocator_type = allocator<node_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         class iterator;
         friend class iterator;
@@ -192,7 +194,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t max_size() const
         {
-            return allocator_.max_size();
+            return allocator_traits_type::max_size(allocator_);
         }
 
         size_t erase(key_type key)
@@ -344,7 +346,7 @@ namespace MINIMAL_STD_NAMESPACE
             if (subtree_root == nullptr)
             {
                 //  Sub tree is empty, so we found the insert point.
-                node_type *new_node_block = allocator_.allocate(1);
+                node_type *new_node_block = allocator_traits_type::allocate(allocator_, 1);
 
                 if (new_node_block == nullptr)
                 {
@@ -353,7 +355,8 @@ namespace MINIMAL_STD_NAMESPACE
 
                 size_++;
 
-                return new (new_node_block) node_type(key, minstd::move(value));
+                allocator_traits_type::construct(allocator_, new_node_block, key, minstd::move(value));
+                return new_node_block;
             }
 
             //  Work down the tree recursively to insert the new node.
@@ -476,8 +479,8 @@ namespace MINIMAL_STD_NAMESPACE
                         }
                     }
 
-                    temp->~node_type();
-                    allocator_.deallocate(temp, 1);
+                    allocator_traits_type::destroy(allocator_, temp);
+                    allocator_traits_type::deallocate(allocator_, temp, 1);
                     size_--;
                 }
                 else

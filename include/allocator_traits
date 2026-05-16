@@ -1,0 +1,265 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <new>
+#include <stddef.h>
+
+#include "type_traits"
+#include "utility"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    template <class allocator_type, class = void>
+    struct allocator_traits_pointer_helper
+    {
+        using type = typename allocator_type::value_type *;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_pointer_helper<allocator_type, __void_t<typename allocator_type::pointer>>
+    {
+        using type = typename allocator_type::pointer;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_const_pointer_helper
+    {
+        using type = const typename allocator_type::value_type *;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_const_pointer_helper<allocator_type, __void_t<typename allocator_type::const_pointer>>
+    {
+        using type = typename allocator_type::const_pointer;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_void_pointer_helper
+    {
+        using type = void *;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_void_pointer_helper<allocator_type, __void_t<typename allocator_type::void_pointer>>
+    {
+        using type = typename allocator_type::void_pointer;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_const_void_pointer_helper
+    {
+        using type = const void *;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_const_void_pointer_helper<allocator_type, __void_t<typename allocator_type::const_void_pointer>>
+    {
+        using type = typename allocator_type::const_void_pointer;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_difference_type_helper
+    {
+        using type = ptrdiff_t;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_difference_type_helper<allocator_type, __void_t<typename allocator_type::difference_type>>
+    {
+        using type = typename allocator_type::difference_type;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_size_type_helper
+    {
+        using type = make_unsigned_t<typename allocator_traits_difference_type_helper<allocator_type>::type>;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_size_type_helper<allocator_type, __void_t<typename allocator_type::size_type>>
+    {
+        using type = typename allocator_type::size_type;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_pocca_helper
+    {
+        using type = false_type;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_pocca_helper<allocator_type,
+                                         __void_t<typename allocator_type::propagate_on_container_copy_assignment>>
+    {
+        using type = typename allocator_type::propagate_on_container_copy_assignment;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_pocma_helper
+    {
+        using type = false_type;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_pocma_helper<allocator_type,
+                                         __void_t<typename allocator_type::propagate_on_container_move_assignment>>
+    {
+        using type = typename allocator_type::propagate_on_container_move_assignment;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_pocs_helper
+    {
+        using type = false_type;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_pocs_helper<allocator_type,
+                                        __void_t<typename allocator_type::propagate_on_container_swap>>
+    {
+        using type = typename allocator_type::propagate_on_container_swap;
+    };
+
+    template <class allocator_type, class = void>
+    struct allocator_traits_is_always_equal_helper
+    {
+        using type = bool_constant<is_empty<allocator_type>::value>;
+    };
+
+    template <class allocator_type>
+    struct allocator_traits_is_always_equal_helper<allocator_type, __void_t<typename allocator_type::is_always_equal>>
+    {
+        using type = typename allocator_type::is_always_equal;
+    };
+
+    template <class allocator_type, class value_type>
+    struct allocator_traits_rebind_alloc_fallback_helper
+    {
+        using type = allocator_type;
+    };
+
+    template <template <class, class...> class allocator_template,
+              class current_value_type,
+              class... extra_types,
+              class value_type>
+    struct allocator_traits_rebind_alloc_fallback_helper<allocator_template<current_value_type, extra_types...>, value_type>
+    {
+        using type = allocator_template<value_type, extra_types...>;
+    };
+
+    template <class allocator_type, class value_type, class = void>
+    struct allocator_traits_rebind_alloc_helper
+    {
+        using type = typename allocator_traits_rebind_alloc_fallback_helper<allocator_type, value_type>::type;
+    };
+
+    template <class allocator_type, class value_type>
+    struct allocator_traits_rebind_alloc_helper<allocator_type,
+                                                value_type,
+                                                __void_t<typename allocator_type::template rebind<value_type>::other>>
+    {
+        using type = typename allocator_type::template rebind<value_type>::other;
+    };
+
+    template <class allocator_type_t>
+    struct allocator_traits
+    {
+        using allocator_type = allocator_type_t;
+        using value_type = typename allocator_type_t::value_type;
+        using pointer = typename allocator_traits_pointer_helper<allocator_type_t>::type;
+        using const_pointer = typename allocator_traits_const_pointer_helper<allocator_type_t>::type;
+        using void_pointer = typename allocator_traits_void_pointer_helper<allocator_type_t>::type;
+        using const_void_pointer = typename allocator_traits_const_void_pointer_helper<allocator_type_t>::type;
+        using difference_type = typename allocator_traits_difference_type_helper<allocator_type_t>::type;
+        using size_type = typename allocator_traits_size_type_helper<allocator_type_t>::type;
+
+        using propagate_on_container_copy_assignment = typename allocator_traits_pocca_helper<allocator_type_t>::type;
+        using propagate_on_container_move_assignment = typename allocator_traits_pocma_helper<allocator_type_t>::type;
+        using propagate_on_container_swap = typename allocator_traits_pocs_helper<allocator_type_t>::type;
+
+        using is_always_equal = typename allocator_traits_is_always_equal_helper<allocator_type_t>::type;
+
+        template <class rebound_value_type>
+        using rebind_alloc = typename allocator_traits_rebind_alloc_helper<allocator_type_t, rebound_value_type>::type;
+
+        template <class rebound_value_type>
+        using rebind_traits = allocator_traits<rebind_alloc<rebound_value_type>>;
+
+        static pointer allocate(allocator_type &allocator, size_type num_elements)
+        {
+            return allocator.allocate(num_elements);
+        }
+
+        static void deallocate(allocator_type &allocator, pointer ptr, size_type num_elements)
+        {
+            allocator.deallocate(ptr, num_elements);
+        }
+
+        template <class element_type, class... args_type>
+        static void construct(allocator_type &allocator, element_type *ptr, args_type &&...args)
+        {
+            if constexpr (requires(allocator_type &current_allocator, element_type *current_ptr, args_type &&...current_args)
+                          {
+                              current_allocator.construct(current_ptr, minstd::forward<args_type>(current_args)...);
+                          })
+            {
+                allocator.construct(ptr, minstd::forward<args_type>(args)...);
+            }
+            else
+            {
+                ::new ((void *)__builtin_addressof(*ptr)) element_type(minstd::forward<args_type>(args)...);
+            }
+        }
+
+        template <class element_type>
+        static void destroy(allocator_type &allocator, element_type *ptr)
+        {
+            if constexpr (requires(allocator_type &current_allocator, element_type *current_ptr)
+                          {
+                              current_allocator.destroy(current_ptr);
+                          })
+            {
+                allocator.destroy(ptr);
+            }
+            else
+            {
+                __builtin_addressof(*ptr)->~element_type();
+            }
+        }
+
+        static size_type max_size(const allocator_type &allocator) noexcept
+        {
+            if constexpr (requires(const allocator_type &current_allocator)
+                          {
+                              current_allocator.max_size();
+                          })
+            {
+                return static_cast<size_type>(allocator.max_size());
+            }
+            else
+            {
+                return static_cast<size_type>(-1) / sizeof(value_type);
+            }
+        }
+
+        static allocator_type select_on_container_copy_construction(const allocator_type &allocator)
+        {
+            if constexpr (requires(const allocator_type &current_allocator)
+                          {
+                              current_allocator.select_on_container_copy_construction();
+                          })
+            {
+                return allocator.select_on_container_copy_construction();
+            }
+            else
+            {
+                return allocator;
+            }
+        }
+    };
+}
