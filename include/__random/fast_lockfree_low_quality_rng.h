@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <limits>
+#include "__random/engine.h"
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -35,6 +36,14 @@ namespace MINIMAL_STD_NAMESPACE
             return numeric_limits<result_type>::max();
         }
 
+        //  SeedSequence constructor — seeds the engine from a SeedSequence.
+        template <seed_sequence SeedSeq>
+        explicit fast_lockfree_low_quality_rng(SeedSeq &seq) noexcept
+            : rng_state_(DEFAULT_SEED)
+        {
+            seed(seq);
+        }
+
         //  Default constructor — uses built-in default seed.
         fast_lockfree_low_quality_rng() noexcept
             : rng_state_(DEFAULT_SEED)
@@ -46,10 +55,29 @@ namespace MINIMAL_STD_NAMESPACE
         {
         }
 
+        //  Re-seed from a SeedSequence.
+        template <seed_sequence SeedSeq>
+        void seed(SeedSeq &seq) noexcept
+        {
+            uint_least32_t s[2];
+            seq.generate(s, s + 2);
+            uint64_t val = (uint64_t(s[0]) << 32) | uint64_t(s[1]);
+            rng_state_.store(val == 0u ? DEFAULT_SEED : val, memory_order_relaxed);
+        }
+
         //  Re-seed.  A zero seed is replaced by the default.
         void seed(uint64_t s) noexcept
         {
             rng_state_.store(s == 0 ? DEFAULT_SEED : s, memory_order_relaxed);
+        }
+
+        //  Returns a snapshot of the current engine state.
+        //  Combined with seed(uint64_t) or the uint64_t constructor, this provides
+        //  state save/restore.  Note: for a concurrent engine the snapshot is a
+        //  relaxed read and may not reflect in-flight CAS operations.
+        uint64_t state() const noexcept
+        {
+            return rng_state_.load(memory_order_relaxed);
         }
 
         result_type operator()()

@@ -328,4 +328,129 @@ namespace
 
         CHECK(!destination.has_value());
     }
+
+    TEST(OptionalTests, NulloptConstructorTest)
+    {
+        minstd::optional<uint32_t> opt(minstd::nullopt);
+
+        CHECK(!opt.has_value());
+    }
+
+    TEST(OptionalTests, NulloptAssignmentClearsValue)
+    {
+        lifecycle_probe::reset_counters();
+        lifecycle_probe source(42);
+
+        minstd::optional<lifecycle_probe> opt(source);
+        CHECK(opt.has_value());
+        CHECK_EQUAL(2, lifecycle_probe::live_instances());
+
+        opt = minstd::nullopt;
+
+        CHECK(!opt.has_value());
+        CHECK_EQUAL(1, lifecycle_probe::live_instances());
+        CHECK_EQUAL(1, lifecycle_probe::destroyed());
+    }
+
+    TEST(OptionalTests, CopyInitializationTest)
+    {
+        //  Validates that removing 'explicit' from copy/move ctors allows
+        //  copy-initialization syntax.
+        minstd::optional<uint32_t> source(55u);
+        minstd::optional<uint32_t> dest = source;
+
+        CHECK(dest.has_value());
+        CHECK_EQUAL(55u, dest.value());
+
+        minstd::optional<uint32_t> empty_src;
+        minstd::optional<uint32_t> empty_dest = empty_src;
+
+        CHECK(!empty_dest.has_value());
+    }
+
+    TEST(OptionalTests, EmplaceTest)
+    {
+        //  Emplace into empty optional
+        minstd::optional<test_element> opt;
+
+        CHECK(!opt.has_value());
+
+        test_element &ref = opt.emplace(3u, 4u);
+
+        CHECK(opt.has_value());
+        CHECK_EQUAL(3u, ref.value1());
+        CHECK_EQUAL(4u, ref.value2());
+        CHECK_EQUAL(3u, opt.value().value1());
+        CHECK_EQUAL(4u, opt.value().value2());
+
+        //  Emplace over an existing value — old value's destructor must be called
+        lifecycle_probe::reset_counters();
+        lifecycle_probe src(7);
+
+        minstd::optional<lifecycle_probe> lopt(src);
+
+        CHECK(lopt.has_value());
+        CHECK_EQUAL(2, lifecycle_probe::live_instances());
+
+        lopt.emplace(99u);
+
+        CHECK(lopt.has_value());
+        CHECK_EQUAL(2, lifecycle_probe::live_instances());
+        CHECK_EQUAL(1, lifecycle_probe::destroyed());
+    }
+
+    TEST(OptionalTests, ValueOrTest)
+    {
+        minstd::optional<uint32_t> empty_opt;
+        minstd::optional<uint32_t> value_opt(42u);
+
+        CHECK_EQUAL(99u, empty_opt.value_or(99u));
+        CHECK_EQUAL(42u, value_opt.value_or(99u));
+    }
+
+    TEST(OptionalTests, ComparisonOperatorsTest)
+    {
+        minstd::optional<uint32_t> empty1;
+        minstd::optional<uint32_t> empty2;
+        minstd::optional<uint32_t> value1(10u);
+        minstd::optional<uint32_t> value2(10u);
+        minstd::optional<uint32_t> value3(20u);
+
+        //  optional == optional
+        CHECK(empty1 == empty2);
+        CHECK(value1 == value2);
+        CHECK(!(empty1 == value1));
+        CHECK(!(value1 == value3));
+
+        //  optional != optional
+        CHECK(!(empty1 != empty2));
+        CHECK(!(value1 != value2));
+        CHECK(empty1 != value1);
+        CHECK(value1 != value3);
+
+        //  optional == T  and  T == optional
+        CHECK(value1 == 10u);
+        CHECK(10u == value1);
+        CHECK(!(empty1 == 10u));
+        CHECK(!(value1 == 20u));
+
+        //  optional != T  and  T != optional
+        CHECK(!(value1 != 10u));
+        CHECK(value1 != 20u);
+        CHECK(empty1 != 10u);
+        CHECK(!(10u != value1));
+        CHECK(20u != value1);
+
+        //  optional == nullopt  and  nullopt == optional
+        CHECK(empty1 == minstd::nullopt);
+        CHECK(minstd::nullopt == empty1);
+        CHECK(!(value1 == minstd::nullopt));
+        CHECK(!(minstd::nullopt == value1));
+
+        //  optional != nullopt  and  nullopt != optional
+        CHECK(value1 != minstd::nullopt);
+        CHECK(minstd::nullopt != value1);
+        CHECK(!(empty1 != minstd::nullopt));
+        CHECK(!(minstd::nullopt != empty1));
+    }
 }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "__random/engine.h"
+#include "__random/seed_seq.h"
 #include "__random/random_device.h"
 #include "__random/xoroshiro128_plus_plus.h"
 #include "__random/fast_lockfree_low_quality_rng.h"

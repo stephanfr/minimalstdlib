@@ -2,57 +2,198 @@
 #include <stdint.h>
 #include "minstdconfig.h"
 namespace MINIMAL_STD_NAMESPACE {
+
+    //  Primary (unspecialized) template — matches any type for which no
+    //  explicit specialization exists.  is_specialized == false signals that.
     template <typename T>
-    struct numeric_limits {
-        static constexpr bool is_iec559 = false;
-        static constexpr int radix = 0;
+    struct numeric_limits
+    {
+        static constexpr bool is_specialized = false;
+        static constexpr bool is_integer     = false;
+        static constexpr bool is_signed      = false;
+        static constexpr bool is_exact       = false;
+        static constexpr bool is_modulo      = false;
+        static constexpr bool is_iec559      = false;
+        static constexpr int  radix          = 0;
+        static constexpr int  digits         = 0;
+        static constexpr int  digits10       = 0;
+        static constexpr T min()    noexcept { return T{}; }
+        static constexpr T max()    noexcept { return T{}; }
+        static constexpr T lowest() noexcept { return T{}; }
     };
-    template <> struct numeric_limits<float> {
-        static constexpr bool is_iec559 = true;
-        static constexpr int radix = 2;
+
+    // -----------------------------------------------------------------------
+    //  Floating-point specializations
+    //  min()    — smallest positive normalised value  (matches std)
+    //  lowest() — most-negative finite value          (matches std)
+    //  Uses GCC predefined macros so no <float.h> include is needed.
+    // -----------------------------------------------------------------------
+    template <> struct numeric_limits<float>
+    {
+        static constexpr bool  is_specialized = true;
+        static constexpr bool  is_integer     = false;
+        static constexpr bool  is_signed      = true;
+        static constexpr bool  is_exact       = false;
+        static constexpr bool  is_modulo      = false;
+        static constexpr bool  is_iec559      = true;
+        static constexpr int   radix          = 2;
+        static constexpr int   digits         = __FLT_MANT_DIG__;
+        static constexpr int   digits10       = __FLT_DIG__;
+        static constexpr float min()     noexcept { return __FLT_MIN__; }
+        static constexpr float max()     noexcept { return __FLT_MAX__; }
+        static constexpr float lowest()  noexcept { return -__FLT_MAX__; }
+        static constexpr float epsilon() noexcept { return __FLT_EPSILON__; }
     };
-    template <> struct numeric_limits<double> {
-        static constexpr bool is_iec559 = true;
-        static constexpr int radix = 2;
+
+    template <> struct numeric_limits<double>
+    {
+        static constexpr bool   is_specialized = true;
+        static constexpr bool   is_integer     = false;
+        static constexpr bool   is_signed      = true;
+        static constexpr bool   is_exact       = false;
+        static constexpr bool   is_modulo      = false;
+        static constexpr bool   is_iec559      = true;
+        static constexpr int    radix          = 2;
+        static constexpr int    digits         = __DBL_MANT_DIG__;
+        static constexpr int    digits10       = __DBL_DIG__;
+        static constexpr double min()     noexcept { return __DBL_MIN__; }
+        static constexpr double max()     noexcept { return __DBL_MAX__; }
+        static constexpr double lowest()  noexcept { return -__DBL_MAX__; }
+        static constexpr double epsilon() noexcept { return __DBL_EPSILON__; }
     };
-    template <> struct numeric_limits<int8_t> {
-        static constexpr int8_t min() { return -128; }
-        static constexpr int8_t max() { return 127; }
-        static constexpr bool is_signed = true;
+
+    // -----------------------------------------------------------------------
+    //  Integer specializations
+    //  is_modulo = true  for unsigned types (wraparound is defined)
+    //  is_modulo = false for signed types   (overflow is UB in C++)
+    //  lowest() == min() for all integer types
+    // -----------------------------------------------------------------------
+    template <> struct numeric_limits<int8_t>
+    {
+        static constexpr bool   is_specialized = true;
+        static constexpr bool   is_integer     = true;
+        static constexpr bool   is_signed      = true;
+        static constexpr bool   is_exact       = true;
+        static constexpr bool   is_modulo      = false;
+        static constexpr bool   is_iec559      = false;
+        static constexpr int    radix          = 2;
+        static constexpr int    digits         = 7;
+        static constexpr int    digits10       = 2;
+        static constexpr int8_t min()    noexcept { return -128; }
+        static constexpr int8_t max()    noexcept { return 127; }
+        static constexpr int8_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<uint8_t> {
-        static constexpr uint8_t min() { return 0; }
-        static constexpr uint8_t max() { return 255U; }
-        static constexpr bool is_signed = false;
+
+    template <> struct numeric_limits<uint8_t>
+    {
+        static constexpr bool    is_specialized = true;
+        static constexpr bool    is_integer     = true;
+        static constexpr bool    is_signed      = false;
+        static constexpr bool    is_exact       = true;
+        static constexpr bool    is_modulo      = true;
+        static constexpr bool    is_iec559      = false;
+        static constexpr int     radix          = 2;
+        static constexpr int     digits         = 8;
+        static constexpr int     digits10       = 2;
+        static constexpr uint8_t min()    noexcept { return 0; }
+        static constexpr uint8_t max()    noexcept { return 255U; }
+        static constexpr uint8_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<int16_t> {
-        static constexpr int16_t min() { return -32768; }
-        static constexpr int16_t max() { return 32767; }
-        static constexpr bool is_signed = true;
+
+    template <> struct numeric_limits<int16_t>
+    {
+        static constexpr bool    is_specialized = true;
+        static constexpr bool    is_integer     = true;
+        static constexpr bool    is_signed      = true;
+        static constexpr bool    is_exact       = true;
+        static constexpr bool    is_modulo      = false;
+        static constexpr bool    is_iec559      = false;
+        static constexpr int     radix          = 2;
+        static constexpr int     digits         = 15;
+        static constexpr int     digits10       = 4;
+        static constexpr int16_t min()    noexcept { return -32768; }
+        static constexpr int16_t max()    noexcept { return 32767; }
+        static constexpr int16_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<uint16_t> {
-        static constexpr uint16_t min() { return 0; }
-        static constexpr uint16_t max() { return 65535U; }
-        static constexpr bool is_signed = false;
+
+    template <> struct numeric_limits<uint16_t>
+    {
+        static constexpr bool     is_specialized = true;
+        static constexpr bool     is_integer     = true;
+        static constexpr bool     is_signed      = false;
+        static constexpr bool     is_exact       = true;
+        static constexpr bool     is_modulo      = true;
+        static constexpr bool     is_iec559      = false;
+        static constexpr int      radix          = 2;
+        static constexpr int      digits         = 16;
+        static constexpr int      digits10       = 4;
+        static constexpr uint16_t min()    noexcept { return 0; }
+        static constexpr uint16_t max()    noexcept { return 65535U; }
+        static constexpr uint16_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<int32_t> {
-        static constexpr int32_t min() { return -2147483647 - 1; }
-        static constexpr int32_t max() { return 2147483647; }
-        static constexpr bool is_signed = true;
+
+    template <> struct numeric_limits<int32_t>
+    {
+        static constexpr bool    is_specialized = true;
+        static constexpr bool    is_integer     = true;
+        static constexpr bool    is_signed      = true;
+        static constexpr bool    is_exact       = true;
+        static constexpr bool    is_modulo      = false;
+        static constexpr bool    is_iec559      = false;
+        static constexpr int     radix          = 2;
+        static constexpr int     digits         = 31;
+        static constexpr int     digits10       = 9;
+        static constexpr int32_t min()    noexcept { return -2147483647 - 1; }
+        static constexpr int32_t max()    noexcept { return 2147483647; }
+        static constexpr int32_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<uint32_t> {
-        static constexpr uint32_t min() { return 0; }
-        static constexpr uint32_t max() { return 4294967295U; }
-        static constexpr bool is_signed = false;
+
+    template <> struct numeric_limits<uint32_t>
+    {
+        static constexpr bool     is_specialized = true;
+        static constexpr bool     is_integer     = true;
+        static constexpr bool     is_signed      = false;
+        static constexpr bool     is_exact       = true;
+        static constexpr bool     is_modulo      = true;
+        static constexpr bool     is_iec559      = false;
+        static constexpr int      radix          = 2;
+        static constexpr int      digits         = 32;
+        static constexpr int      digits10       = 9;
+        static constexpr uint32_t min()    noexcept { return 0; }
+        static constexpr uint32_t max()    noexcept { return 4294967295U; }
+        static constexpr uint32_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<int64_t> {
-        static constexpr int64_t min() { return -9223372036854775807LL - 1; }
-        static constexpr int64_t max() { return 9223372036854775807LL; }
-        static constexpr bool is_signed = true;
+
+    template <> struct numeric_limits<int64_t>
+    {
+        static constexpr bool    is_specialized = true;
+        static constexpr bool    is_integer     = true;
+        static constexpr bool    is_signed      = true;
+        static constexpr bool    is_exact       = true;
+        static constexpr bool    is_modulo      = false;
+        static constexpr bool    is_iec559      = false;
+        static constexpr int     radix          = 2;
+        static constexpr int     digits         = 63;
+        static constexpr int     digits10       = 18;
+        static constexpr int64_t min()    noexcept { return -9223372036854775807LL - 1; }
+        static constexpr int64_t max()    noexcept { return 9223372036854775807LL; }
+        static constexpr int64_t lowest() noexcept { return min(); }
     };
-    template <> struct numeric_limits<uint64_t> {
-        static constexpr uint64_t min() { return 0; }
-        static constexpr uint64_t max() { return 18446744073709551615ULL; }
-        static constexpr bool is_signed = false;
+
+    template <> struct numeric_limits<uint64_t>
+    {
+        static constexpr bool     is_specialized = true;
+        static constexpr bool     is_integer     = true;
+        static constexpr bool     is_signed      = false;
+        static constexpr bool     is_exact       = true;
+        static constexpr bool     is_modulo      = true;
+        static constexpr bool     is_iec559      = false;
+        static constexpr int      radix          = 2;
+        static constexpr int      digits         = 64;
+        static constexpr int      digits10       = 19;
+        static constexpr uint64_t min()    noexcept { return 0; }
+        static constexpr uint64_t max()    noexcept { return 18446744073709551615ULL; }
+        static constexpr uint64_t lowest() noexcept { return min(); }
     };
+
 }

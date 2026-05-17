@@ -32,12 +32,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
         }
 
-        unique_ptr(unique_ptr &pointer_to_copy)
-            : wrapped_pointer_(pointer_to_copy.wrapped_pointer_),
-              resource_(pointer_to_copy.resource_)
-        {
-            pointer_to_copy.wrapped_pointer_ = nullptr;
-        }
+                unique_ptr(const unique_ptr &pointer_to_copy) = delete;
 
         unique_ptr(unique_ptr &&pointer_to_copy)
             : wrapped_pointer_(pointer_to_copy.wrapped_pointer_),
@@ -51,7 +46,7 @@ namespace MINIMAL_STD_NAMESPACE
             destroy_wrapped_pointer();
         }
 
-        unique_ptr &operator=(unique_ptr &pointer_to_copy) = delete;
+        unique_ptr &operator=(const unique_ptr &pointer_to_copy) = delete;
 
         unique_ptr &operator=(unique_ptr &&pointer_to_move)
         {
