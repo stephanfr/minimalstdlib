@@ -6,6 +6,7 @@
 
 #include "minstdconfig.h"
 
+#include <__bit/rotl_rotr.h>
 #include <limits>
 #include "__random/engine.h"
 
@@ -164,20 +165,15 @@ namespace MINIMAL_STD_NAMESPACE
 
         seed_type state_;
 
-        static constexpr uint64_t rotl(uint64_t x, int k) noexcept
-        {
-            return (x << k) | (x >> (64 - k));
-        }
-
         uint64_t next_value_internal() noexcept
         {
             const uint64_t s0 = state_.low;
             uint64_t s1 = state_.high;
-            const uint64_t result = rotl(s0 + s1, 17) + s0;
+            const uint64_t result = MINIMAL_STD_NAMESPACE::rotl(s0 + s1, 17) + s0;
 
             s1 ^= s0;
-            state_.low  = rotl(s0, 49) ^ s1 ^ (s1 << 21); // a, b
-            state_.high = rotl(s1, 28);                    // c
+            state_.low  = MINIMAL_STD_NAMESPACE::rotl(s0, 49) ^ s1 ^ (s1 << 21); // a, b
+            state_.high = MINIMAL_STD_NAMESPACE::rotl(s1, 28);                    // c
 
             return result;
         }
