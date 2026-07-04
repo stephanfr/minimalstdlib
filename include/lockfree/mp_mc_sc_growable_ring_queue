@@ -1,0 +1,506 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <allocator>
+#include "allocator_traits"
+#include <new>
+#include <stddef.h>
+#include <stdint.h>
+#include <type_traits>
+#include <utility>
+
+#include <atomic>
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    //  Packs a position together with an epoch/generation counter into one
+    //  atomic word.  Only used by the multi-consumer dequeue path: a plain
+    //  atomic<size_t> position reset to 0 on every segment reopen exposes a
+    //  genuine ABA hazard -- a consumer thread's stale CAS attempt from a
+    //  previous "life" of a segment could otherwise spuriously match a new
+    //  life's counter.  Tagging the position with a counter that increments
+    //  on every reopen makes a stale attempt from an earlier life impossible
+    //  to alias against the current one.
+    struct tagged_position
+    {
+        using storage_type = uint64_t;
+
+        static constexpr int EPOCH_BITS = 16;
+        static constexpr storage_type POS_MASK = (storage_type{1} << (64 - EPOCH_BITS)) - 1;
+
+        static constexpr storage_type pack(size_t pos, uint16_t epoch)
+        {
+            return (static_cast<storage_type>(epoch) << (64 - EPOCH_BITS)) | (static_cast<storage_type>(pos) & POS_MASK);
+        }
+
+        static constexpr size_t unpack_pos(storage_type value)
+        {
+            return static_cast<size_t>(value & POS_MASK);
+        }
+
+        static constexpr uint16_t unpack_epoch(storage_type value)
+        {
+            return static_cast<uint16_t>(value >> (64 - EPOCH_BITS));
+        }
+    };
+
+    //  Multi-producer lock-free queue, growable via two alternating
+    //  ring-buffer segments, with a compile-time choice of single- or
+    //  multi-consumer operation.
+    //
+    //  A segment is only ever resized once fully drained, so growth never
+    //  copies live data -- it just reallocates empty memory to a larger
+    //  capacity (growth_numerator_/growth_denominator_ x the sibling
+    //  segment's current capacity, ~1.25x by default) and brings it back
+    //  into rotation.
+    //
+    //  MultiConsumer == false: pop_front()/empty() are consumer-thread-only
+    //  and use no atomics beyond a per-slot published-flag check -- this is
+    //  the entire reason to pick this mode: zero contention on the pop side.
+    //  MultiConsumer == true: pop_front()/empty() may be called from any
+    //  number of consumer threads concurrently, at the cost of a CAS-claimed,
+    //  epoch-tagged position per segment.
+    //
+    //  Ordering: two pushes from the same producer thread that land in the
+    //  same segment are observed by consumers in that order.  There is no
+    //  ordering guarantee across different producer threads, nor across a
+    //  segment boundary -- a push into a newly-active segment can be
+    //  observed before an earlier push still queued behind a slower
+    //  publisher in the other segment.  This relaxation is required: always
+    //  draining one segment to its declared capacity before ever considering
+    //  the other would permanently strand published items whenever
+    //  production stops before a segment's capacity happens to be exactly
+    //  exhausted.
+    template <typename T, bool MultiConsumer = false>
+    class mp_mc_sc_growable_ring_queue
+    {
+    public:
+        using value_type = T;
+
+        struct slot_type
+        {
+            atomic<bool> ready_;
+            alignas(T) unsigned char storage_[sizeof(T)];
+
+            slot_type()
+                : ready_(false)
+            {
+            }
+
+            T *element_ptr()
+            {
+                return reinterpret_cast<T *>(storage_);
+            }
+        };
+
+        using allocator_type = allocator<slot_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
+
+        explicit mp_mc_sc_growable_ring_queue(allocator_type &allocator,
+                                               size_t initial_capacity,
+                                               size_t growth_numerator = 5,
+                                               size_t growth_denominator = 4)
+            : allocator_(allocator),
+              growth_numerator_(growth_numerator),
+              growth_denominator_(growth_denominator)
+        {
+            open_segment(segments_[0], initial_capacity);
+            open_segment(segments_[1], initial_capacity);
+
+            segments_[0].other_ = &segments_[1];
+            segments_[1].other_ = &segments_[0];
+
+            producer_target_.store(&segments_[0], memory_order_relaxed);
+            store_consumer_target(&segments_[0]);
+        }
+
+        mp_mc_sc_growable_ring_queue(const mp_mc_sc_growable_ring_queue &) = delete;
+        mp_mc_sc_growable_ring_queue(mp_mc_sc_growable_ring_queue &&) = delete;
+        mp_mc_sc_growable_ring_queue &operator=(const mp_mc_sc_growable_ring_queue &) = delete;
+        mp_mc_sc_growable_ring_queue &operator=(mp_mc_sc_growable_ring_queue &&) = delete;
+
+        //  Precondition: no producer threads are concurrently pushing during
+        //  destruction (same convention as spsc_queue).
+        ~mp_mc_sc_growable_ring_queue()
+        {
+            destroy_segment(segments_[0]);
+            destroy_segment(segments_[1]);
+        }
+
+        //  May be called from any number of producer threads concurrently,
+        //  regardless of MultiConsumer.  Returns false only when both
+        //  segments are currently full.
+        template <class... Args>
+        bool push_back(Args &&...args)
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            //  Safe to forward on this attempt even though args may be
+            //  needed again below: try_claim_and_publish only ever touches
+            //  args if the claim succeeds (in which case we return
+            //  immediately and never need them again); a failed claim
+            //  returns before constructing anything.
+            if (try_claim_and_publish(*target, minstd::forward<Args>(args)...))
+            {
+                return true;
+            }
+
+            segment *fallback = target->other_;
+
+            //  No CAS needed: fallback is a fixed, pre-existing sibling, not
+            //  something producers race to create -- redundant stores of the
+            //  same value from multiple producers are race-free.
+            producer_target_.store(fallback, memory_order_relaxed);
+
+            return try_claim_and_publish(*fallback, minstd::forward<Args>(args)...);
+        }
+
+        //  If MultiConsumer == false: must only be called from a single
+        //  thread. If MultiConsumer == true: may be called from any number
+        //  of consumer threads concurrently.  Returning false does not
+        //  always mean the queue is empty -- it can also mean a producer is
+        //  transiently mid-push.  Callers must retry.
+        bool pop_front(T &front)
+        {
+            segment *preferred = load_consumer_target();
+
+            if (try_pop_from(*preferred, front))
+            {
+                return true;
+            }
+
+            segment *fallback = preferred->other_;
+
+            if (try_pop_from(*fallback, front))
+            {
+                store_consumer_target(fallback);
+                return true;
+            }
+
+            return false;
+        }
+
+        //  Consumer-thread-only (even under MultiConsumer -- a best-effort
+        //  hint, not a linearizable query): false is authoritative, true
+        //  only means "nothing available right now."
+        bool empty() const
+        {
+            return !has_ready(segments_[0]) && !has_ready(segments_[1]);
+        }
+
+        //  Consumer-thread-only diagnostic: sum of both segments' current
+        //  declared capacity.  Lets callers confirm growth actually happened.
+        size_t capacity_estimate() const
+        {
+            return segments_[0].capacity_ + segments_[1].capacity_;
+        }
+
+    private:
+        struct segment
+        {
+            segment *other_ = nullptr;
+            atomic<size_t> enqueue_pos_{0};
+            size_t capacity_ = 0;
+            slot_type *buffer_ = nullptr;
+
+            //  Dequeue-position representation is conditional on
+            //  MultiConsumer: plain size_t (single-consumer, no atomics at
+            //  all) vs. an epoch-tagged atomic<uint64_t> (multi-consumer,
+            //  CAS-claimed -- see tagged_position above for why the epoch
+            //  tag is required).
+            conditional_t<MultiConsumer, atomic<tagged_position::storage_type>, size_t> dequeue_state_{};
+
+            //  Multi-consumer only: counts slots that have FINISHED being
+            //  read (moved-out + destroyed), as opposed to merely CLAIMED
+            //  via the CAS above.  retire_and_grow() must not run until
+            //  every claimed slot has actually finished being read --
+            //  triggering it as soon as the *last position* is claimed is
+            //  unsafe, because a thread that claimed an earlier position can
+            //  be arbitrarily delayed (preemption) and still be mid-read
+            //  when a faster thread claims and finishes the last position.
+            //  Unused (but harmless, a few bytes) when MultiConsumer is
+            //  false, since single-consumer mode has no concurrent
+            //  claimants to stagger in the first place.
+            atomic<size_t> completed_count_{0};
+        };
+
+        using consumer_target_type = conditional_t<MultiConsumer, atomic<segment *>, segment *>;
+
+        void open_segment(segment &seg, size_t capacity)
+        {
+            seg.buffer_ = allocator_traits_type::allocate(allocator_, capacity);
+
+            if (seg.buffer_ == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * capacity, alignof(slot_type));
+                capacity = 0;
+            }
+
+            for (size_t i = 0; i < capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &seg.buffer_[i]);
+            }
+
+            seg.capacity_ = capacity;
+            seg.enqueue_pos_.store(0, memory_order_relaxed);
+            seg.completed_count_.store(0, memory_order_relaxed);
+
+            if constexpr (MultiConsumer)
+            {
+                seg.dequeue_state_.store(tagged_position::pack(0, 0), memory_order_relaxed);
+            }
+            else
+            {
+                seg.dequeue_state_ = 0;
+            }
+        }
+
+        void destroy_segment(segment &seg)
+        {
+            for (size_t i = 0; i < seg.capacity_; ++i)
+            {
+                //  Only slots a producer actually published still hold a
+                //  live T (production may have stopped mid-fill, leaving a
+                //  non-contiguous mix of claimed and never-claimed slots) --
+                //  skip past unclaimed slots, never stop early.
+                if (seg.buffer_[i].ready_.load(memory_order_acquire))
+                {
+                    seg.buffer_[i].element_ptr()->~T();
+                }
+
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
+        }
+
+        template <class... Args>
+        bool try_claim_and_publish(segment &seg, Args &&...args)
+        {
+            //  NOT a CAS loop: fetch_add is sufficient because enqueue_pos_
+            //  is never reused in place within a life -- no wraparound to
+            //  arbitrate, and fetch_add has no ABA exposure since it never
+            //  compares against a remembered value.  acquire: must observe
+            //  the reopen-gate release-store below if this claim belongs to
+            //  a freshly-recycled life, so the bound check against
+            //  capacity_ (and buffer_ itself) is guaranteed up to date.
+            size_t idx = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
+
+            if (idx >= seg.capacity_)
+            {
+                return false;
+            }
+
+            allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
+            seg.buffer_[idx].ready_.store(true, memory_order_release);
+
+            return true;
+        }
+
+        bool try_pop_from(segment &seg, T &front)
+        {
+            if constexpr (MultiConsumer)
+            {
+                tagged_position::storage_type state = seg.dequeue_state_.load(memory_order_acquire);
+
+                while (true)
+                {
+                    size_t pos = tagged_position::unpack_pos(state);
+
+                    if (pos >= seg.capacity_)
+                    {
+                        return false;
+                    }
+
+                    slot_type &s = seg.buffer_[pos];
+
+                    if (!s.ready_.load(memory_order_acquire))
+                    {
+                        return false;
+                    }
+
+                    tagged_position::storage_type next_state = tagged_position::pack(pos + 1, tagged_position::unpack_epoch(state));
+
+                    if (seg.dequeue_state_.compare_exchange_strong(state, next_state, memory_order_acq_rel, memory_order_acquire))
+                    {
+                        front = minstd::move(*s.element_ptr());
+                        allocator_traits_type::destroy(allocator_, s.element_ptr());
+                        s.ready_.store(false, memory_order_relaxed);
+
+                        //  Trigger retirement on COMPLETION order, not claim
+                        //  order: a thread that claimed an earlier position
+                        //  can be arbitrarily delayed and still be mid-read
+                        //  here while another thread has already claimed
+                        //  (and would otherwise appear to "finish") the last
+                        //  position -- retire_and_grow must not run until
+                        //  every claimed slot has actually finished being
+                        //  read, or a straggler's slot can be freed out from
+                        //  under it.  acq_rel: the thread whose increment
+                        //  reaches capacity_ is thereby guaranteed to
+                        //  synchronize-with every other thread's completed
+                        //  read (all of which happened-before their own
+                        //  fetch_add), so it alone is the one safe to retire.
+                        if (seg.completed_count_.fetch_add(1, memory_order_acq_rel) + 1 == seg.capacity_)
+                        {
+                            retire_and_grow(seg);
+                        }
+
+                        return true;
+                    }
+
+                    //  CAS failed: `state` was refreshed to the actual
+                    //  current packed value; loop and recheck.
+                }
+            }
+            else
+            {
+                if (seg.dequeue_state_ >= seg.capacity_)
+                {
+                    return false;
+                }
+
+                slot_type &s = seg.buffer_[seg.dequeue_state_];
+
+                if (!s.ready_.load(memory_order_acquire))
+                {
+                    return false;
+                }
+
+                front = minstd::move(*s.element_ptr());
+                allocator_traits_type::destroy(allocator_, s.element_ptr());
+                s.ready_.store(false, memory_order_relaxed);
+                ++seg.dequeue_state_;
+
+                if (seg.dequeue_state_ == seg.capacity_)
+                {
+                    retire_and_grow(seg);
+                }
+
+                return true;
+            }
+        }
+
+        bool has_ready(const segment &seg) const
+        {
+            size_t pos;
+
+            if constexpr (MultiConsumer)
+            {
+                pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
+            }
+            else
+            {
+                pos = seg.dequeue_state_;
+            }
+
+            if (pos >= seg.capacity_)
+            {
+                return false;
+            }
+
+            return seg.buffer_[pos].ready_.load(memory_order_acquire);
+        }
+
+        segment *load_consumer_target() const
+        {
+            if constexpr (MultiConsumer)
+            {
+                return consumer_target_.load(memory_order_relaxed);
+            }
+            else
+            {
+                return consumer_target_;
+            }
+        }
+
+        void store_consumer_target(segment *s)
+        {
+            if constexpr (MultiConsumer)
+            {
+                consumer_target_.store(s, memory_order_relaxed);
+            }
+            else
+            {
+                consumer_target_ = s;
+            }
+        }
+
+        size_t compute_new_capacity(size_t sibling_capacity) const
+        {
+            size_t grown = (sibling_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
+            return grown > sibling_capacity ? grown : sibling_capacity + 1;
+        }
+
+        //  Only ever called once a segment is proven fully drained: in
+        //  single-consumer mode the sole consumer thread calls this
+        //  unconditionally; in multi-consumer mode, exactly one consumer
+        //  thread's CAS can ever transition dequeue_state_ from capacity_-1
+        //  to capacity_, so the call is uniquely triggered without any
+        //  additional locking.
+        void retire_and_grow(segment &seg)
+        {
+            size_t new_capacity = compute_new_capacity(seg.other_->capacity_);
+
+            //  Allocate the new (larger) buffer before freeing the old one,
+            //  so an allocator failure degrades to "recycle at the old
+            //  capacity" instead of leaving the segment without a buffer.
+            slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
+            size_t effective_capacity = new_capacity;
+
+            for (size_t i = 0; i < seg.capacity_; ++i)
+            {
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            if (new_buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
+                new_buffer = seg.buffer_;
+                effective_capacity = seg.capacity_;
+            }
+            else
+            {
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
+            }
+
+            for (size_t i = 0; i < effective_capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &new_buffer[i]);
+            }
+
+            seg.buffer_ = new_buffer;
+            seg.capacity_ = effective_capacity;
+            seg.completed_count_.store(0, memory_order_relaxed);
+
+            //  Reopen gates: plain buffer_/capacity_ writes above MUST
+            //  precede these release-stores.  Two independent audiences --
+            //  producers gate on enqueue_pos_, other consumers (multi-
+            //  consumer mode only) gate on dequeue_state_ -- so the relative
+            //  order between the two stores below does not matter, only
+            //  that each individually follows the plain writes.
+            if constexpr (MultiConsumer)
+            {
+                uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
+                seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
+            }
+            else
+            {
+                seg.dequeue_state_ = 0;
+            }
+
+            seg.enqueue_pos_.store(0, memory_order_release);
+        }
+
+        allocator_type &allocator_;
+        size_t growth_numerator_;
+        size_t growth_denominator_;
+        segment segments_[2];
+        atomic<segment *> producer_target_;
+        consumer_target_type consumer_target_;
+    };
+}
