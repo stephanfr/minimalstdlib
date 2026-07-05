@@ -49,8 +49,18 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 minstd::atomic<bool> in_use_{false};
                 minstd::atomic<bool> active_{false};
-                pointer_type retired_ptr_ = nullptr;
-                deleter_type deleter_ = nullptr;
+
+                //  Atomic, not plain: multiple threads can concurrently scan
+                //  this record via try_reclaim_specific()/scan() (called
+                //  from any hazard guard's release, on any thread), while
+                //  another thread may simultaneously be winning the CAS on
+                //  active_ above and clearing these two fields. A plain
+                //  field would make that a data race -- benign in outcome
+                //  (the active_ CAS below still arbitrates who actually
+                //  reclaims), but still undefined behavior per the memory
+                //  model, and TSan (rightly) flags it.
+                minstd::atomic<pointer_type> retired_ptr_{nullptr};
+                minstd::atomic<deleter_type> deleter_{nullptr};
             };
 
         public:
@@ -191,8 +201,8 @@ namespace MINIMAL_STD_NAMESPACE
                             continue;
                         }
 
-                        retired_records_[i].retired_ptr_ = ptr;
-                        retired_records_[i].deleter_ = deleter;
+                        retired_records_[i].retired_ptr_.store(ptr, minstd::memory_order_relaxed);
+                        retired_records_[i].deleter_.store(deleter, minstd::memory_order_relaxed);
                         retired_records_[i].active_.store(true, minstd::memory_order_release);
 
                         //  Primary reclaim path: check this exact pointer right
@@ -245,7 +255,7 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    if (retired_records_[i].retired_ptr_ != ptr)
+                    if (retired_records_[i].retired_ptr_.load(minstd::memory_order_acquire) != ptr)
                     {
                         continue;
                     }
@@ -264,11 +274,11 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
-                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_;
-                    deleter_type deleter = retired_records_[i].deleter_;
+                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
+                    deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
-                    retired_records_[i].retired_ptr_ = nullptr;
-                    retired_records_[i].deleter_ = nullptr;
+                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
                     retired_records_[i].in_use_.store(false, minstd::memory_order_release);
 
                     if ((ptr_to_delete != nullptr) && (deleter != nullptr))
@@ -295,7 +305,7 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    pointer_type retired_ptr = retired_records_[i].retired_ptr_;
+                    pointer_type retired_ptr = retired_records_[i].retired_ptr_.load(minstd::memory_order_acquire);
 
                     if ((retired_ptr == nullptr) || is_hazard_protected(retired_ptr))
                     {
@@ -311,11 +321,11 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_;
-                    deleter_type deleter = retired_records_[i].deleter_;
+                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
+                    deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
-                    retired_records_[i].retired_ptr_ = nullptr;
-                    retired_records_[i].deleter_ = nullptr;
+                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
                     retired_records_[i].in_use_.store(false, minstd::memory_order_release);
 
                     if ((ptr_to_delete != nullptr) && (deleter != nullptr))
@@ -429,12 +439,12 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_;
-                    deleter_type deleter = retired_records_[i].deleter_;
+                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
+                    deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
                     retired_records_[i].active_.store(false, minstd::memory_order_release);
-                    retired_records_[i].retired_ptr_ = nullptr;
-                    retired_records_[i].deleter_ = nullptr;
+                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
                     retired_records_[i].in_use_.store(false, minstd::memory_order_release);
 
                     if ((ptr_to_delete != nullptr) && (deleter != nullptr))

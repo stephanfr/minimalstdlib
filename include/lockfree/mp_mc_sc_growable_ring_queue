@@ -50,6 +50,53 @@ namespace MINIMAL_STD_NAMESPACE
         }
     };
 
+    //  Packs a position together with the CURRENT LIFE's capacity into one
+    //  atomic word, for the enqueue side (both consumer modes -- this is not
+    //  a multi-consumer-only concern).  A plain ascending fetch_add
+    //  compared, after the fact, against a separately-read capacity_ field
+    //  is not safe: a producer that gets an overflowing (invalid) claim and
+    //  is then descheduled before checking it can wake up after the segment
+    //  has since drained and regrown to a larger capacity, and have that
+    //  later, larger capacity make its stale claim look valid.  Since
+    //  capacity only ever grows, this is not a rare corner case -- it is the
+    //  expected outcome whenever a producer is delayed across a regrow.
+    //  Packing the claiming life's own capacity into the same atomic word
+    //  the position comes from makes the bound check self-contained: the
+    //  capacity a producer checks its claim against is always the exact one
+    //  in effect at the moment of its own fetch_add, never a later one.
+    //  (An earlier attempt to fix this by counting DOWN from capacity
+    //  instead -- so overflow was detectable from the return value alone,
+    //  with no capacity read at all -- turned out to invert claim order to
+    //  a top-down suffix, which breaks the low-to-high contiguous-prefix
+    //  claim order the sequential dequeue side depends on: whenever
+    //  production stops before a segment is fully claimed, which is the
+    //  common case at shutdown, the consumer would permanently stall on
+    //  low, never-claimed slots while already-published high slots sit
+    //  unreachable behind them. This scheme keeps ascending claim order
+    //  intact and fixes only the staleness of the bound check itself.)
+    struct tagged_enqueue_state
+    {
+        using storage_type = uint64_t;
+
+        static constexpr int CAPACITY_BITS = 24;
+        static constexpr storage_type POS_MASK = (storage_type{1} << (64 - CAPACITY_BITS)) - 1;
+
+        static constexpr storage_type pack(size_t capacity, size_t pos)
+        {
+            return (static_cast<storage_type>(capacity) << (64 - CAPACITY_BITS)) | (static_cast<storage_type>(pos) & POS_MASK);
+        }
+
+        static constexpr size_t unpack_capacity(storage_type value)
+        {
+            return static_cast<size_t>(value >> (64 - CAPACITY_BITS));
+        }
+
+        static constexpr size_t unpack_pos(storage_type value)
+        {
+            return static_cast<size_t>(value & POS_MASK);
+        }
+    };
+
     //  Multi-producer lock-free queue, growable via two alternating
     //  ring-buffer segments, with a compile-time choice of single- or
     //  multi-consumer operation.
@@ -273,7 +320,12 @@ namespace MINIMAL_STD_NAMESPACE
         struct segment
         {
             segment *other_ = nullptr;
-            atomic<size_t> enqueue_pos_{0};
+
+            //  Packs the claiming life's capacity together with the
+            //  ascending position counter -- see tagged_enqueue_state above.
+            //  Applies uniformly regardless of MultiConsumer: the staleness
+            //  hazard this closes is not specific to multi-consumer mode.
+            atomic<tagged_enqueue_state::storage_type> enqueue_pos_{0};
 
             //  Dequeue-position representation is conditional on
             //  MultiConsumer: plain size_t (single-consumer, no atomics at
@@ -319,9 +371,7 @@ namespace MINIMAL_STD_NAMESPACE
                 allocator_traits_type::construct(allocator_, &buffer[i]);
             }
 
-            //  Counts DOWN from capacity (see try_claim_and_publish) rather
-            //  than up from zero.
-            seg.enqueue_pos_.store(capacity, memory_order_relaxed);
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(capacity, 0), memory_order_relaxed);
 
             if constexpr (MultiConsumer)
             {
@@ -369,35 +419,35 @@ namespace MINIMAL_STD_NAMESPACE
         template <class... Args>
         bool try_claim_and_publish(segment &seg, Args &&...args)
         {
-            //  enqueue_pos_ counts DOWN from the life's capacity rather than
-            //  up from zero, so overflow is a self-contained fact of the
-            //  fetch_sub's own return value -- reinterpreting the (unsigned)
-            //  result as signed, <= 0 means this claim ran past the end of
-            //  the current life.  This needs no follow-up read of capacity_
-            //  or the buffer at all, so an overflowing claim bails out
-            //  before ever touching either.  That matters: a producer
-            //  delayed between an overflowing claim and a *subsequent*
-            //  capacity/buffer comparison could otherwise have that
-            //  comparison observe a since-grown capacity (single-consumer:
-            //  silently corrupts a slot two lives are now racing over) or a
-            //  since-freed descriptor (multi-consumer: a real
-            //  use-after-free) -- either way wrongly treating a stale claim
-            //  from an already-retired life as valid for the current one.
-            //  A valid claim (> 0) needs no such protection: it is, by
+            //  fetch_add still hands out an ascending, contiguous-from-zero
+            //  position within the current life (unchanged claim order --
+            //  the sequential dequeue side depends on it), but the capacity
+            //  to validate that position against comes from the SAME atomic
+            //  word, frozen at the exact instant of this producer's own
+            //  fetch_add (see tagged_enqueue_state above).  That makes the
+            //  bound check self-contained: it can never observe a LATER
+            //  life's (larger) capacity, however long this producer is
+            //  delayed before checking it, closing a real hazard where a
+            //  producer with an overflowing claim could otherwise wake after
+            //  the segment regrew and have the new, larger capacity make its
+            //  stale claim look valid -- corrupting a slot two lives now
+            //  race over (single-consumer) or dereferencing an
+            //  already-freed descriptor (multi-consumer).  A valid claim (idx
+            //  < capacity_at_claim) needs no such protection: it is, by
             //  construction, guaranteed to be within [0, capacity) for
-            //  whichever life is current at the moment of the fetch_sub, and
+            //  whichever life is current at the moment of the fetch_add, and
             //  that life cannot retire until this exact claim publishes (see
-            //  try_pop_from's "no straggler left" note) -- so reading
-            //  capacity_/the buffer afterward, however delayed, is safe
-            //  without any further check.
-            int64_t remaining_before = static_cast<int64_t>(seg.enqueue_pos_.fetch_sub(1, memory_order_acquire));
+            //  try_pop_from's "no straggler left" note) -- so reading the
+            //  buffer afterward, however delayed, is safe without any
+            //  further check.
+            tagged_enqueue_state::storage_type before = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
+            size_t capacity_at_claim = tagged_enqueue_state::unpack_capacity(before);
+            size_t idx = tagged_enqueue_state::unpack_pos(before);
 
-            if (remaining_before <= 0)
+            if (idx >= capacity_at_claim)
             {
                 return false;
             }
-
-            size_t idx = static_cast<size_t>(remaining_before) - 1;
 
             if constexpr (MultiConsumer)
             {
@@ -609,10 +659,9 @@ namespace MINIMAL_STD_NAMESPACE
             //  precede this release-store, since the sole consumer thread's
             //  own next dequeue_state_ read is a plain (non-atomic) read
             //  that simply follows program order, and the producer side's
-            //  fetch_sub on enqueue_pos_ (acquire) must observe it.  Counts
-            //  down from the new capacity (see try_claim_and_publish).
+            //  fetch_add on enqueue_pos_ (acquire) must observe it.
             seg.dequeue_state_ = 0;
-            seg.enqueue_pos_.store(effective_capacity, memory_order_release);
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(effective_capacity, 0), memory_order_release);
         }
 
         //  Multi-consumer only: called once `desc` (the descriptor this
@@ -644,7 +693,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  this reopen.
                 uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
                 seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-                seg.enqueue_pos_.store(desc->capacity_, memory_order_release);
+                seg.enqueue_pos_.store(tagged_enqueue_state::pack(desc->capacity_, 0), memory_order_release);
                 return;
             }
 
@@ -663,7 +712,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
             seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-            seg.enqueue_pos_.store(new_capacity, memory_order_release);
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(new_capacity, 0), memory_order_release);
 
             //  Hand the old descriptor off for hazard-protected deferred
             //  deletion -- safe to reclaim immediately once no consumer
