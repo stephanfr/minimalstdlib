@@ -112,15 +112,29 @@ namespace MINIMAL_STD_NAMESPACE
         }
     };
 
-    //  Multi-producer lock-free queue, growable via two alternating
-    //  ring-buffer segments, with a compile-time choice of single- or
-    //  multi-consumer operation.
+    //  Multi-producer lock-free queue, growable via SegmentCount ring-buffer
+    //  segments arranged in a fixed cycle, with a compile-time choice of
+    //  single- or multi-consumer operation.
     //
     //  A segment is only ever resized once fully drained, so growth never
     //  copies live data -- it just reallocates empty memory to a larger
-    //  capacity (growth_numerator_/growth_denominator_ x the sibling
-    //  segment's current capacity, ~1.25x by default) and brings it back
-    //  into rotation.
+    //  capacity (growth_numerator_/growth_denominator_ x the next segment's
+    //  current capacity in ring order, ~1.25x by default) and brings it
+    //  back into rotation.
+    //
+    //  SegmentCount (default 2) controls how many segments are kept in
+    //  rotation simultaneously.  Raising it gives push_back() more
+    //  pre-allocated headroom to absorb a producer burst before ever
+    //  returning false, WITHOUT introducing any new coordination between
+    //  producer threads: every segment in the ring is always already
+    //  allocated ahead of need (via the same drain-then-regrow mechanism as
+    //  the 2-segment case), so walking to the next one during a burst is
+    //  only ever a pointer follow, never an on-demand allocation racing
+    //  multiple producers to decide who performs it. Raising SegmentCount
+    //  only raises the threshold before the ring is genuinely exhausted --
+    //  it cannot eliminate that possibility for a long enough sustained
+    //  burst, so push_back() can still return false and callers must still
+    //  handle that (the same way any bounded queue's caller must).
     //
     //  MultiConsumer == false: pop_front()/empty() are consumer-thread-only
     //  and use no atomics beyond a per-slot published-flag check -- this is
@@ -134,14 +148,16 @@ namespace MINIMAL_STD_NAMESPACE
     //  ordering guarantee across different producer threads, nor across a
     //  segment boundary -- a push into a newly-active segment can be
     //  observed before an earlier push still queued behind a slower
-    //  publisher in the other segment.  This relaxation is required: always
+    //  publisher in another segment.  This relaxation is required: always
     //  draining one segment to its declared capacity before ever considering
-    //  the other would permanently strand published items whenever
-    //  production stops before a segment's capacity happens to be exactly
-    //  exhausted.
-    template <typename T, bool MultiConsumer = false>
+    //  the rest of the ring would permanently strand published items
+    //  whenever production stops before a segment's capacity happens to be
+    //  exactly exhausted.
+    template <typename T, bool MultiConsumer = false, size_t SegmentCount = 2>
     class mp_mc_sc_growable_ring_queue
     {
+        static_assert(SegmentCount >= 2, "mp_mc_sc_growable_ring_queue requires at least 2 segments");
+
     public:
         using value_type = T;
 
@@ -228,11 +244,15 @@ namespace MINIMAL_STD_NAMESPACE
               growth_numerator_(growth_numerator),
               growth_denominator_(growth_denominator)
         {
-            open_segment(segments_[0], initial_capacity);
-            open_segment(segments_[1], initial_capacity);
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                open_segment(segments_[i], initial_capacity);
+            }
 
-            segments_[0].other_ = &segments_[1];
-            segments_[1].other_ = &segments_[0];
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                segments_[i].next_ = &segments_[(i + 1) % SegmentCount];
+            }
 
             producer_target_.store(&segments_[0], memory_order_relaxed);
             store_consumer_target(&segments_[0]);
@@ -247,36 +267,48 @@ namespace MINIMAL_STD_NAMESPACE
         //  destruction (same convention as spsc_queue).
         ~mp_mc_sc_growable_ring_queue()
         {
-            destroy_segment(segments_[0]);
-            destroy_segment(segments_[1]);
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                destroy_segment(segments_[i]);
+            }
         }
 
         //  May be called from any number of producer threads concurrently,
-        //  regardless of MultiConsumer.  Returns false only when both
-        //  segments are currently full.
+        //  regardless of MultiConsumer.  Returns false only when every
+        //  segment in the ring is currently full.
         template <class... Args>
         bool push_back(Args &&...args)
         {
             segment *target = producer_target_.load(memory_order_relaxed);
 
-            //  Safe to forward on this attempt even though args may be
-            //  needed again below: try_claim_and_publish only ever touches
-            //  args if the claim succeeds (in which case we return
-            //  immediately and never need them again); a failed claim
-            //  returns before constructing anything.
-            if (try_claim_and_publish(*target, minstd::forward<Args>(args)...))
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
             {
-                return true;
+                //  Safe to forward on every attempt even though args may be
+                //  needed again below: try_claim_and_publish only ever
+                //  touches args if the claim succeeds (in which case we
+                //  return immediately and never need them again); a failed
+                //  claim returns before constructing anything.
+                if (try_claim_and_publish(*target, minstd::forward<Args>(args)...))
+                {
+                    return true;
+                }
+
+                if (attempt + 1 < SegmentCount)
+                {
+                    target = target->next_;
+
+                    //  No CAS needed: next_ is a fixed, pre-existing ring
+                    //  member, not something producers race to create --
+                    //  redundant stores of the same value from multiple
+                    //  producers are race-free.  Storing between every
+                    //  attempt (not just the last) lets the next push_back
+                    //  call resume from wherever this one left off, instead
+                    //  of re-trying segments already known to be exhausted.
+                    producer_target_.store(target, memory_order_relaxed);
+                }
             }
 
-            segment *fallback = target->other_;
-
-            //  No CAS needed: fallback is a fixed, pre-existing sibling, not
-            //  something producers race to create -- redundant stores of the
-            //  same value from multiple producers are race-free.
-            producer_target_.store(fallback, memory_order_relaxed);
-
-            return try_claim_and_publish(*fallback, minstd::forward<Args>(args)...);
+            return false;
         }
 
         //  If MultiConsumer == false: must only be called from a single
@@ -286,19 +318,17 @@ namespace MINIMAL_STD_NAMESPACE
         //  transiently mid-push.  Callers must retry.
         bool pop_front(T &front)
         {
-            segment *preferred = load_consumer_target();
+            segment *candidate = load_consumer_target();
 
-            if (try_pop_from(*preferred, front))
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
             {
-                return true;
-            }
+                if (try_pop_from(*candidate, front))
+                {
+                    store_consumer_target(candidate);
+                    return true;
+                }
 
-            segment *fallback = preferred->other_;
-
-            if (try_pop_from(*fallback, front))
-            {
-                store_consumer_target(fallback);
-                return true;
+                candidate = candidate->next_;
             }
 
             return false;
@@ -309,32 +339,55 @@ namespace MINIMAL_STD_NAMESPACE
         //  only means "nothing available right now."
         bool empty() const
         {
-            return !has_ready(segments_[0]) && !has_ready(segments_[1]);
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                if (has_ready(segments_[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
-        //  Consumer-thread-only diagnostic: sum of both segments' current
+        //  Consumer-thread-only diagnostic: sum of every segment's current
         //  declared capacity.  Lets callers confirm growth actually happened.
         size_t capacity_estimate() const
         {
+            size_t total = 0;
+
             if constexpr (MultiConsumer)
             {
-                typename domain_type::hazard_guard g0 = domain_.acquire_guard();
-                retired_descriptor *d0 = g0.protect(segments_[0].current_);
-                typename domain_type::hazard_guard g1 = domain_.acquire_guard();
-                retired_descriptor *d1 = g1.protect(segments_[1].current_);
+                typename domain_type::hazard_guard guard = domain_.acquire_guard();
 
-                return d0->capacity_ + d1->capacity_;
+                for (size_t i = 0; i < SegmentCount; ++i)
+                {
+                    retired_descriptor *d = guard.protect(segments_[i].current_);
+                    total += d->capacity_;
+                }
             }
             else
             {
-                return segments_[0].capacity_ + segments_[1].capacity_;
+                for (size_t i = 0; i < SegmentCount; ++i)
+                {
+                    total += segments_[i].capacity_;
+                }
             }
+
+            return total;
         }
 
     private:
         struct segment
         {
-            segment *other_ = nullptr;
+            //  Fixed ring member -- always the next segment in a
+            //  SegmentCount-length cycle (never reallocated, never
+            //  repointed after construction).  Named next_ rather than
+            //  other_/sibling_ because with SegmentCount > 2 it is one of
+            //  several ring neighbors, not a single dedicated partner; for
+            //  the SegmentCount == 2 default it is exactly the old sibling_
+            //  (a 2-cycle: A -> B -> A).
+            segment *next_ = nullptr;
 
             //  Packs the claiming life's capacity together with the
             //  ascending position counter -- see tagged_enqueue_state above.
@@ -626,10 +679,10 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
-        size_t compute_new_capacity(size_t sibling_capacity) const
+        size_t compute_new_capacity(size_t reference_capacity) const
         {
-            size_t grown = (sibling_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
-            return grown > sibling_capacity ? grown : sibling_capacity + 1;
+            size_t grown = (reference_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
+            return grown > reference_capacity ? grown : reference_capacity + 1;
         }
 
         //  Single-consumer only: only ever called once a segment is proven
@@ -638,7 +691,14 @@ namespace MINIMAL_STD_NAMESPACE
         //  to protect against.
         void retire_and_grow(segment &seg)
         {
-            size_t new_capacity = compute_new_capacity(seg.other_->capacity_);
+            //  Grows relative to the NEXT segment in the ring, not any
+            //  particular one -- for SegmentCount == 2 this is the same
+            //  single sibling as before; for SegmentCount > 2 it is simply
+            //  a fixed, consistent reference point. Growth is monotonic
+            //  (never shrinks) and every segment eventually reopens based on
+            //  whatever its neighbor grew to, so all ring members converge
+            //  to within one growth factor of each other over enough cycles.
+            size_t new_capacity = compute_new_capacity(seg.next_->capacity_);
 
             //  Allocate the new (larger) buffer before freeing the old one,
             //  so an allocator failure degrades to "recycle at the old
@@ -690,8 +750,10 @@ namespace MINIMAL_STD_NAMESPACE
         //  precisely because those fields never change after construction).
         void retire_and_grow_multi(segment &seg, retired_descriptor *desc)
         {
+            //  Grows relative to the NEXT segment in the ring -- see
+            //  retire_and_grow's comment above; the reasoning is identical.
             typename domain_type::hazard_guard sibling_guard = domain_.acquire_guard();
-            retired_descriptor *sibling_desc = sibling_guard.protect(seg.other_->current_);
+            retired_descriptor *sibling_desc = sibling_guard.protect(seg.next_->current_);
             size_t new_capacity = compute_new_capacity(sibling_desc->capacity_);
 
             slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
@@ -740,7 +802,7 @@ namespace MINIMAL_STD_NAMESPACE
         allocator_type &allocator_;
         size_t growth_numerator_;
         size_t growth_denominator_;
-        segment segments_[2];
+        segment segments_[SegmentCount];
         atomic<segment *> producer_target_;
         consumer_target_type consumer_target_;
         mutable conditional_t<MultiConsumer, domain_type, no_domain> domain_;
