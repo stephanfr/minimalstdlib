@@ -78,7 +78,22 @@ namespace MINIMAL_STD_NAMESPACE
     {
         using storage_type = uint64_t;
 
-        static constexpr int CAPACITY_BITS = 24;
+        //  Split evenly at 32/32. Capacity needs real headroom -- under
+        //  sustained, saturated throughput (producer and consumer both
+        //  continuously busy, never idling) a segment genuinely fills and
+        //  triggers a real regrow every single life, with no natural lull
+        //  to let growth taper off, so capacity climbs for as long as that
+        //  throughput continues; 24 bits (16.7M) was observed to be crossed
+        //  within a single benchmark run. Position needs real headroom too:
+        //  nothing blocks other producer threads from continuing to
+        //  fetch_add against an already-exhausted counter for the entire
+        //  duration of the regrow's allocate+construct loop (whose own cost
+        //  scales with the new capacity), so a narrow position budget is
+        //  its own overflow-into-capacity-bits hazard at large capacities.
+        //  32 bits each gives ~4.29 billion headroom on both sides --
+        //  already a physically implausible capacity (would require
+        //  terabytes of backing memory) or claim-pileup count.
+        static constexpr int CAPACITY_BITS = 32;
         static constexpr storage_type POS_MASK = (storage_type{1} << (64 - CAPACITY_BITS)) - 1;
 
         static constexpr storage_type pack(size_t capacity, size_t pos)
