@@ -319,7 +319,9 @@ namespace MINIMAL_STD_NAMESPACE
                 allocator_traits_type::construct(allocator_, &buffer[i]);
             }
 
-            seg.enqueue_pos_.store(0, memory_order_relaxed);
+            //  Counts DOWN from capacity (see try_claim_and_publish) rather
+            //  than up from zero.
+            seg.enqueue_pos_.store(capacity, memory_order_relaxed);
 
             if constexpr (MultiConsumer)
             {
@@ -367,43 +369,45 @@ namespace MINIMAL_STD_NAMESPACE
         template <class... Args>
         bool try_claim_and_publish(segment &seg, Args &&...args)
         {
-            //  NOT a CAS loop: fetch_add is sufficient because enqueue_pos_
-            //  is never reused in place within a life -- no wraparound to
-            //  arbitrate, and fetch_add has no ABA exposure since it never
-            //  compares against a remembered value.  acquire: must observe
-            //  the reopen-gate release-store below if this claim belongs to
-            //  a freshly-recycled life, so the bound check against capacity
-            //  (and the buffer itself) is guaranteed up to date.
-            size_t idx = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
+            //  enqueue_pos_ counts DOWN from the life's capacity rather than
+            //  up from zero, so overflow is a self-contained fact of the
+            //  fetch_sub's own return value -- reinterpreting the (unsigned)
+            //  result as signed, <= 0 means this claim ran past the end of
+            //  the current life.  This needs no follow-up read of capacity_
+            //  or the buffer at all, so an overflowing claim bails out
+            //  before ever touching either.  That matters: a producer
+            //  delayed between an overflowing claim and a *subsequent*
+            //  capacity/buffer comparison could otherwise have that
+            //  comparison observe a since-grown capacity (single-consumer:
+            //  silently corrupts a slot two lives are now racing over) or a
+            //  since-freed descriptor (multi-consumer: a real
+            //  use-after-free) -- either way wrongly treating a stale claim
+            //  from an already-retired life as valid for the current one.
+            //  A valid claim (> 0) needs no such protection: it is, by
+            //  construction, guaranteed to be within [0, capacity) for
+            //  whichever life is current at the moment of the fetch_sub, and
+            //  that life cannot retire until this exact claim publishes (see
+            //  try_pop_from's "no straggler left" note) -- so reading
+            //  capacity_/the buffer afterward, however delayed, is safe
+            //  without any further check.
+            int64_t remaining_before = static_cast<int64_t>(seg.enqueue_pos_.fetch_sub(1, memory_order_acquire));
+
+            if (remaining_before <= 0)
+            {
+                return false;
+            }
+
+            size_t idx = static_cast<size_t>(remaining_before) - 1;
 
             if constexpr (MultiConsumer)
             {
-                //  No hazard guard needed here: retire_and_grow_multi() for
-                //  THIS life cannot run until every valid claim in
-                //  [0, capacity) -- including whichever one this fetch_add
-                //  just returned, if it is valid -- has been both published
-                //  and consumed (dequeue only ever advances one position at
-                //  a time, and only past a position whose ready_ flag it has
-                //  already observed true). So the descriptor this load
-                //  returns is guaranteed to still be the current, live one
-                //  for the entire remainder of this call.
                 retired_descriptor *desc = seg.current_.load(memory_order_acquire);
-
-                if (idx >= desc->capacity_)
-                {
-                    return false;
-                }
 
                 allocator_traits_type::construct(allocator_, desc->buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
                 desc->buffer_[idx].ready_.store(true, memory_order_release);
             }
             else
             {
-                if (idx >= seg.capacity_)
-                {
-                    return false;
-                }
-
                 allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
                 seg.buffer_[idx].ready_.store(true, memory_order_release);
             }
@@ -605,9 +609,10 @@ namespace MINIMAL_STD_NAMESPACE
             //  precede this release-store, since the sole consumer thread's
             //  own next dequeue_state_ read is a plain (non-atomic) read
             //  that simply follows program order, and the producer side's
-            //  fetch_add on enqueue_pos_ (acquire) must observe it.
+            //  fetch_sub on enqueue_pos_ (acquire) must observe it.  Counts
+            //  down from the new capacity (see try_claim_and_publish).
             seg.dequeue_state_ = 0;
-            seg.enqueue_pos_.store(0, memory_order_release);
+            seg.enqueue_pos_.store(effective_capacity, memory_order_release);
         }
 
         //  Multi-consumer only: called once `desc` (the descriptor this
@@ -639,7 +644,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  this reopen.
                 uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
                 seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-                seg.enqueue_pos_.store(0, memory_order_release);
+                seg.enqueue_pos_.store(desc->capacity_, memory_order_release);
                 return;
             }
 
@@ -658,7 +663,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
             seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-            seg.enqueue_pos_.store(0, memory_order_release);
+            seg.enqueue_pos_.store(new_capacity, memory_order_release);
 
             //  Hand the old descriptor off for hazard-protected deferred
             //  deletion -- safe to reclaim immediately once no consumer
