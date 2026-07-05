@@ -142,7 +142,7 @@ namespace
             return nullptr;
         }
 
-        void run()
+        void run(size_t idle_rotation_interval = 0)
         {
             new_delete_test_resource resource;
             alloc_t alloc(&resource);
@@ -150,7 +150,7 @@ namespace
             //  Deliberately small initial capacity relative to
             //  ITEMS_PER_PRODUCER, forcing many real growth cycles across
             //  every segment in the ring under contention.
-            queue_t q(alloc, 8, 5, 4);
+            queue_t q(alloc, 8, 5, 4, idle_rotation_interval);
             queue_ = &q;
 
             pthread_t producers[NUM_PRODUCERS];
@@ -325,4 +325,113 @@ TEST(MpMcScGrowableRingQueueTests, RingUnderContentionMultiConsumer)
 {
     ring_stress_harness<true, 4> harness;
     harness.run();
+}
+
+//  idle_rotation_interval left at its default of 0: capacity must only ever
+//  grow, exactly as before this feature existed, even when a segment is left
+//  running well under 50% loaded indefinitely.
+TEST(MpMcScGrowableRingQueueTests, IdleRotationDisabledByDefault)
+{
+    minstd::pmr::monotonic_buffer_resource resource(scratch_buffer, SCRATCH_BUFFER_SIZE, nullptr);
+
+    using queue_t = minstd::mp_mc_sc_growable_ring_queue<int>;
+    minstd::pmr::polymorphic_allocator<queue_t::allocator_type::value_type> alloc(&resource);
+
+    queue_t q(alloc, 100);
+
+    for (int i = 0; i < 20; ++i)
+    {
+        CHECK_TRUE(q.push_back(i));
+    }
+
+    for (int i = 0; i < 20; ++i)
+    {
+        int v = -1;
+
+        CHECK_TRUE(q.pop_front(v));
+        CHECK_EQUAL(i, v);
+    }
+
+    //  Segment never got anywhere near full (20 of 100), and with rotation
+    //  disabled it must never have been capped or shrunk.
+    CHECK_EQUAL(200, q.capacity_estimate()); // 100 + 100, both segments untouched
+}
+
+//  A segment left running well under 50% loaded should get its life closed
+//  early and reopen SMALLER, once idle_rotation_interval successful pops
+//  have occurred -- without ever needing to be completely refilled to its
+//  (currently much larger) declared capacity first.
+TEST(MpMcScGrowableRingQueueTests, IdleRotationShrinksUnderusedSegment)
+{
+    minstd::pmr::monotonic_buffer_resource resource(scratch_buffer, SCRATCH_BUFFER_SIZE, nullptr);
+
+    using queue_t = minstd::mp_mc_sc_growable_ring_queue<int>;
+    minstd::pmr::polymorphic_allocator<queue_t::allocator_type::value_type> alloc(&resource);
+
+    //  initial_capacity=100 (both segments), default growth 5/4, check for
+    //  idle rotation every 4th successful pop.
+    queue_t q(alloc, 100, 5, 4, 4);
+
+    CHECK_EQUAL(200, q.capacity_estimate()); // 100 + 100 to start
+
+    //  Push only 20 of segment 0's 100 slots -- well under the 50%
+    //  threshold -- then stop. No overflow, no organic regrow trigger.
+    for (int i = 0; i < 20; ++i)
+    {
+        CHECK_TRUE(q.push_back(i));
+    }
+
+    //  Drain all 20. On the 4th, 8th, 12th, 16th, and 20th pops (every
+    //  idle_rotation_interval-th one), the queue opportunistically checks
+    //  whether the active segment (still segment 0, at 20/100 = 20% loaded)
+    //  should be capped. The first such check that lands while a claimed-
+    //  but-not-yet-consumed backlog still remains closes segment 0's life
+    //  early at capacity_=20; the final pop then completes that (now
+    //  smaller) life and triggers a real regrow, shrinking it further via
+    //  the inverse growth ratio (20 * 4 / 5 = 16) rather than growing.
+    for (int expected = 0; expected < 20; ++expected)
+    {
+        int v = -1;
+
+        CHECK_TRUE(q.pop_front(v));
+        CHECK_EQUAL(expected, v);
+    }
+
+    //  Segment 0 must have reopened SMALLER than its original 100 -- total
+    //  capacity is now segment 0's shrunk size plus segment 1's untouched
+    //  100. If shrinking never triggered, this would still read 200.
+    size_t final_capacity = q.capacity_estimate();
+
+    CHECK_TRUE(final_capacity < 200);
+    CHECK_TRUE(final_capacity >= 100); // segment 1 alone still accounts for 100
+
+    //  The queue must still be fully, correctly usable afterward.
+    for (int i = 100; i < 120; ++i)
+    {
+        CHECK_TRUE(q.push_back(i));
+    }
+
+    for (int expected = 100; expected < 120; ++expected)
+    {
+        int v = -1;
+
+        CHECK_TRUE(q.pop_front(v));
+        CHECK_EQUAL(expected, v);
+    }
+}
+
+//  Same shrink mechanism, but under real multi-producer/multi-consumer
+//  contention (both MultiConsumer configurations), to catch any concurrency
+//  bug in the shrink-vs-normal-completion arbitration (segment::retire_claimed_)
+//  that a single-threaded test can't exercise.
+TEST(MpMcScGrowableRingQueueTests, RingUnderContentionWithIdleRotationSingleConsumer)
+{
+    ring_stress_harness<false, 4> harness;
+    harness.run(500);
+}
+
+TEST(MpMcScGrowableRingQueueTests, RingUnderContentionWithIdleRotationMultiConsumer)
+{
+    ring_stress_harness<true, 4> harness;
+    harness.run(500);
 }

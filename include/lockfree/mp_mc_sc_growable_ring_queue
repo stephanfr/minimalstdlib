@@ -122,6 +122,14 @@ namespace MINIMAL_STD_NAMESPACE
     //  current capacity in ring order, ~1.25x by default) and brings it
     //  back into rotation.
     //
+    //  idle_rotation_interval (constructor parameter, 0/default disables
+    //  this) opportunistically closes a segment's life early -- before it
+    //  organically fills -- if it is running under 50% loaded once that
+    //  many pops have occurred, so it can reopen SMALLER instead of only
+    //  ever being eligible to shrink after being completely refilled to a
+    //  possibly burst-inflated capacity again first (which, once a burst
+    //  subsides, may never happen). See maybe_shrink_active_segment().
+    //
     //  SegmentCount (default 2) controls how many segments are kept in
     //  rotation simultaneously.  Raising it gives push_back() more
     //  pre-allocated headroom to absorb a producer burst before ever
@@ -197,12 +205,35 @@ namespace MINIMAL_STD_NAMESPACE
         struct retired_descriptor : lockfree::hazardous_resource<retired_descriptor, domain_type>
         {
             slot_type *buffer_;
-            size_t capacity_;
+
+            //  original_capacity_ is the PHYSICAL size this buffer was
+            //  allocated at -- immutable for the descriptor's whole life,
+            //  exactly like buffer_/allocator_, and used wherever the real
+            //  allocation size matters (destructor cleanup, deallocate()'s
+            //  size argument, array-indexing safety).
+            //
+            //  capacity_ is the CURRENT, effective size for THIS life --
+            //  starts equal to original_capacity_, but can be reduced
+            //  exactly once, opportunistically, by maybe_shrink_active_segment()
+            //  if this segment is running well under capacity (see there).
+            //  It is atomic (unlike buffer_/original_capacity_/allocator_,
+            //  which truly never change) because, under MultiConsumer, any
+            //  consumer thread's periodic check may reduce it while other
+            //  consumer threads concurrently read it via their own hazard
+            //  guard. That's safe: the per-slot ready_ flag remains the sole
+            //  authority on whether a slot was ever published, so a reader
+            //  observing a stale (not-yet-reduced) snapshot of capacity_
+            //  only affects a fast-path bound check, never memory safety --
+            //  the physical buffer never shrinks mid-life, only the
+            //  "how much of it counts for this life" value does.
+            size_t original_capacity_;
+            atomic<size_t> capacity_;
             allocator_type *allocator_;
 
             retired_descriptor(domain_type &domain, slot_type *buffer, size_t capacity, allocator_type *allocator)
                 : lockfree::hazardous_resource<retired_descriptor, domain_type>(domain),
                   buffer_(buffer),
+                  original_capacity_(capacity),
                   capacity_(capacity),
                   allocator_(allocator)
             {
@@ -215,9 +246,14 @@ namespace MINIMAL_STD_NAMESPACE
             //  shutdown (production may have stopped mid-fill, leaving a
             //  non-contiguous claimed/unclaimed mix) -- so this must check
             //  ready_ per slot rather than assume every slot holds a live T.
+            //  Iterates original_capacity_ (the physical allocation), not
+            //  capacity_ (which may have been opportunistically reduced
+            //  below the physical size) -- every physically-constructed
+            //  slot_type wrapper must be destroyed, and deallocate() must
+            //  be called with the size it was originally allocated at.
             ~retired_descriptor()
             {
-                for (size_t i = 0; i < capacity_; ++i)
+                for (size_t i = 0; i < original_capacity_; ++i)
                 {
                     if (buffer_[i].ready_.load(memory_order_acquire))
                     {
@@ -227,7 +263,7 @@ namespace MINIMAL_STD_NAMESPACE
                     allocator_traits_type::destroy(*allocator_, &buffer_[i]);
                 }
 
-                allocator_traits_type::deallocate(*allocator_, buffer_, capacity_);
+                allocator_traits_type::deallocate(*allocator_, buffer_, original_capacity_);
             }
         };
 
@@ -236,13 +272,28 @@ namespace MINIMAL_STD_NAMESPACE
         };
 
     public:
+        //  idle_rotation_interval: every that many successful pop_front()
+        //  calls (globally across the whole queue, counted via a single
+        //  fetch_add so exactly one caller ever crosses a given multiple),
+        //  opportunistically check whether the currently-active segment is
+        //  running under 50% loaded, and if so, close its current life
+        //  early so it can reopen smaller once it finishes draining --
+        //  see maybe_shrink_active_segment(). 0 (the default) disables
+        //  this entirely: capacity then only ever grows, exactly as
+        //  before. This exists so a queue that grew during a burst can
+        //  give some of that memory back afterward, without requiring the
+        //  segment to be completely refilled to its (now inflated)
+        //  capacity again first -- which, after a burst subsides, may
+        //  never happen.
         explicit mp_mc_sc_growable_ring_queue(allocator_type &allocator,
                                                size_t initial_capacity,
                                                size_t growth_numerator = 5,
-                                               size_t growth_denominator = 4)
+                                               size_t growth_denominator = 4,
+                                               size_t idle_rotation_interval = 0)
             : allocator_(allocator),
               growth_numerator_(growth_numerator),
-              growth_denominator_(growth_denominator)
+              growth_denominator_(growth_denominator),
+              idle_rotation_interval_(idle_rotation_interval)
         {
             for (size_t i = 0; i < SegmentCount; ++i)
             {
@@ -325,6 +376,36 @@ namespace MINIMAL_STD_NAMESPACE
                 if (try_pop_from(*candidate, front))
                 {
                     store_consumer_target(candidate);
+
+                    //  idle_rotation_interval_ == 0 (the default) disables
+                    //  this entirely -- capacity then only ever grows,
+                    //  exactly as before this feature existed. Otherwise,
+                    //  every idle_rotation_interval_-th successful pop
+                    //  (globally, across the whole queue) opportunistically
+                    //  checks whether the active segment could be shrunk.
+                    //  The fetch_add (multi-consumer) or plain increment
+                    //  (single-consumer) returns a unique value per call, so
+                    //  exactly one caller ever observes a given exact
+                    //  multiple -- no extra coordination needed for that.
+                    if (idle_rotation_interval_ != 0)
+                    {
+                        size_t count;
+
+                        if constexpr (MultiConsumer)
+                        {
+                            count = pop_count_.fetch_add(1, memory_order_relaxed) + 1;
+                        }
+                        else
+                        {
+                            count = ++pop_count_;
+                        }
+
+                        if (count % idle_rotation_interval_ == 0)
+                        {
+                            maybe_shrink_active_segment();
+                        }
+                    }
+
                     return true;
                 }
 
@@ -363,7 +444,7 @@ namespace MINIMAL_STD_NAMESPACE
                 for (size_t i = 0; i < SegmentCount; ++i)
                 {
                     retired_descriptor *d = guard.protect(segments_[i].current_);
-                    total += d->capacity_;
+                    total += d->capacity_.load(memory_order_acquire);
                 }
             }
             else
@@ -407,6 +488,18 @@ namespace MINIMAL_STD_NAMESPACE
             //  one thread ever touches this segment's buffer.  Left at their
             //  initial values (harmless, a few bytes) and never touched when
             //  MultiConsumer is true.
+            //
+            //  original_capacity_ is the PHYSICAL size this buffer was
+            //  allocated at this life (used for destructor cleanup and
+            //  deallocate()'s size argument); capacity_ is the CURRENT,
+            //  effective size for this life, which maybe_shrink_active_segment()
+            //  may reduce below original_capacity_ exactly once per life.
+            //  Both remain plain, non-atomic fields here: the sole consumer
+            //  thread is the only one that ever reads or writes either, in
+            //  single-consumer mode, including when performing that shrink
+            //  (see maybe_shrink_active_segment()) -- no new synchronization
+            //  is needed on this path.
+            size_t original_capacity_ = 0;
             size_t capacity_ = 0;
             slot_type *buffer_ = nullptr;
 
@@ -420,6 +513,24 @@ namespace MINIMAL_STD_NAMESPACE
             //  Left null (harmless) and never touched when MultiConsumer is
             //  false.
             atomic<retired_descriptor *> current_{nullptr};
+
+            //  Multi-consumer only: arbitrates who actually calls
+            //  retire_and_grow_multi() for a given life. Normally that's
+            //  uniquely the one consumer thread whose CAS completes the
+            //  last position (see try_pop_from's "no straggler left"
+            //  note). But maybe_shrink_active_segment() can close a life
+            //  early at a point the consumer side has *already* fully
+            //  drained -- in that case no future pop would ever re-check
+            //  completion, so the shrink-check must trigger it instead;
+            //  since a normal completion and a shrink-triggered one could
+            //  race on the SAME life if a normal consumer's own capacity_
+            //  read straddles the shrink's update, exactly one of them must
+            //  win this CAS. Reset to false every time a life opens.
+            //  Unused (harmless) when MultiConsumer is false, since the
+            //  single-consumer path handles the same "already caught up"
+            //  case directly, with no concurrent caller to arbitrate
+            //  against.
+            atomic<bool> retire_claimed_{false};
         };
 
         using consumer_target_type = conditional_t<MultiConsumer, atomic<segment *>, segment *>;
@@ -444,11 +555,13 @@ namespace MINIMAL_STD_NAMESPACE
             if constexpr (MultiConsumer)
             {
                 seg.current_.store(new retired_descriptor(domain_, buffer, capacity, &allocator_), memory_order_relaxed);
+                seg.retire_claimed_.store(false, memory_order_relaxed);
                 seg.dequeue_state_.store(tagged_position::pack(0, 0), memory_order_relaxed);
             }
             else
             {
                 seg.buffer_ = buffer;
+                seg.original_capacity_ = capacity;
                 seg.capacity_ = capacity;
                 seg.dequeue_state_ = 0;
             }
@@ -465,7 +578,11 @@ namespace MINIMAL_STD_NAMESPACE
             }
             else
             {
-                for (size_t i = 0; i < seg.capacity_; ++i)
+                //  Iterates original_capacity_ (the physical allocation),
+                //  not capacity_ (which may have been opportunistically
+                //  reduced below the physical size) -- see the comment on
+                //  segment::original_capacity_.
+                for (size_t i = 0; i < seg.original_capacity_; ++i)
                 {
                     //  Only slots a producer actually published still hold a
                     //  live T (production may have stopped mid-fill, leaving
@@ -480,7 +597,7 @@ namespace MINIMAL_STD_NAMESPACE
                     allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
                 }
 
-                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
             }
         }
 
@@ -555,7 +672,7 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     size_t pos = tagged_position::unpack_pos(state);
 
-                    if (pos >= desc->capacity_)
+                    if (pos >= desc->capacity_.load(memory_order_acquire))
                     {
                         return false;
                     }
@@ -587,9 +704,27 @@ namespace MINIMAL_STD_NAMESPACE
                         //  There is no straggler left to protect against;
                         //  the hazard guard above exists to protect THIS
                         //  thread's own read, not to stagger the trigger.
-                        if (pos + 1 == desc->capacity_)
+                        //  Fresh (acquire) read: capacity_ may have been
+                        //  opportunistically reduced by
+                        //  maybe_shrink_active_segment() since this call
+                        //  started, and that reduced value is exactly what
+                        //  this life's completion should be measured
+                        //  against.
+                        size_t effective_capacity = desc->capacity_.load(memory_order_acquire);
+
+                        if (pos + 1 == effective_capacity)
                         {
-                            retire_and_grow_multi(seg, desc);
+                            //  Arbitrate against maybe_shrink_active_segment(),
+                            //  which can also detect this same completion
+                            //  (if this life was capped and already fully
+                            //  drained by the time the cap applied) -- see
+                            //  segment::retire_claimed_.
+                            bool expected = false;
+
+                            if (seg.retire_claimed_.compare_exchange_strong(expected, true, memory_order_acq_rel, memory_order_relaxed))
+                            {
+                                retire_and_grow_multi(seg, desc, effective_capacity);
+                            }
                         }
 
                         return true;
@@ -635,7 +770,7 @@ namespace MINIMAL_STD_NAMESPACE
                 retired_descriptor *desc = guard.protect(seg.current_);
                 size_t pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
 
-                if (pos >= desc->capacity_)
+                if (pos >= desc->capacity_.load(memory_order_acquire))
                 {
                     return false;
                 }
@@ -685,28 +820,55 @@ namespace MINIMAL_STD_NAMESPACE
             return grown > reference_capacity ? grown : reference_capacity + 1;
         }
 
+        //  Inverse of compute_new_capacity, applied to a segment's OWN
+        //  just-closed size (not a sibling reference) when a life was
+        //  closed early by maybe_shrink_active_segment() rather than
+        //  filling organically. Shrinks gradually (by the same ratio
+        //  growth uses, in reverse) so repeated idle cycles settle toward
+        //  a smaller size rather than jumping to an arbitrary reference;
+        //  floored at 1 to avoid a degenerate zero-capacity segment.
+        size_t compute_shrunk_capacity(size_t current) const
+        {
+            size_t shrunk = (current * growth_denominator_) / growth_numerator_;
+            return shrunk > 0 ? shrunk : 1;
+        }
+
         //  Single-consumer only: only ever called once a segment is proven
         //  fully drained, by the sole consumer thread, so there is exactly
         //  one caller and no concurrent reader/writer of buffer_/capacity_
         //  to protect against.
         void retire_and_grow(segment &seg)
         {
-            //  Grows relative to the NEXT segment in the ring, not any
-            //  particular one -- for SegmentCount == 2 this is the same
-            //  single sibling as before; for SegmentCount > 2 it is simply
-            //  a fixed, consistent reference point. Growth is monotonic
-            //  (never shrinks) and every segment eventually reopens based on
-            //  whatever its neighbor grew to, so all ring members converge
-            //  to within one growth factor of each other over enough cycles.
-            size_t new_capacity = compute_new_capacity(seg.next_->capacity_);
+            //  Was this life's capacity_ opportunistically reduced below
+            //  its original_capacity_ (see maybe_shrink_active_segment)? If
+            //  so, this is not an organic full-drain -- demand fell off
+            //  before this life ever filled -- so the next life should
+            //  shrink, not grow, relative to its OWN just-closed size. An
+            //  organic full-drain (capacity_ == original_capacity_) grows
+            //  as always, relative to the NEXT segment in the ring.
+            bool was_capped = seg.capacity_ < seg.original_capacity_;
 
-            //  Allocate the new (larger) buffer before freeing the old one,
-            //  so an allocator failure degrades to "recycle at the old
+            //  For SegmentCount == 2 the "next segment" reference is the
+            //  same single sibling as before; for SegmentCount > 2 it is
+            //  simply a fixed, consistent reference point. Growth is
+            //  monotonic and every segment eventually reopens based on
+            //  whatever its neighbor grew to, so all ring members converge
+            //  to within one growth factor of each other over enough
+            //  cycles.
+            size_t new_capacity = was_capped
+                                      ? compute_shrunk_capacity(seg.capacity_)
+                                      : compute_new_capacity(seg.next_->capacity_);
+
+            //  Allocate the new buffer before freeing the old one, so an
+            //  allocator failure degrades to "recycle at the old physical
             //  capacity" instead of leaving the segment without a buffer.
             slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
             size_t effective_capacity = new_capacity;
 
-            for (size_t i = 0; i < seg.capacity_; ++i)
+            //  Destroys/deallocates using original_capacity_ (the physical
+            //  allocation), not capacity_ (which may be smaller if this
+            //  life was capped) -- see the comment on segment::original_capacity_.
+            for (size_t i = 0; i < seg.original_capacity_; ++i)
             {
                 allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
             }
@@ -715,11 +877,11 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
                 new_buffer = seg.buffer_;
-                effective_capacity = seg.capacity_;
+                effective_capacity = seg.original_capacity_;
             }
             else
             {
-                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
             }
 
             for (size_t i = 0; i < effective_capacity; ++i)
@@ -728,6 +890,7 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
             seg.buffer_ = new_buffer;
+            seg.original_capacity_ = effective_capacity;
             seg.capacity_ = effective_capacity;
 
             //  Reopen gates: plain buffer_/capacity_ writes above MUST
@@ -741,20 +904,41 @@ namespace MINIMAL_STD_NAMESPACE
 
         //  Multi-consumer only: called once `desc` (the descriptor this
         //  thread just finished reading the last position of) is proven
-        //  fully drained.  Never mutates `desc` itself -- only ever swaps in
-        //  a brand-new descriptor and hands `desc` off to the domain via
-        //  retire() -- since other consumer threads may still be mid-call
-        //  with a hazard guard protecting `desc`, reading its buffer_/
-        //  capacity_ fields (see try_pop_from's "no straggler left" note:
-        //  those reads are always stale-but-safe, never a live race,
-        //  precisely because those fields never change after construction).
-        void retire_and_grow_multi(segment &seg, retired_descriptor *desc)
+        //  fully drained, at effective_capacity (the life's capacity_ at
+        //  the moment of that completion -- see try_pop_from's fresh read).
+        //  Never mutates `desc`'s buffer_/original_capacity_/allocator_ --
+        //  only ever swaps in a brand-new descriptor and hands `desc` off
+        //  to the domain via retire() -- since other consumer threads may
+        //  still be mid-call with a hazard guard protecting `desc`, reading
+        //  its fields (see try_pop_from's "no straggler left" note: those
+        //  reads are always stale-but-safe, never a live race, precisely
+        //  because buffer_/original_capacity_/allocator_ never change after
+        //  construction; capacity_ is the sole exception, see its comment).
+        void retire_and_grow_multi(segment &seg, retired_descriptor *desc, size_t effective_capacity_at_close)
         {
-            //  Grows relative to the NEXT segment in the ring -- see
-            //  retire_and_grow's comment above; the reasoning is identical.
-            typename domain_type::hazard_guard sibling_guard = domain_.acquire_guard();
-            retired_descriptor *sibling_desc = sibling_guard.protect(seg.next_->current_);
-            size_t new_capacity = compute_new_capacity(sibling_desc->capacity_);
+            //  Was this life's capacity_ opportunistically reduced below
+            //  its original_capacity_ (see maybe_shrink_active_segment)? If
+            //  so, this is not an organic full-drain, so the next life
+            //  should shrink relative to its own just-closed size rather
+            //  than grow relative to the sibling -- see retire_and_grow's
+            //  identical reasoning.
+            bool was_capped = effective_capacity_at_close < desc->original_capacity_;
+
+            size_t new_capacity;
+
+            if (was_capped)
+            {
+                new_capacity = compute_shrunk_capacity(effective_capacity_at_close);
+            }
+            else
+            {
+                //  Grows relative to the NEXT segment in the ring -- see
+                //  retire_and_grow's comment above; the reasoning is
+                //  identical.
+                typename domain_type::hazard_guard sibling_guard = domain_.acquire_guard();
+                retired_descriptor *sibling_desc = sibling_guard.protect(seg.next_->current_);
+                new_capacity = compute_new_capacity(sibling_desc->capacity_.load(memory_order_acquire));
+            }
 
             slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
 
@@ -762,15 +946,20 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
 
-                //  Recycle at the old capacity: reopen the SAME descriptor
-                //  for another life rather than allocating a new one.
-                //  `desc`'s buffer_/capacity_ are left completely untouched,
-                //  so any thread still holding a hazard-protected reference
-                //  to it (see the note above) remains safe regardless of
-                //  this reopen.
+                //  Recycle at the old (full physical) capacity: reopen the
+                //  SAME descriptor for another life rather than allocating
+                //  a new one. `desc`'s buffer_/original_capacity_/allocator_
+                //  are left completely untouched, so any thread still
+                //  holding a hazard-protected reference to it (see the note
+                //  above) remains safe regardless of this reopen; capacity_
+                //  is reset back to the full original_capacity_ since
+                //  there's no reason to keep a shrunk logical size when
+                //  recycling the same (already fully-sized) physical buffer.
+                desc->capacity_.store(desc->original_capacity_, memory_order_relaxed);
+                seg.retire_claimed_.store(false, memory_order_relaxed);
                 uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
                 seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-                seg.enqueue_pos_.store(tagged_enqueue_state::pack(desc->capacity_, 0), memory_order_release);
+                seg.enqueue_pos_.store(tagged_enqueue_state::pack(desc->original_capacity_, 0), memory_order_release);
                 return;
             }
 
@@ -786,6 +975,7 @@ namespace MINIMAL_STD_NAMESPACE
             //  enqueue_pos_/dequeue_state_ (acquire) before trusting
             //  seg.current_ to already reflect this new life.
             seg.current_.store(new_desc, memory_order_release);
+            seg.retire_claimed_.store(false, memory_order_relaxed);
 
             uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
             seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
@@ -799,9 +989,89 @@ namespace MINIMAL_STD_NAMESPACE
             desc->retire();
         }
 
+        //  Opportunistically closes the currently-active segment's life
+        //  early if it is running well under capacity, so it can reopen
+        //  smaller once it finishes draining, instead of only ever being
+        //  eligible to shrink after being completely refilled to its
+        //  (possibly burst-inflated) declared capacity again first -- which,
+        //  once a burst subsides, may never happen. Called from pop_front()
+        //  every idle_rotation_interval_ successful pops (0 disables this
+        //  entirely). A single opportunistic CAS attempt, not a retry loop:
+        //  if it fails (some producer claimed another slot in the
+        //  meantime), this check is simply skipped for now -- there will be
+        //  another chance at the next interval.
+        void maybe_shrink_active_segment()
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            tagged_enqueue_state::storage_type state = target->enqueue_pos_.load(memory_order_acquire);
+            size_t capacity_at_check = tagged_enqueue_state::unpack_capacity(state);
+            size_t position_at_check = tagged_enqueue_state::unpack_pos(state);
+
+            //  Skip: nothing claimed yet (capping to zero would be
+            //  degenerate), already overflowing (this life is already
+            //  organically complete or completing), or already at/above the
+            //  50% load threshold.
+            if (position_at_check == 0 || position_at_check >= capacity_at_check || position_at_check * 2 >= capacity_at_check)
+            {
+                return;
+            }
+
+            tagged_enqueue_state::storage_type capped_state = tagged_enqueue_state::pack(position_at_check, position_at_check);
+
+            if (!target->enqueue_pos_.compare_exchange_strong(state, capped_state, memory_order_acq_rel, memory_order_relaxed))
+            {
+                return;
+            }
+
+            if constexpr (MultiConsumer)
+            {
+                typename domain_type::hazard_guard guard = domain_.acquire_guard();
+                retired_descriptor *desc = guard.protect(target->current_);
+                desc->capacity_.store(position_at_check, memory_order_release);
+
+                //  The segment may already be fully drained relative to
+                //  this new, smaller capacity (consumers already consumed
+                //  everything published so far) -- if so, no FUTURE pop
+                //  would ever re-check completion (try_pop_from's own
+                //  bound check would reject any further attempt before
+                //  ever reaching its completion check), so this call must
+                //  recognize completion itself. retire_claimed_ ensures
+                //  exactly one of (a normal consumer's own completion
+                //  check) or (this one) ever actually triggers the regrow.
+                size_t dequeue_pos_after = tagged_position::unpack_pos(target->dequeue_state_.load(memory_order_acquire));
+
+                if (dequeue_pos_after >= position_at_check)
+                {
+                    bool expected = false;
+
+                    if (target->retire_claimed_.compare_exchange_strong(expected, true, memory_order_acq_rel, memory_order_relaxed))
+                    {
+                        retire_and_grow_multi(*target, desc, position_at_check);
+                    }
+                }
+            }
+            else
+            {
+                target->capacity_ = position_at_check;
+
+                //  Single-consumer only: this thread IS the sole consumer,
+                //  so there is no concurrent completion path to arbitrate
+                //  against -- if the segment is already caught up relative
+                //  to the new capacity, triggering the regrow directly here
+                //  is the only place it will ever be recognized.
+                if (target->dequeue_state_ >= position_at_check)
+                {
+                    retire_and_grow(*target);
+                }
+            }
+        }
+
         allocator_type &allocator_;
         size_t growth_numerator_;
         size_t growth_denominator_;
+        size_t idle_rotation_interval_;
+        conditional_t<MultiConsumer, atomic<size_t>, size_t> pop_count_{0};
         segment segments_[SegmentCount];
         atomic<segment *> producer_target_;
         consumer_target_type consumer_target_;
