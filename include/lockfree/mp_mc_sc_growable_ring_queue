@@ -8,6 +8,7 @@
 
 #include <allocator>
 #include "allocator_traits"
+#include "hazard_pointer"
 #include <new>
 #include <stddef.h>
 #include <stdint.h>
@@ -101,6 +102,62 @@ namespace MINIMAL_STD_NAMESPACE
         using allocator_type = allocator<slot_type>;
         using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
+    private:
+        //  Multi-consumer only: a segment's buffer is never freed directly --
+        //  it is wrapped in a retired_descriptor and reclaimed through a
+        //  hazard_pointer_domain, so retire_and_grow() can safely hand an old
+        //  buffer off for deletion while another consumer thread might still
+        //  be mid-read from it (the peek-before-claim hazard that a bare
+        //  claim-order/completion-count scheme cannot close). A single
+        //  consumer never faces that hazard -- there is no second thread that
+        //  could be behind it -- so the single-consumer path keeps its plain
+        //  buffer_/capacity_ fields and never touches any of this.
+        struct retired_descriptor;
+
+        using domain_type = lockfree::hazard_pointer_domain<retired_descriptor, 64, 64, 8>;
+
+        struct retired_descriptor : lockfree::hazardous_resource<retired_descriptor, domain_type>
+        {
+            slot_type *buffer_;
+            size_t capacity_;
+            allocator_type *allocator_;
+
+            retired_descriptor(domain_type &domain, slot_type *buffer, size_t capacity, allocator_type *allocator)
+                : lockfree::hazardous_resource<retired_descriptor, domain_type>(domain),
+                  buffer_(buffer),
+                  capacity_(capacity),
+                  allocator_(allocator)
+            {
+            }
+
+            //  A retired_descriptor is destroyed either when the domain
+            //  reclaims it (growth-cycle retirement -- every slot is
+            //  guaranteed fully drained by then) or directly by the queue's
+            //  own destructor for whichever descriptor is still current at
+            //  shutdown (production may have stopped mid-fill, leaving a
+            //  non-contiguous claimed/unclaimed mix) -- so this must check
+            //  ready_ per slot rather than assume every slot holds a live T.
+            ~retired_descriptor()
+            {
+                for (size_t i = 0; i < capacity_; ++i)
+                {
+                    if (buffer_[i].ready_.load(memory_order_acquire))
+                    {
+                        buffer_[i].element_ptr()->~T();
+                    }
+
+                    allocator_traits_type::destroy(*allocator_, &buffer_[i]);
+                }
+
+                allocator_traits_type::deallocate(*allocator_, buffer_, capacity_);
+            }
+        };
+
+        struct no_domain
+        {
+        };
+
+    public:
         explicit mp_mc_sc_growable_ring_queue(allocator_type &allocator,
                                                size_t initial_capacity,
                                                size_t growth_numerator = 5,
@@ -197,7 +254,19 @@ namespace MINIMAL_STD_NAMESPACE
         //  declared capacity.  Lets callers confirm growth actually happened.
         size_t capacity_estimate() const
         {
-            return segments_[0].capacity_ + segments_[1].capacity_;
+            if constexpr (MultiConsumer)
+            {
+                typename domain_type::hazard_guard g0 = domain_.acquire_guard();
+                retired_descriptor *d0 = g0.protect(segments_[0].current_);
+                typename domain_type::hazard_guard g1 = domain_.acquire_guard();
+                retired_descriptor *d1 = g1.protect(segments_[1].current_);
+
+                return d0->capacity_ + d1->capacity_;
+            }
+            else
+            {
+                return segments_[0].capacity_ + segments_[1].capacity_;
+            }
         }
 
     private:
@@ -205,8 +274,6 @@ namespace MINIMAL_STD_NAMESPACE
         {
             segment *other_ = nullptr;
             atomic<size_t> enqueue_pos_{0};
-            size_t capacity_ = 0;
-            slot_type *buffer_ = nullptr;
 
             //  Dequeue-position representation is conditional on
             //  MultiConsumer: plain size_t (single-consumer, no atomics at
@@ -215,27 +282,33 @@ namespace MINIMAL_STD_NAMESPACE
             //  tag is required).
             conditional_t<MultiConsumer, atomic<tagged_position::storage_type>, size_t> dequeue_state_{};
 
-            //  Multi-consumer only: counts slots that have FINISHED being
-            //  read (moved-out + destroyed), as opposed to merely CLAIMED
-            //  via the CAS above.  retire_and_grow() must not run until
-            //  every claimed slot has actually finished being read --
-            //  triggering it as soon as the *last position* is claimed is
-            //  unsafe, because a thread that claimed an earlier position can
-            //  be arbitrarily delayed (preemption) and still be mid-read
-            //  when a faster thread claims and finishes the last position.
-            //  Unused (but harmless, a few bytes) when MultiConsumer is
-            //  false, since single-consumer mode has no concurrent
-            //  claimants to stagger in the first place.
-            atomic<size_t> completed_count_{0};
+            //  Single-consumer only: authoritative, plain fields -- no
+            //  indirection, no atomics beyond enqueue_pos_ above, since only
+            //  one thread ever touches this segment's buffer.  Left at their
+            //  initial values (harmless, a few bytes) and never touched when
+            //  MultiConsumer is true.
+            size_t capacity_ = 0;
+            slot_type *buffer_ = nullptr;
+
+            //  Multi-consumer only: the sole authority for this segment's
+            //  buffer/capacity, reached exclusively through a hazard guard.
+            //  A retired_descriptor's buffer_/capacity_ are immutable for
+            //  its entire life -- retire_and_grow_multi() never mutates an
+            //  existing descriptor, only swaps in a brand-new one -- so once
+            //  a thread has safely obtained the current descriptor pointer,
+            //  dereferencing it is safe for as long as that thread holds it.
+            //  Left null (harmless) and never touched when MultiConsumer is
+            //  false.
+            atomic<retired_descriptor *> current_{nullptr};
         };
 
         using consumer_target_type = conditional_t<MultiConsumer, atomic<segment *>, segment *>;
 
         void open_segment(segment &seg, size_t capacity)
         {
-            seg.buffer_ = allocator_traits_type::allocate(allocator_, capacity);
+            slot_type *buffer = allocator_traits_type::allocate(allocator_, capacity);
 
-            if (seg.buffer_ == nullptr)
+            if (buffer == nullptr)
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * capacity, alignof(slot_type));
                 capacity = 0;
@@ -243,40 +316,52 @@ namespace MINIMAL_STD_NAMESPACE
 
             for (size_t i = 0; i < capacity; ++i)
             {
-                allocator_traits_type::construct(allocator_, &seg.buffer_[i]);
+                allocator_traits_type::construct(allocator_, &buffer[i]);
             }
 
-            seg.capacity_ = capacity;
             seg.enqueue_pos_.store(0, memory_order_relaxed);
-            seg.completed_count_.store(0, memory_order_relaxed);
 
             if constexpr (MultiConsumer)
             {
+                seg.current_.store(new retired_descriptor(domain_, buffer, capacity, &allocator_), memory_order_relaxed);
                 seg.dequeue_state_.store(tagged_position::pack(0, 0), memory_order_relaxed);
             }
             else
             {
+                seg.buffer_ = buffer;
+                seg.capacity_ = capacity;
                 seg.dequeue_state_ = 0;
             }
         }
 
         void destroy_segment(segment &seg)
         {
-            for (size_t i = 0; i < seg.capacity_; ++i)
+            if constexpr (MultiConsumer)
             {
-                //  Only slots a producer actually published still hold a
-                //  live T (production may have stopped mid-fill, leaving a
-                //  non-contiguous mix of claimed and never-claimed slots) --
-                //  skip past unclaimed slots, never stop early.
-                if (seg.buffer_[i].ready_.load(memory_order_acquire))
+                //  No concurrent activity during destruction (same
+                //  precondition as spsc_queue): safe to delete the current
+                //  descriptor directly rather than going through retire().
+                delete seg.current_.load(memory_order_relaxed);
+            }
+            else
+            {
+                for (size_t i = 0; i < seg.capacity_; ++i)
                 {
-                    seg.buffer_[i].element_ptr()->~T();
+                    //  Only slots a producer actually published still hold a
+                    //  live T (production may have stopped mid-fill, leaving
+                    //  a non-contiguous mix of claimed and never-claimed
+                    //  slots) -- skip past unclaimed slots, never stop
+                    //  early.
+                    if (seg.buffer_[i].ready_.load(memory_order_acquire))
+                    {
+                        seg.buffer_[i].element_ptr()->~T();
+                    }
+
+                    allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
                 }
 
-                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
             }
-
-            allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.capacity_);
         }
 
         template <class... Args>
@@ -287,17 +372,41 @@ namespace MINIMAL_STD_NAMESPACE
             //  arbitrate, and fetch_add has no ABA exposure since it never
             //  compares against a remembered value.  acquire: must observe
             //  the reopen-gate release-store below if this claim belongs to
-            //  a freshly-recycled life, so the bound check against
-            //  capacity_ (and buffer_ itself) is guaranteed up to date.
+            //  a freshly-recycled life, so the bound check against capacity
+            //  (and the buffer itself) is guaranteed up to date.
             size_t idx = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
 
-            if (idx >= seg.capacity_)
+            if constexpr (MultiConsumer)
             {
-                return false;
-            }
+                //  No hazard guard needed here: retire_and_grow_multi() for
+                //  THIS life cannot run until every valid claim in
+                //  [0, capacity) -- including whichever one this fetch_add
+                //  just returned, if it is valid -- has been both published
+                //  and consumed (dequeue only ever advances one position at
+                //  a time, and only past a position whose ready_ flag it has
+                //  already observed true). So the descriptor this load
+                //  returns is guaranteed to still be the current, live one
+                //  for the entire remainder of this call.
+                retired_descriptor *desc = seg.current_.load(memory_order_acquire);
 
-            allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
-            seg.buffer_[idx].ready_.store(true, memory_order_release);
+                if (idx >= desc->capacity_)
+                {
+                    return false;
+                }
+
+                allocator_traits_type::construct(allocator_, desc->buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
+                desc->buffer_[idx].ready_.store(true, memory_order_release);
+            }
+            else
+            {
+                if (idx >= seg.capacity_)
+                {
+                    return false;
+                }
+
+                allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
+                seg.buffer_[idx].ready_.store(true, memory_order_release);
+            }
 
             return true;
         }
@@ -306,18 +415,30 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if constexpr (MultiConsumer)
             {
+                //  Guards the descriptor -- and therefore the buffer it
+                //  points to -- for the entire duration of this call: peek,
+                //  CAS, read, and destroy all happen while this thread's
+                //  hazard slot protects `desc`, which is exactly the gap
+                //  (peek-before-claim) that a bare claim-order/completion-
+                //  count scheme could not close. Releasing the guard on
+                //  return (its destructor) is itself the event that may
+                //  trigger this descriptor's actual reclaim, if this call
+                //  happened to be the one that retired it.
+                typename domain_type::hazard_guard guard = domain_.acquire_guard();
+                retired_descriptor *desc = guard.protect(seg.current_);
+
                 tagged_position::storage_type state = seg.dequeue_state_.load(memory_order_acquire);
 
                 while (true)
                 {
                     size_t pos = tagged_position::unpack_pos(state);
 
-                    if (pos >= seg.capacity_)
+                    if (pos >= desc->capacity_)
                     {
                         return false;
                     }
 
-                    slot_type &s = seg.buffer_[pos];
+                    slot_type &s = desc->buffer_[pos];
 
                     if (!s.ready_.load(memory_order_acquire))
                     {
@@ -332,22 +453,21 @@ namespace MINIMAL_STD_NAMESPACE
                         allocator_traits_type::destroy(allocator_, s.element_ptr());
                         s.ready_.store(false, memory_order_relaxed);
 
-                        //  Trigger retirement on COMPLETION order, not claim
-                        //  order: a thread that claimed an earlier position
-                        //  can be arbitrarily delayed and still be mid-read
-                        //  here while another thread has already claimed
-                        //  (and would otherwise appear to "finish") the last
-                        //  position -- retire_and_grow must not run until
-                        //  every claimed slot has actually finished being
-                        //  read, or a straggler's slot can be freed out from
-                        //  under it.  acq_rel: the thread whose increment
-                        //  reaches capacity_ is thereby guaranteed to
-                        //  synchronize-with every other thread's completed
-                        //  read (all of which happened-before their own
-                        //  fetch_add), so it alone is the one safe to retire.
-                        if (seg.completed_count_.fetch_add(1, memory_order_acq_rel) + 1 == seg.capacity_)
+                        //  Claim order is safe to trigger on directly here:
+                        //  the CAS above only ever advances dequeue_state_ by
+                        //  exactly one position at a time, and only past a
+                        //  position whose ready_ flag was just observed
+                        //  true -- so by the time this position reaches
+                        //  capacity_, every earlier position in this life has
+                        //  already been claimed AND completed, in order,
+                        //  which in turn required every one of their
+                        //  producers to have already finished publishing.
+                        //  There is no straggler left to protect against;
+                        //  the hazard guard above exists to protect THIS
+                        //  thread's own read, not to stagger the trigger.
+                        if (pos + 1 == desc->capacity_)
                         {
-                            retire_and_grow(seg);
+                            retire_and_grow_multi(seg, desc);
                         }
 
                         return true;
@@ -387,23 +507,30 @@ namespace MINIMAL_STD_NAMESPACE
 
         bool has_ready(const segment &seg) const
         {
-            size_t pos;
-
             if constexpr (MultiConsumer)
             {
-                pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
+                typename domain_type::hazard_guard guard = domain_.acquire_guard();
+                retired_descriptor *desc = guard.protect(seg.current_);
+                size_t pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
+
+                if (pos >= desc->capacity_)
+                {
+                    return false;
+                }
+
+                return desc->buffer_[pos].ready_.load(memory_order_acquire);
             }
             else
             {
-                pos = seg.dequeue_state_;
-            }
+                size_t pos = seg.dequeue_state_;
 
-            if (pos >= seg.capacity_)
-            {
-                return false;
-            }
+                if (pos >= seg.capacity_)
+                {
+                    return false;
+                }
 
-            return seg.buffer_[pos].ready_.load(memory_order_acquire);
+                return seg.buffer_[pos].ready_.load(memory_order_acquire);
+            }
         }
 
         segment *load_consumer_target() const
@@ -436,12 +563,10 @@ namespace MINIMAL_STD_NAMESPACE
             return grown > sibling_capacity ? grown : sibling_capacity + 1;
         }
 
-        //  Only ever called once a segment is proven fully drained: in
-        //  single-consumer mode the sole consumer thread calls this
-        //  unconditionally; in multi-consumer mode, exactly one consumer
-        //  thread's CAS can ever transition dequeue_state_ from capacity_-1
-        //  to capacity_, so the call is uniquely triggered without any
-        //  additional locking.
+        //  Single-consumer only: only ever called once a segment is proven
+        //  fully drained, by the sole consumer thread, so there is exactly
+        //  one caller and no concurrent reader/writer of buffer_/capacity_
+        //  to protect against.
         void retire_and_grow(segment &seg)
         {
             size_t new_capacity = compute_new_capacity(seg.other_->capacity_);
@@ -475,25 +600,72 @@ namespace MINIMAL_STD_NAMESPACE
 
             seg.buffer_ = new_buffer;
             seg.capacity_ = effective_capacity;
-            seg.completed_count_.store(0, memory_order_relaxed);
 
             //  Reopen gates: plain buffer_/capacity_ writes above MUST
-            //  precede these release-stores.  Two independent audiences --
-            //  producers gate on enqueue_pos_, other consumers (multi-
-            //  consumer mode only) gate on dequeue_state_ -- so the relative
-            //  order between the two stores below does not matter, only
-            //  that each individually follows the plain writes.
-            if constexpr (MultiConsumer)
+            //  precede this release-store, since the sole consumer thread's
+            //  own next dequeue_state_ read is a plain (non-atomic) read
+            //  that simply follows program order, and the producer side's
+            //  fetch_add on enqueue_pos_ (acquire) must observe it.
+            seg.dequeue_state_ = 0;
+            seg.enqueue_pos_.store(0, memory_order_release);
+        }
+
+        //  Multi-consumer only: called once `desc` (the descriptor this
+        //  thread just finished reading the last position of) is proven
+        //  fully drained.  Never mutates `desc` itself -- only ever swaps in
+        //  a brand-new descriptor and hands `desc` off to the domain via
+        //  retire() -- since other consumer threads may still be mid-call
+        //  with a hazard guard protecting `desc`, reading its buffer_/
+        //  capacity_ fields (see try_pop_from's "no straggler left" note:
+        //  those reads are always stale-but-safe, never a live race,
+        //  precisely because those fields never change after construction).
+        void retire_and_grow_multi(segment &seg, retired_descriptor *desc)
+        {
+            typename domain_type::hazard_guard sibling_guard = domain_.acquire_guard();
+            retired_descriptor *sibling_desc = sibling_guard.protect(seg.other_->current_);
+            size_t new_capacity = compute_new_capacity(sibling_desc->capacity_);
+
+            slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
+
+            if (new_buffer == nullptr)
             {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
+
+                //  Recycle at the old capacity: reopen the SAME descriptor
+                //  for another life rather than allocating a new one.
+                //  `desc`'s buffer_/capacity_ are left completely untouched,
+                //  so any thread still holding a hazard-protected reference
+                //  to it (see the note above) remains safe regardless of
+                //  this reopen.
                 uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
                 seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-            }
-            else
-            {
-                seg.dequeue_state_ = 0;
+                seg.enqueue_pos_.store(0, memory_order_release);
+                return;
             }
 
+            for (size_t i = 0; i < new_capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &new_buffer[i]);
+            }
+
+            retired_descriptor *new_desc = new retired_descriptor(domain_, new_buffer, new_capacity, &allocator_);
+
+            //  Reopen gates: the descriptor swap MUST precede these
+            //  release-stores, since producers/other consumers gate on
+            //  enqueue_pos_/dequeue_state_ (acquire) before trusting
+            //  seg.current_ to already reflect this new life.
+            seg.current_.store(new_desc, memory_order_release);
+
+            uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
+            seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
             seg.enqueue_pos_.store(0, memory_order_release);
+
+            //  Hand the old descriptor off for hazard-protected deferred
+            //  deletion -- safe to reclaim immediately once no consumer
+            //  thread (including this one, whose own guard still protects
+            //  it until try_pop_from returns) still holds a hazard pointer
+            //  to it.
+            desc->retire();
         }
 
         allocator_type &allocator_;
@@ -502,5 +674,6 @@ namespace MINIMAL_STD_NAMESPACE
         segment segments_[2];
         atomic<segment *> producer_target_;
         consumer_target_type consumer_target_;
+        mutable conditional_t<MultiConsumer, domain_type, no_domain> domain_;
     };
 }

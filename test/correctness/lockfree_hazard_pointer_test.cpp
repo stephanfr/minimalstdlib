@@ -42,7 +42,12 @@ namespace
         free(ptr);
     }
 
-    TEST(HazardPointerTests, RetireWithoutHazardReclaimsOnScan)
+    //  retire() now performs a targeted reclaim check on the exact pointer
+    //  immediately (not just a deferred-to-scan() check): a resource nothing
+    //  is protecting is reclaimed right away, since waiting for scan() (or
+    //  for some future hazard guard release) would never happen if nobody is
+    //  currently, or will ever be, holding a guard on it.
+    TEST(HazardPointerTests, RetireWithoutHazardReclaimsImmediately)
     {
         deleted_nodes.store(0, minstd::memory_order_relaxed);
 
@@ -51,9 +56,10 @@ namespace
         auto *node = new counted_node{123};
 
         CHECK_TRUE(domain.retire(node, counted_node_deleter));
-        CHECK_EQUAL(0u, deleted_nodes.load(minstd::memory_order_relaxed));
+        CHECK_EQUAL(1u, deleted_nodes.load(minstd::memory_order_relaxed));
 
-        CHECK_EQUAL(1u, domain.scan());
+        //  Nothing left for an explicit scan() to find.
+        CHECK_EQUAL(0u, domain.scan());
         CHECK_EQUAL(1u, deleted_nodes.load(minstd::memory_order_relaxed));
     }
 
@@ -206,7 +212,13 @@ namespace
         release.store(true, minstd::memory_order_release);
         CHECK_EQUAL(0, pthread_join(worker, nullptr));
 
-        CHECK_EQUAL(1u, domain.scan());
+        //  hold_hazard_worker never explicitly clears its guard -- its
+        //  destructor runs (releasing the hazard slot) as the thread function
+        //  returns, which is exactly the event that now triggers a targeted
+        //  reclaim check for whatever it was protecting.  So by the time
+        //  pthread_join() returns, the node has already been reclaimed --
+        //  there's nothing left for an explicit scan() to find.
+        CHECK_EQUAL(0u, domain.scan());
         CHECK_EQUAL(1u, deleted_nodes.load(minstd::memory_order_relaxed));
 
         shared.store(nullptr, minstd::memory_order_release);

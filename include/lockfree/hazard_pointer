@@ -15,6 +15,21 @@ namespace MINIMAL_STD_NAMESPACE
 {
     namespace lockfree
     {
+        //  Optional, purpose-built notification: implement this to learn when
+        //  a hazard_pointer_domain actually reclaims (frees) one or more
+        //  retired objects.  Not required for correctness -- the deleter
+        //  passed to retire() already performs the real free; this is purely
+        //  an informational hook (stats, logging, backpressure monitoring).
+        //  Fired once per reclaiming operation (a whole scan() pass, or a
+        //  single targeted reclaim), not once per object.
+        struct hazard_pointer_reclaim_observer
+        {
+            virtual void on_reclaimed(size_t reclaimed_this_pass, size_t total_reclaimed) = 0;
+
+        protected:
+            ~hazard_pointer_reclaim_observer() = default;
+        };
+
         template <typename T, size_t MAX_HAZARD_POINTERS = 128, size_t MAX_RETIRED_RECORDS = 1024, size_t RETIRE_SCAN_THRESHOLD = 32>
         class hazard_pointer_domain
         {
@@ -138,6 +153,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             hazard_pointer_domain() = default;
 
+            explicit hazard_pointer_domain(hazard_pointer_reclaim_observer *observer)
+                : observer_(observer)
+            {
+            }
+
             hazard_pointer_domain(const hazard_pointer_domain &) = delete;
             hazard_pointer_domain &operator=(const hazard_pointer_domain &) = delete;
 
@@ -175,6 +195,18 @@ namespace MINIMAL_STD_NAMESPACE
                         retired_records_[i].deleter_ = deleter;
                         retired_records_[i].active_.store(true, minstd::memory_order_release);
 
+                        //  Primary reclaim path: check this exact pointer right
+                        //  now.  Covers the common case where nothing was ever
+                        //  protecting it, or whatever was protecting it already
+                        //  let go before retire() was even called -- without
+                        //  this, such a resource would never get reclaimed,
+                        //  since nothing will release a hazard pointer for a
+                        //  pointer nobody is holding.
+                        try_reclaim_specific(ptr);
+
+                        //  Backstop: an occasional full-table scan in case a
+                        //  targeted check was ever missed. Not load-bearing for
+                        //  the common case, just defensive.
                         size_t retired_since_scan = retire_since_scan_.fetch_add(1, minstd::memory_order_relaxed) + 1;
 
                         if (retired_since_scan >= RETIRE_SCAN_THRESHOLD)
@@ -187,6 +219,66 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     scan();
+                }
+
+                return false;
+            }
+
+            //  Targeted reclaim: checks only the retired record matching ptr
+            //  (if any) rather than the whole table.  This is the primary
+            //  reclaim path -- call it from retire() (to catch resources that
+            //  are already unprotected) and whenever a hazard guard releases a
+            //  pointer that might match a retired resource (to catch resources
+            //  that become unprotected later).  Returns true if this specific
+            //  call reclaimed it.
+            bool try_reclaim_specific(pointer_type ptr)
+            {
+                if (ptr == nullptr)
+                {
+                    return false;
+                }
+
+                for (size_t i = 0; i < MAX_RETIRED_RECORDS; ++i)
+                {
+                    if (!retired_records_[i].active_.load(minstd::memory_order_acquire))
+                    {
+                        continue;
+                    }
+
+                    if (retired_records_[i].retired_ptr_ != ptr)
+                    {
+                        continue;
+                    }
+
+                    if (is_hazard_protected(ptr))
+                    {
+                        return false;
+                    }
+
+                    bool expected = true;
+
+                    if (!retired_records_[i].active_.compare_exchange_strong(expected, false,
+                                                                             minstd::memory_order_acq_rel,
+                                                                             minstd::memory_order_acquire))
+                    {
+                        return false;
+                    }
+
+                    pointer_type ptr_to_delete = retired_records_[i].retired_ptr_;
+                    deleter_type deleter = retired_records_[i].deleter_;
+
+                    retired_records_[i].retired_ptr_ = nullptr;
+                    retired_records_[i].deleter_ = nullptr;
+                    retired_records_[i].in_use_.store(false, minstd::memory_order_release);
+
+                    if ((ptr_to_delete != nullptr) && (deleter != nullptr))
+                    {
+                        deleter(ptr_to_delete);
+                        notify_reclaimed(1);
+                        return true;
+                    }
+
+                    return false;
                 }
 
                 return false;
@@ -231,6 +323,11 @@ namespace MINIMAL_STD_NAMESPACE
                         deleter(ptr_to_delete);
                         ++reclaimed;
                     }
+                }
+
+                if (reclaimed > 0)
+                {
+                    notify_reclaimed(reclaimed);
                 }
 
                 return reclaimed;
@@ -282,8 +379,27 @@ namespace MINIMAL_STD_NAMESPACE
 
             void release_hazard_slot(size_t slot_index)
             {
+                //  Capture what this slot was protecting before clearing it --
+                //  if it matches a retired resource, this release may be
+                //  exactly the event that makes that resource reclaimable.
+                pointer_type released_ptr = hazard_records_[slot_index].protected_ptr_.load(minstd::memory_order_acquire);
+
                 hazard_records_[slot_index].protected_ptr_.store(nullptr, minstd::memory_order_release);
                 hazard_records_[slot_index].in_use_.store(false, minstd::memory_order_release);
+
+                if (released_ptr != nullptr)
+                {
+                    try_reclaim_specific(released_ptr);
+                }
+            }
+
+            void notify_reclaimed(size_t reclaimed_this_pass)
+            {
+                if (observer_ != nullptr)
+                {
+                    size_t total = total_reclaimed_.fetch_add(reclaimed_this_pass, minstd::memory_order_relaxed) + reclaimed_this_pass;
+                    observer_->on_reclaimed(reclaimed_this_pass, total);
+                }
             }
 
             bool is_hazard_protected(pointer_type ptr) const
@@ -331,6 +447,45 @@ namespace MINIMAL_STD_NAMESPACE
             minstd::array<hazard_record, MAX_HAZARD_POINTERS> hazard_records_{};
             minstd::array<retired_record, MAX_RETIRED_RECORDS> retired_records_{};
             minstd::atomic<size_t> retire_since_scan_{0};
+            hazard_pointer_reclaim_observer *observer_ = nullptr;
+            minstd::atomic<size_t> total_reclaimed_{0};
+        };
+
+        //  Optional CRTP base for a resource type managed by a
+        //  hazard_pointer_domain, so callers can write `resource->retire()`
+        //  instead of `domain.retire(resource)` -- operating on the resource
+        //  itself reads more naturally than operating on the domain through a
+        //  pointer/reference, once the resource already exists. (Creation
+        //  can't follow the same pattern -- there's no object yet to call a
+        //  method on -- so it stays the caller's own responsibility, e.g. a
+        //  plain `new Derived(...)`.)
+        //
+        //  Precondition: the domain must outlive every resource it manages.
+        //  If the domain is destroyed first, it force-reclaims (deletes)
+        //  every resource still retired with it; any subsequent use of a
+        //  dangling resource pointer is a use-after-free -- a loud, immediate
+        //  crash, not a subtle one, which is the intended failure mode here
+        //  (matching this codebase's other "no concurrent misuse during
+        //  teardown" preconditions, e.g. spsc_queue/mpsc_queue).
+        template <typename Derived, typename Domain>
+        class hazardous_resource
+        {
+        public:
+            void retire()
+            {
+                domain_->retire(static_cast<Derived *>(this));
+            }
+
+        protected:
+            explicit hazardous_resource(Domain &domain)
+                : domain_(&domain)
+            {
+            }
+
+            ~hazardous_resource() = default;
+
+        private:
+            Domain *domain_;
         };
     }
 }
