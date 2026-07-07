@@ -35,11 +35,19 @@ namespace MINIMAL_STD_NAMESPACE
         {
         private:
             static constexpr size_t INVALID_SLOT_INDEX = numeric_limits<size_t>::max();
+            static constexpr size_t CACHE_LINE_SIZE = 64;
 
             using pointer_type = T *;
             using deleter_type = void (*)(pointer_type);
 
-            struct hazard_record
+            //  Padded to a full cache line: guard acquire/protect/release
+            //  each write their slot, and at 16 unpadded bytes four slots
+            //  shared one line -- so concurrent guard holders in adjacent
+            //  slots false-shared on every operation. One line per slot
+            //  costs MAX_HAZARD_POINTERS x 64 bytes per domain (4KB at the
+            //  default 64), which is cheap next to eliminating a guaranteed
+            //  line bounce per concurrent guard pair.
+            struct alignas(CACHE_LINE_SIZE) hazard_record
             {
                 minstd::atomic<bool> in_use_{false};
                 minstd::atomic<pointer_type> protected_ptr_{nullptr};
@@ -113,16 +121,39 @@ namespace MINIMAL_STD_NAMESPACE
                         return nullptr;
                     }
 
+                    //  Retargeting this slot to a different pointer silently
+                    //  drops protection of whatever it held before -- and if
+                    //  that previous pointer was retired while we held it,
+                    //  our protection is exactly what deferred its reclaim,
+                    //  so we owe it the same targeted re-check a full guard
+                    //  release performs.  Without this, a retired resource
+                    //  whose last protector retargets (rather than releases)
+                    //  would sit unreclaimed until the occasional backstop
+                    //  scan.  Cheap: with the active-retired-count early-out
+                    //  below, the re-check is a single relaxed load when
+                    //  nothing is pending reclamation, which is the common
+                    //  case.
+                    pointer_type previous = domain_->hazard_slot_value(slot_index_);
+
+                    pointer_type current;
+
                     while (true)
                     {
-                        pointer_type current = source.load(minstd::memory_order_acquire);
+                        current = source.load(minstd::memory_order_acquire);
                         domain_->store_hazard(slot_index_, current);
 
                         if (source.load(minstd::memory_order_acquire) == current)
                         {
-                            return current;
+                            break;
                         }
                     }
+
+                    if ((previous != nullptr) && (previous != current))
+                    {
+                        domain_->try_reclaim_specific(previous);
+                    }
+
+                    return current;
                 }
 
                 void clear()
@@ -192,6 +223,14 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     for (size_t i = 0; i < MAX_RETIRED_RECORDS; ++i)
                     {
+                        //  Test-and-test-and-set: an occupied record costs a
+                        //  shared read instead of a failed CAS (which is
+                        //  still an exclusive-ownership RMW on the line).
+                        if (retired_records_[i].in_use_.load(minstd::memory_order_relaxed))
+                        {
+                            continue;
+                        }
+
                         bool expected = false;
 
                         if (!retired_records_[i].in_use_.compare_exchange_strong(expected, true,
@@ -200,6 +239,19 @@ namespace MINIMAL_STD_NAMESPACE
                         {
                             continue;
                         }
+
+                        //  Incremented BEFORE active_ goes true, so this
+                        //  thread's own subsequent targeted-reclaim calls
+                        //  (the primary reclaim path -- see below and the
+                        //  guard-release path) are guaranteed by program
+                        //  order to see a nonzero count and not early-out
+                        //  past their own retirement.  Other threads may
+                        //  transiently read a stale zero and skip a check --
+                        //  that only defers their (secondary) reclaim
+                        //  opportunity to the RETIRE_SCAN_THRESHOLD backstop
+                        //  scan, which is already how missed targeted
+                        //  reclaims are handled.
+                        active_retired_count_.fetch_add(1, minstd::memory_order_relaxed);
 
                         retired_records_[i].retired_ptr_.store(ptr, minstd::memory_order_relaxed);
                         retired_records_[i].deleter_.store(deleter, minstd::memory_order_relaxed);
@@ -248,6 +300,20 @@ namespace MINIMAL_STD_NAMESPACE
                     return false;
                 }
 
+                //  Fast-path early-out: this is called on EVERY guard
+                //  release (and slot retarget), but outside a retirement
+                //  window there are zero active retired records -- one
+                //  relaxed load spares the full record-table walk in that
+                //  common case.  A transiently stale zero here can only
+                //  skip a SECONDARY reclaim opportunity (the retiring
+                //  thread's own calls are ordered after its increment --
+                //  see retire()); anything skipped is picked up by the
+                //  threshold backstop scan.
+                if (active_retired_count_.load(minstd::memory_order_relaxed) == 0)
+                {
+                    return false;
+                }
+
                 for (size_t i = 0; i < MAX_RETIRED_RECORDS; ++i)
                 {
                     if (!retired_records_[i].active_.load(minstd::memory_order_acquire))
@@ -274,6 +340,8 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
+                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
+
                     pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
                     deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
@@ -296,6 +364,12 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t scan()
             {
+                //  Same early-out as try_reclaim_specific -- see there.
+                if (active_retired_count_.load(minstd::memory_order_relaxed) == 0)
+                {
+                    return 0;
+                }
+
                 size_t reclaimed = 0;
 
                 for (size_t i = 0; i < MAX_RETIRED_RECORDS; ++i)
@@ -320,6 +394,8 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         continue;
                     }
+
+                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
 
                     pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
                     deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
@@ -358,6 +434,20 @@ namespace MINIMAL_STD_NAMESPACE
                 return count;
             }
 
+            //  Public wrapper over the internal hazard-table check: true if
+            //  ANY hazard slot currently protects ptr.  Intended for owners
+            //  that need to safely REUSE (not delete) a resource that was
+            //  never retired -- e.g. reopening a buffer in place after an
+            //  allocation failure -- by waiting until no reader still holds
+            //  it.  Best-effort by nature: a new protector can appear right
+            //  after this returns false unless the caller has already made
+            //  the resource unreachable to new readers (or those readers
+            //  are harmless, e.g. gated out by other state).
+            bool is_protected(pointer_type ptr) const
+            {
+                return is_hazard_protected(ptr);
+            }
+
         private:
             static void default_deleter(pointer_type ptr)
             {
@@ -368,6 +458,19 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 for (size_t i = 0; i < MAX_HAZARD_POINTERS; ++i)
                 {
+                    //  Test-and-test-and-set: every guard acquisition scans
+                    //  from slot 0, so with N concurrent guard holders the
+                    //  first N slots are usually taken -- probing them with
+                    //  a blind CAS would steal each owner's cache line on
+                    //  every acquisition (a failed CAS is still an
+                    //  exclusive-ownership RMW), whereas a relaxed load
+                    //  leaves the line in Shared state and costs the owner
+                    //  nothing.
+                    if (hazard_records_[i].in_use_.load(minstd::memory_order_relaxed))
+                    {
+                        continue;
+                    }
+
                     bool expected = false;
 
                     if (hazard_records_[i].in_use_.compare_exchange_strong(expected, true,
@@ -380,6 +483,11 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 return INVALID_SLOT_INDEX;
+            }
+
+            pointer_type hazard_slot_value(size_t slot_index) const
+            {
+                return hazard_records_[slot_index].protected_ptr_.load(minstd::memory_order_relaxed);
             }
 
             void store_hazard(size_t slot_index, pointer_type ptr)
@@ -414,13 +522,15 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool is_hazard_protected(pointer_type ptr) const
             {
+                //  No in_use_ pre-check needed: a slot's protected_ptr_ is
+                //  never left non-null while the slot is free (release
+                //  stores null before clearing in_use_; acquisition stores
+                //  null before first use), so comparing protected_ptr_
+                //  alone is equivalent and halves the atomic loads on this
+                //  path -- which runs once per hazard slot per reclaim
+                //  check.
                 for (size_t i = 0; i < MAX_HAZARD_POINTERS; ++i)
                 {
-                    if (!hazard_records_[i].in_use_.load(minstd::memory_order_acquire))
-                    {
-                        continue;
-                    }
-
                     if (hazard_records_[i].protected_ptr_.load(minstd::memory_order_acquire) == ptr)
                     {
                         return true;
@@ -432,6 +542,10 @@ namespace MINIMAL_STD_NAMESPACE
 
             void force_reclaim_all()
             {
+                //  Destructor-time only -- no concurrent activity by
+                //  precondition, so a plain reset is sufficient.
+                active_retired_count_.store(0, minstd::memory_order_relaxed);
+
                 for (size_t i = 0; i < MAX_RETIRED_RECORDS; ++i)
                 {
                     if (!retired_records_[i].in_use_.load(minstd::memory_order_acquire))
@@ -457,6 +571,15 @@ namespace MINIMAL_STD_NAMESPACE
             minstd::array<hazard_record, MAX_HAZARD_POINTERS> hazard_records_{};
             minstd::array<retired_record, MAX_RETIRED_RECORDS> retired_records_{};
             minstd::atomic<size_t> retire_since_scan_{0};
+
+            //  Approximate count of records whose active_ flag is set --
+            //  maintained solely so the per-guard-release reclaim check can
+            //  early-out with one relaxed load when nothing is pending,
+            //  instead of walking the whole record table on every release.
+            //  See retire()/try_reclaim_specific() for why approximate
+            //  (relaxed) counting is sufficient.
+            minstd::atomic<size_t> active_retired_count_{0};
+
             hazard_pointer_reclaim_observer *observer_ = nullptr;
             minstd::atomic<size_t> total_reclaimed_{0};
         };

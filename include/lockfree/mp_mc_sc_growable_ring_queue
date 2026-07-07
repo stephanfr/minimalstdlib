@@ -371,9 +371,25 @@ namespace MINIMAL_STD_NAMESPACE
         {
             segment *candidate = load_consumer_target();
 
+            //  Multi-consumer only: ONE hazard guard for the whole call,
+            //  re-targeted (protect()) per segment attempt, instead of a
+            //  full acquire/release cycle inside every try_pop_from -- on
+            //  an empty-looking queue that halves (or better, for larger
+            //  SegmentCount) the guard traffic per call.  protect()
+            //  performs the targeted-reclaim re-check when it retargets
+            //  away from a pointer, so reclamation stays as prompt as with
+            //  per-attempt guards.  Default-constructed (invalid, unused)
+            //  in single-consumer mode.
+            [[maybe_unused]] typename domain_type::hazard_guard guard;
+
+            if constexpr (MultiConsumer)
+            {
+                guard = domain_.acquire_guard();
+            }
+
             for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
             {
-                if (try_pop_from(*candidate, front))
+                if (try_pop_from(*candidate, front, guard))
                 {
                     store_consumer_target(candidate);
 
@@ -703,20 +719,23 @@ namespace MINIMAL_STD_NAMESPACE
             return true;
         }
 
-        bool try_pop_from(segment &seg, T &front)
+        //  guard: caller-owned (see pop_front), valid whenever
+        //  MultiConsumer is true; completely ignored in single-consumer
+        //  mode.
+        bool try_pop_from(segment &seg, T &front, [[maybe_unused]] typename domain_type::hazard_guard &guard)
         {
             if constexpr (MultiConsumer)
             {
-                //  Guards the descriptor -- and therefore the buffer it
+                //  Protects the descriptor -- and therefore the buffer it
                 //  points to -- for the entire duration of this call: peek,
-                //  CAS, read, and destroy all happen while this thread's
+                //  CAS, read, and destroy all happen while the caller's
                 //  hazard slot protects `desc`, which is exactly the gap
                 //  (peek-before-claim) that a bare claim-order/completion-
-                //  count scheme could not close. Releasing the guard on
-                //  return (its destructor) is itself the event that may
-                //  trigger this descriptor's actual reclaim, if this call
-                //  happened to be the one that retired it.
-                typename domain_type::hazard_guard guard = domain_.acquire_guard();
+                //  count scheme could not close. The caller's eventual
+                //  guard release (or retarget to another segment's
+                //  descriptor) is the event that may trigger this
+                //  descriptor's actual reclaim, if this call happened to be
+                //  the one that retired it.
                 retired_descriptor *desc = guard.protect(seg.current_);
 
                 tagged_position::storage_type state = seg.dequeue_state_.load(memory_order_acquire);
