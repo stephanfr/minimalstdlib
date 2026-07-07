@@ -604,9 +604,13 @@ namespace MINIMAL_STD_NAMESPACE
         class hazardous_resource
         {
         public:
-            void retire()
+            //  Returns the domain's result: false means the retired-record
+            //  table was full and ownership was NOT transferred -- the
+            //  caller still owns the object and must dispose of it some
+            //  other way (or leak it knowingly).
+            bool retire()
             {
-                domain_->retire(static_cast<Derived *>(this));
+                return domain_->retire(static_cast<Derived *>(this));
             }
 
         protected:

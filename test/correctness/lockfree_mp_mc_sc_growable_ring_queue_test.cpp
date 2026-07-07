@@ -52,13 +52,49 @@ namespace
         }
     };
 
+    //  Thread-safe resource that deliberately fails some allocations:
+    //  lets the queue's constructor allocate its initial segments, then
+    //  fails every other allocation -- interleaving successful regrows
+    //  with allocation-failure recycles (the queue's degraded in-place
+    //  reopen path) under whatever contention the caller applies.
+    class flaky_test_resource : public minstd::pmr::memory_resource
+    {
+    public:
+        static constexpr size_t INITIAL_ALLOCATIONS_ALLOWED = 8;
+
+    private:
+        minstd::atomic<size_t> allocation_count_{0};
+
+        void *do_allocate(size_t bytes, size_t align) override
+        {
+            size_t n = allocation_count_.fetch_add(1, minstd::memory_order_relaxed);
+
+            if (n >= INITIAL_ALLOCATIONS_ALLOWED && (n % 2) == 1)
+            {
+                return nullptr;
+            }
+
+            return ::operator new(bytes, static_cast<std::align_val_t>(align));
+        }
+
+        void do_deallocate(void *ptr, size_t, size_t align) override
+        {
+            ::operator delete(ptr, static_cast<std::align_val_t>(align));
+        }
+
+        bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+        {
+            return this == &other;
+        }
+    };
+
     struct ring_test_element
     {
         uint32_t producer_ = 0;
         uint32_t sequence_ = 0;
     };
 
-    template <bool MultiConsumer, size_t SegmentCount>
+    template <bool MultiConsumer, size_t SegmentCount, typename Resource = new_delete_test_resource>
     struct ring_stress_harness
     {
         using queue_t = minstd::mp_mc_sc_growable_ring_queue<ring_test_element, MultiConsumer, SegmentCount>;
@@ -144,7 +180,7 @@ namespace
 
         void run(size_t idle_rotation_interval = 0)
         {
-            new_delete_test_resource resource;
+            Resource resource;
             alloc_t alloc(&resource);
 
             //  Deliberately small initial capacity relative to
@@ -434,4 +470,122 @@ TEST(MpMcScGrowableRingQueueTests, RingUnderContentionWithIdleRotationMultiConsu
 {
     ring_stress_harness<true, 4> harness;
     harness.run(500);
+}
+
+//  Resource that fails allocation on demand -- deterministic control for
+//  the allocation-failure recycle path, unlike flaky_test_resource's
+//  every-other pattern.
+namespace
+{
+    class switchable_test_resource : public minstd::pmr::memory_resource
+    {
+    public:
+        bool fail_allocations_ = false;
+
+    private:
+        void *do_allocate(size_t bytes, size_t align) override
+        {
+            if (fail_allocations_)
+            {
+                return nullptr;
+            }
+
+            return ::operator new(bytes, static_cast<std::align_val_t>(align));
+        }
+
+        void do_deallocate(void *ptr, size_t, size_t align) override
+        {
+            ::operator delete(ptr, static_cast<std::align_val_t>(align));
+        }
+
+        bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+        {
+            return this == &other;
+        }
+    };
+}
+
+//  Deterministic coverage of the multi-consumer allocation-failure
+//  fallback: every regrow allocation fails, so every completed life must
+//  recycle the SAME buffer in place (capacity frozen), and the queue must
+//  keep working correctly through many such recycles -- then resume
+//  growing once allocation recovers.
+TEST(MpMcScGrowableRingQueueTests, MultiConsumerAllocationFailureRecyclesInPlace)
+{
+    switchable_test_resource resource;
+
+    using queue_t = minstd::mp_mc_sc_growable_ring_queue<int, true>;
+    minstd::pmr::polymorphic_allocator<queue_t::allocator_type::value_type> alloc(&resource);
+
+    queue_t q(alloc, 4);
+
+    CHECK_EQUAL(8, q.capacity_estimate()); // 4 + 4
+
+    resource.fail_allocations_ = true;
+
+    int next_push = 0;
+    int next_pop = 0;
+
+    for (int round = 0; round < 100; ++round)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            CHECK_TRUE(q.push_back(next_push));
+            ++next_push;
+        }
+
+        for (int i = 0; i < 4; ++i)
+        {
+            int v = -1;
+
+            CHECK_TRUE(q.pop_front(v));
+            CHECK_EQUAL(next_pop, v);
+            ++next_pop;
+        }
+    }
+
+    //  100 full drain-and-retire cycles, every one of which failed to
+    //  allocate a replacement -- capacity must be exactly where it started.
+    CHECK_EQUAL(8, q.capacity_estimate());
+
+    //  Allocation recovers: the very next full drain regrows organically.
+    resource.fail_allocations_ = false;
+
+    for (int round = 0; round < 4; ++round)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            CHECK_TRUE(q.push_back(next_push));
+            ++next_push;
+        }
+
+        for (int i = 0; i < 4; ++i)
+        {
+            int v = -1;
+
+            CHECK_TRUE(q.pop_front(v));
+            CHECK_EQUAL(next_pop, v);
+            ++next_pop;
+        }
+    }
+
+    CHECK_TRUE(q.capacity_estimate() > 8);
+}
+
+//  Same full multi-producer/multi-consumer stress as
+//  RingUnderContentionMultiConsumer, but with an allocator that fails
+//  every other regrow -- forcing the allocation-failure recycle path
+//  (including its wait-for-stragglers gate) to interleave with real
+//  growth under genuine contention. The single-consumer variant covers
+//  the equivalent (simpler) recycle path in retire_and_grow.
+TEST(MpMcScGrowableRingQueueTests, RingUnderContentionSingleConsumerWithAllocationFailures)
+{
+    ring_stress_harness<false, 4, flaky_test_resource> harness;
+    harness.run();
+}
+
+TEST(MpMcScGrowableRingQueueTests, RingUnderContentionMultiConsumerWithAllocationFailures)
+{
+    ring_stress_harness<true, 4, flaky_test_resource> harness;
+    harness.run();
 }

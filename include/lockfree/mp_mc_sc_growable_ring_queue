@@ -810,7 +810,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                             if (seg.retire_claimed_.compare_exchange_strong(expected, true, memory_order_acq_rel, memory_order_relaxed))
                             {
-                                retire_and_grow_multi(seg, desc, effective_capacity);
+                                retire_and_grow_multi(seg, desc, effective_capacity, guard);
                             }
                         }
                         else if (idle_rotation_interval_ != 0 && (pos + 1) % idle_rotation_interval_ == 0)
@@ -1011,7 +1011,13 @@ namespace MINIMAL_STD_NAMESPACE
         //  reads are always stale-but-safe, never a live race, precisely
         //  because buffer_/original_capacity_/allocator_ never change after
         //  construction; capacity_ is the sole exception, see its comment).
-        void retire_and_grow_multi(segment &seg, retired_descriptor *desc, size_t effective_capacity_at_close)
+        //  guard: the caller's hazard guard currently protecting `desc`.
+        //  May be CLEARED by the degraded paths below (allocation failure,
+        //  retired-record exhaustion), which need to wait until nothing
+        //  protects desc -- including this thread. Callers must not
+        //  dereference the descriptor after this returns (neither call
+        //  site does).
+        void retire_and_grow_multi(segment &seg, retired_descriptor *desc, size_t effective_capacity_at_close, typename domain_type::hazard_guard &guard)
         {
             //  Was this life's capacity_ opportunistically reduced below
             //  its original_capacity_ (see maybe_shrink_active_segment)? If
@@ -1045,13 +1051,48 @@ namespace MINIMAL_STD_NAMESPACE
 
                 //  Recycle at the old (full physical) capacity: reopen the
                 //  SAME descriptor for another life rather than allocating
-                //  a new one. `desc`'s buffer_/original_capacity_/allocator_
-                //  are left completely untouched, so any thread still
-                //  holding a hazard-protected reference to it (see the note
-                //  above) remains safe regardless of this reopen; capacity_
-                //  is reset back to the full original_capacity_ since
-                //  there's no reason to keep a shrunk logical size when
-                //  recycling the same (already fully-sized) physical buffer.
+                //  a new one.
+                //
+                //  Reuse (unlike the deferred DELETION the normal path
+                //  gets from retire()) is NOT automatically safe under
+                //  hazard pointers: retirement triggers on the CLAIM of
+                //  the last dequeue position, not on its consumption
+                //  completing, so a consumer that won its CAS and was then
+                //  descheduled before moving/destroying its element can
+                //  still be mid-slot right now. Reopening the same buffer
+                //  without waiting would let new-life producers construct
+                //  over that live slot -- corruption -- and the
+                //  straggler's deferred ready_=false store would then
+                //  permanently strand the new item. So: wait until no
+                //  hazard slot still protects `desc` before reopening.
+                //  Our own guard must be cleared first (it protects desc
+                //  and would spin forever) -- safe, because desc is never
+                //  retired on this path, so there is no reclamation this
+                //  thread needs protection from, and this thread's own
+                //  continued use of desc's immutable fields is safe
+                //  regardless. New consumers that protect desc while we
+                //  wait are gated out by the still-exhausted
+                //  dequeue_state_ bound check before they touch any slot,
+                //  and their transient protection just extends the wait by
+                //  one guard cycle. Stragglers' slot writes happen-before
+                //  their hazard-slot release/retarget (release store), and
+                //  our acquire scan reads that -- so everything they wrote
+                //  is visible before the reopen stores below publish the
+                //  buffer to new producers.
+                //
+                //  This path can therefore briefly WAIT (bounded by the
+                //  longest concurrent pop_front) -- acceptable for an
+                //  allocation-failure fallback.
+                guard.clear();
+
+                while (domain_.is_protected(desc))
+                {
+                }
+
+                //  capacity_ is reset back to the full original_capacity_
+                //  since there's no reason to keep a shrunk logical size
+                //  when recycling the same (already fully-sized) physical
+                //  buffer.
                 desc->capacity_.store(desc->original_capacity_, memory_order_relaxed);
                 seg.retire_claimed_.store(false, memory_order_relaxed);
                 uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
@@ -1081,9 +1122,28 @@ namespace MINIMAL_STD_NAMESPACE
             //  Hand the old descriptor off for hazard-protected deferred
             //  deletion -- safe to reclaim immediately once no consumer
             //  thread (including this one, whose own guard still protects
-            //  it until try_pop_from returns) still holds a hazard pointer
-            //  to it.
-            desc->retire();
+            //  it until the enclosing pop_front returns) still holds a
+            //  hazard pointer to it.
+            if (!desc->retire())
+            {
+                //  Retired-record table exhausted (implies dozens of
+                //  concurrently stalled reclamations -- effectively never,
+                //  but previously a silent leak). desc is already
+                //  unreachable: current_ now points at new_desc, and
+                //  protect()'s validation re-read makes any in-flight
+                //  stale protection attempt retry against the new value
+                //  rather than return desc. So drain existing protectors
+                //  (clearing our own guard first -- see the parameter
+                //  note) and delete directly, same wait pattern as the
+                //  allocation-failure reopen above.
+                guard.clear();
+
+                while (domain_.is_protected(desc))
+                {
+                }
+
+                delete desc;
+            }
         }
 
         //  Opportunistically closes the currently-active segment's life
@@ -1144,7 +1204,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (target->retire_claimed_.compare_exchange_strong(expected, true, memory_order_acq_rel, memory_order_relaxed))
                     {
-                        retire_and_grow_multi(*target, desc, position_at_check);
+                        retire_and_grow_multi(*target, desc, position_at_check, guard);
                     }
                 }
             }
