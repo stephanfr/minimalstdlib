@@ -463,62 +463,51 @@ namespace MINIMAL_STD_NAMESPACE
         //  declared as plain consecutive members with no isolation) fit in
         //  EXACTLY one 64-byte cache line on every configuration measured
         //  (single- and multi-consumer, confirmed via sizeof deltas across
-        //  SegmentCount). That means enqueue_pos_ (written by every
-        //  producer on every push_back) and dequeue_state_/capacity_/
-        //  buffer_/current_/retire_claimed_ (written by the consumer side
-        //  on every pop_front/retire) were guaranteed to share one line --
-        //  real false sharing that hits the primary 1-producer/1-consumer
-        //  case just as hard as any multi-producer burst, since it bounces
-        //  the same line between the two cores on every single operation
-        //  in either direction. next_ is isolated too: it's read by the
-        //  consumer on every FAILED try_pop_from attempt (an empty or
-        //  momentarily-behind queue is the common case), which would
-        //  otherwise pull the producer-hot line into Shared state on the
-        //  consumer's core and force an invalidation on the next producer
-        //  fetch_add.
+        //  SegmentCount). That meant enqueue_pos_ (written by every
+        //  producer on every push_back) and dequeue_state_ (written by the
+        //  consumer side on every pop_front) were guaranteed to share one
+        //  line -- real false sharing that hits the primary
+        //  1-producer/1-consumer case just as hard as any multi-producer
+        //  burst, since it bounces the same line between the two cores on
+        //  every single operation in either direction.
+        //
+        //  The fields are split by ACCESS pattern, not by which role "owns"
+        //  them, into three cache lines:
+        //
+        //  1. read-mostly (next_/buffer_/original_capacity_/capacity_/
+        //     current_): read by producers on EVERY push (buffer_ or
+        //     current_) and by consumers on every pop, but written only at
+        //     segment open/regrow -- so the line sits in Shared state on
+        //     every core and nobody invalidates anyone. Grouping these with
+        //     either hot counter instead would put a field producers must
+        //     read every push on a line consumers dirty every pop (or vice
+        //     versa), reintroducing a miss per operation -- exactly the
+        //     mistake the first-generation split made by parking buffer_/
+        //     current_ next to dequeue_state_.
+        //
+        //  2. producer-hot (enqueue_pos_): the only field producers write
+        //     on the fast path, alone on its line.
+        //
+        //  3. consumer-hot (dequeue_state_, retire_claimed_): written by
+        //     the consumer side on every pop (dequeue_state_) or at life
+        //     boundaries (retire_claimed_), alone on their line.
         static constexpr size_t CACHE_LINE_SIZE = 64;
 
         struct segment
         {
+            //  --- Cache line 1: read-mostly, written only at open/regrow ---
+
             //  Fixed ring member -- always the next segment in a
             //  SegmentCount-length cycle (never reallocated, never
             //  repointed after construction).  Named next_ rather than
             //  other_/sibling_ because with SegmentCount > 2 it is one of
             //  several ring neighbors, not a single dedicated partner; for
             //  the SegmentCount == 2 default it is exactly the old sibling_
-            //  (a 2-cycle: A -> B -> A).  Isolated on its own line -- see
-            //  the padding audit note above -- since both producer (rare,
-            //  segment-switch only) and consumer (common, every failed pop
-            //  attempt) read it.
+            //  (a 2-cycle: A -> B -> A).
             alignas(CACHE_LINE_SIZE) segment *next_ = nullptr;
-            char next_pad_[CACHE_LINE_SIZE - sizeof(segment *)];
-
-            //  Packs the claiming life's capacity together with the
-            //  ascending position counter -- see tagged_enqueue_state above.
-            //  Applies uniformly regardless of MultiConsumer: the staleness
-            //  hazard this closes is not specific to multi-consumer mode.
-            //  The single hottest producer-side field in the structure --
-            //  isolated on its own line so no consumer-side write ever
-            //  invalidates it, and vice versa.
-            alignas(CACHE_LINE_SIZE) atomic<tagged_enqueue_state::storage_type> enqueue_pos_{0};
-            char enqueue_pos_pad_[CACHE_LINE_SIZE - sizeof(atomic<tagged_enqueue_state::storage_type>)];
-
-            //  Consumer-only cache line: every field from here down is
-            //  written exclusively by whichever thread(s) perform
-            //  pop_front()/retire_and_grow(_multi)/maybe_shrink_active_segment()
-            //  -- never by a producer -- so grouping them together, away
-            //  from enqueue_pos_ above, means a pop never invalidates the
-            //  producer's line and a push never invalidates this one.
-            //
-            //  Dequeue-position representation is conditional on
-            //  MultiConsumer: plain size_t (single-consumer, no atomics at
-            //  all) vs. an epoch-tagged atomic<uint64_t> (multi-consumer,
-            //  CAS-claimed -- see tagged_position above for why the epoch
-            //  tag is required).
-            alignas(CACHE_LINE_SIZE) conditional_t<MultiConsumer, atomic<tagged_position::storage_type>, size_t> dequeue_state_{};
 
             //  Single-consumer only: authoritative, plain fields -- no
-            //  indirection, no atomics beyond enqueue_pos_ above, since only
+            //  indirection, no atomics beyond enqueue_pos_ below, since only
             //  one thread ever touches this segment's buffer.  Left at their
             //  initial values (harmless, a few bytes) and never touched when
             //  MultiConsumer is true.
@@ -548,6 +537,26 @@ namespace MINIMAL_STD_NAMESPACE
             //  false.
             atomic<retired_descriptor *> current_{nullptr};
 
+            //  --- Cache line 2: producer-hot ---
+
+            //  Packs the claiming life's capacity together with the
+            //  ascending position counter -- see tagged_enqueue_state above.
+            //  Applies uniformly regardless of MultiConsumer: the staleness
+            //  hazard this closes is not specific to multi-consumer mode.
+            //  The single hottest producer-side field in the structure --
+            //  isolated on its own line so no consumer-side write ever
+            //  invalidates it, and vice versa.
+            alignas(CACHE_LINE_SIZE) atomic<tagged_enqueue_state::storage_type> enqueue_pos_{0};
+
+            //  --- Cache line 3: consumer-hot ---
+
+            //  Dequeue-position representation is conditional on
+            //  MultiConsumer: plain size_t (single-consumer, no atomics at
+            //  all) vs. an epoch-tagged atomic<uint64_t> (multi-consumer,
+            //  CAS-claimed -- see tagged_position above for why the epoch
+            //  tag is required).
+            alignas(CACHE_LINE_SIZE) conditional_t<MultiConsumer, atomic<tagged_position::storage_type>, size_t> dequeue_state_{};
+
             //  Multi-consumer only: arbitrates who actually calls
             //  retire_and_grow_multi() for a given life. Normally that's
             //  uniquely the one consumer thread whose CAS completes the
@@ -570,8 +579,10 @@ namespace MINIMAL_STD_NAMESPACE
         //  Layout guards: catch any future field reordering/addition that
         //  would silently reintroduce the false sharing this padding was
         //  added to eliminate.
+        static_assert(offsetof(segment, next_) == 0,
+                      "read-mostly group must start the struct");
         static_assert(offsetof(segment, enqueue_pos_) == CACHE_LINE_SIZE,
-                      "enqueue_pos_ must start its own cache line, isolated from next_");
+                      "enqueue_pos_ must start its own cache line, isolated from the read-mostly group");
         static_assert(offsetof(segment, dequeue_state_) == 2 * CACHE_LINE_SIZE,
                       "dequeue_state_ must start its own cache line, isolated from enqueue_pos_");
 
@@ -1109,11 +1120,18 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
+        //  allocator_ (a stored reference) is read by BOTH producers and
+        //  consumers on every construct/destroy, and the growth/interval
+        //  fields are read at life boundaries -- all read-only after
+        //  construction, so this first line stays in Shared state
+        //  everywhere. pop_count_ deliberately does NOT live here: it is
+        //  written by the consumer side on every pop when idle rotation is
+        //  enabled, which would invalidate this line under every reader --
+        //  it lives with the other consumer-written fields below instead.
         allocator_type &allocator_;
         size_t growth_numerator_;
         size_t growth_denominator_;
         size_t idle_rotation_interval_;
-        conditional_t<MultiConsumer, atomic<size_t>, size_t> pop_count_{0};
         segment segments_[SegmentCount];
 
         //  Same false-sharing concern as within segment above: producer_target_
@@ -1123,11 +1141,12 @@ namespace MINIMAL_STD_NAMESPACE
         //  virtually guaranteed to share a line. domain_ is consumer/retire-
         //  path-only (its hazard guard is acquired on every MultiConsumer
         //  pop_front call), so it belongs on the consumer side of the split,
-        //  not isolated further from consumer_target_.
+        //  not isolated further from consumer_target_ -- as does pop_count_
+        //  (see the allocator_ comment above).
         alignas(CACHE_LINE_SIZE) atomic<segment *> producer_target_;
-        char producer_target_pad_[CACHE_LINE_SIZE - sizeof(atomic<segment *>)];
 
         alignas(CACHE_LINE_SIZE) consumer_target_type consumer_target_;
+        conditional_t<MultiConsumer, atomic<size_t>, size_t> pop_count_{0};
         mutable conditional_t<MultiConsumer, domain_type, no_domain> domain_;
     };
 }
