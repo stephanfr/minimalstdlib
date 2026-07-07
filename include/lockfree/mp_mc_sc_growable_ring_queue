@@ -466,7 +466,13 @@ namespace MINIMAL_STD_NAMESPACE
                 for (size_t i = 0; i < SegmentCount; ++i)
                 {
                     retired_descriptor *d = guard.protect(segments_[i].current_);
-                    total += d->capacity_.load(memory_order_acquire);
+
+                    //  Hazard slots exhausted: skip -- this is a best-effort
+                    //  diagnostic, an undercount beats a null deref.
+                    if (d != nullptr)
+                    {
+                        total += d->capacity_.load(memory_order_acquire);
+                    }
                 }
             }
             else
@@ -753,6 +759,17 @@ namespace MINIMAL_STD_NAMESPACE
                 //  the one that retired it.
                 retired_descriptor *desc = guard.protect(seg.current_);
 
+                //  protect() returns null only when the domain's hazard
+                //  slots were exhausted at acquire_guard time (an extreme
+                //  consumer-thread count) -- previously an unchecked null
+                //  deref. Treat it as a transient failure: report nothing
+                //  available; a slot frees as soon as any concurrent pop
+                //  completes and the caller's retry proceeds normally.
+                if (desc == nullptr)
+                {
+                    return false;
+                }
+
                 tagged_position::storage_type state = seg.dequeue_state_.load(memory_order_acquire);
 
                 while (true)
@@ -865,6 +882,15 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 typename domain_type::hazard_guard guard = domain_.acquire_guard();
                 retired_descriptor *desc = guard.protect(seg.current_);
+
+                //  Hazard slots exhausted: "nothing ready here" is exactly
+                //  the semantic empty() documents for transient conditions
+                //  ("true only means nothing available right now").
+                if (desc == nullptr)
+                {
+                    return false;
+                }
+
                 size_t pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
 
                 if (pos >= desc->capacity_.load(memory_order_acquire))
@@ -1040,7 +1066,14 @@ namespace MINIMAL_STD_NAMESPACE
                 //  identical.
                 typename domain_type::hazard_guard sibling_guard = domain_.acquire_guard();
                 retired_descriptor *sibling_desc = sibling_guard.protect(seg.next_->current_);
-                new_capacity = compute_new_capacity(sibling_desc->capacity_.load(memory_order_acquire));
+
+                //  Hazard slots exhausted: fall back to growing relative to
+                //  this segment's own just-closed size instead of the
+                //  sibling's -- a fixed, valid reference that keeps growth
+                //  monotonic; the ring re-converges within a cycle.
+                new_capacity = compute_new_capacity(sibling_desc != nullptr
+                                                        ? sibling_desc->capacity_.load(memory_order_acquire)
+                                                        : desc->original_capacity_);
             }
 
             slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
@@ -1174,6 +1207,29 @@ namespace MINIMAL_STD_NAMESPACE
                 return;
             }
 
+            //  Multi-consumer: the hazard slot must be secured BEFORE the
+            //  capping CAS.  Once the cap lands, this thread MUST reduce
+            //  the descriptor's capacity_ to match, or the life can never
+            //  complete (producers are blocked at the cap while the
+            //  completion check waits for the original capacity) -- and
+            //  undoing a landed cap is not an option either, because any
+            //  producer claims burned against the capped word in the
+            //  meantime would become permanent, unpublishable holes in the
+            //  claim sequence.  Acquiring the guard first means slot
+            //  exhaustion just skips the whole check harmlessly, before
+            //  anything irreversible happens.
+            [[maybe_unused]] typename domain_type::hazard_guard guard;
+
+            if constexpr (MultiConsumer)
+            {
+                guard = domain_.acquire_guard();
+
+                if (!guard.is_valid())
+                {
+                    return;
+                }
+            }
+
             tagged_enqueue_state::storage_type capped_state = tagged_enqueue_state::pack(position_at_check, position_at_check);
 
             if (!target->enqueue_pos_.compare_exchange_strong(state, capped_state, memory_order_acq_rel, memory_order_relaxed))
@@ -1183,8 +1239,14 @@ namespace MINIMAL_STD_NAMESPACE
 
             if constexpr (MultiConsumer)
             {
-                typename domain_type::hazard_guard guard = domain_.acquire_guard();
+                //  Cannot return null: the guard was validated above, and
+                //  current_ always holds a live descriptor.  This protect
+                //  necessarily observes the life the CAS just capped:
+                //  current_ cannot change between the CAS and here, since
+                //  swapping it requires this life to complete, which is
+                //  exactly what is frozen until the capacity_ store below.
                 retired_descriptor *desc = guard.protect(target->current_);
+
                 desc->capacity_.store(position_at_check, memory_order_release);
 
                 //  The segment may already be fully drained relative to
