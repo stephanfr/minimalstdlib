@@ -272,9 +272,7 @@ namespace MINIMAL_STD_NAMESPACE
         };
 
     public:
-        //  idle_rotation_interval: every that many successful pop_front()
-        //  calls (globally across the whole queue, counted via a single
-        //  fetch_add so exactly one caller ever crosses a given multiple),
+        //  idle_rotation_interval: every that many successful pops,
         //  opportunistically check whether the currently-active segment is
         //  running under 50% loaded, and if so, close its current life
         //  early so it can reopen smaller once it finishes draining --
@@ -285,6 +283,20 @@ namespace MINIMAL_STD_NAMESPACE
         //  segment to be completely refilled to its (now inflated)
         //  capacity again first -- which, after a burst subsides, may
         //  never happen.
+        //
+        //  How the "every Nth pop" is counted differs by mode.
+        //  Single-consumer: a plain global counter (free -- the sole
+        //  consumer owns it). Multi-consumer: the claimed dequeue POSITION
+        //  is sampled instead ((pos + 1) % interval == 0) -- each position
+        //  is claimed exactly once per life, so exactly one consumer fires
+        //  per multiple, with NO shared counter for every consumer to
+        //  fetch_add on every pop. Consequence worth knowing: positions
+        //  reset each life, so a segment whose capacity is smaller than
+        //  the interval never triggers a check while active. That is the
+        //  right bias -- the shrink target is by definition a segment far
+        //  larger than its load (a burst-inflated one), and producers
+        //  stick with a not-yet-full segment, so draining one keeps
+        //  advancing its position toward the next multiple.
         explicit mp_mc_sc_growable_ring_queue(allocator_type &allocator,
                                                size_t initial_capacity,
                                                size_t growth_numerator = 5,
@@ -402,28 +414,15 @@ namespace MINIMAL_STD_NAMESPACE
 
                     //  idle_rotation_interval_ == 0 (the default) disables
                     //  this entirely -- capacity then only ever grows,
-                    //  exactly as before this feature existed. Otherwise,
-                    //  every idle_rotation_interval_-th successful pop
-                    //  (globally, across the whole queue) opportunistically
-                    //  checks whether the active segment could be shrunk.
-                    //  The fetch_add (multi-consumer) or plain increment
-                    //  (single-consumer) returns a unique value per call, so
-                    //  exactly one caller ever observes a given exact
-                    //  multiple -- no extra coordination needed for that.
-                    if (idle_rotation_interval_ != 0)
+                    //  exactly as before this feature existed.
+                    //  Single-consumer only: the multi-consumer equivalent
+                    //  samples the claimed dequeue position inside
+                    //  try_pop_from instead of maintaining a shared counter
+                    //  every consumer would have to fetch_add on every pop
+                    //  -- see the constructor comment.
+                    if constexpr (!MultiConsumer)
                     {
-                        size_t count;
-
-                        if constexpr (MultiConsumer)
-                        {
-                            count = pop_count_.fetch_add(1, memory_order_relaxed) + 1;
-                        }
-                        else
-                        {
-                            count = ++pop_count_;
-                        }
-
-                        if (count % idle_rotation_interval_ == 0)
+                        if (idle_rotation_interval_ != 0 && ++pop_count_ % idle_rotation_interval_ == 0)
                         {
                             maybe_shrink_active_segment();
                         }
@@ -814,6 +813,16 @@ namespace MINIMAL_STD_NAMESPACE
                                 retire_and_grow_multi(seg, desc, effective_capacity);
                             }
                         }
+                        else if (idle_rotation_interval_ != 0 && (pos + 1) % idle_rotation_interval_ == 0)
+                        {
+                            //  Multi-consumer idle-rotation sampling: the
+                            //  claimed position is unique per life, so
+                            //  exactly one consumer fires per interval
+                            //  multiple -- no shared counter needed. See
+                            //  the constructor comment for the semantics
+                            //  (and the deliberate small-segment bias).
+                            maybe_shrink_active_segment();
+                        }
 
                         return true;
                     }
@@ -1180,8 +1189,11 @@ namespace MINIMAL_STD_NAMESPACE
         //  (see the allocator_ comment above).
         alignas(CACHE_LINE_SIZE) atomic<segment *> producer_target_;
 
+        //  Single-consumer only (multi-consumer samples the dequeue
+        //  position instead of counting -- see the constructor comment);
+        //  plain because the sole consumer owns it.
         alignas(CACHE_LINE_SIZE) consumer_target_type consumer_target_;
-        conditional_t<MultiConsumer, atomic<size_t>, size_t> pop_count_{0};
+        size_t pop_count_ = 0;
         mutable conditional_t<MultiConsumer, domain_type, no_domain> domain_;
     };
 }
