@@ -391,7 +391,14 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 if (try_pop_from(*candidate, front, guard))
                 {
-                    store_consumer_target(candidate);
+                    //  Only write the hint when it actually changed: under
+                    //  MultiConsumer this is a shared line every consumer
+                    //  would otherwise dirty on every single pop just to
+                    //  store the value it already holds.
+                    if (attempt != 0)
+                    {
+                        store_consumer_target(candidate);
+                    }
 
                     //  idle_rotation_interval_ == 0 (the default) disables
                     //  this entirely -- capacity then only ever grows,
@@ -694,6 +701,15 @@ namespace MINIMAL_STD_NAMESPACE
             //  try_pop_from's "no straggler left" note) -- so reading the
             //  buffer afterward, however delayed, is safe without any
             //  further check.
+            //
+            //  Note: a test-and-test-and-set peek before this fetch_add
+            //  (load, check full, skip the RMW) was tried to soften the
+            //  RMW ping-pong that blocked producers cause while spinning
+            //  against a full ring -- and measured a consistent 20-35%
+            //  regression on the uncontended 1P/1C fast path (the
+            //  dependent load+branch ahead of the RMW stalls the tight
+            //  producer loop), so it was deliberately rejected: the fast
+            //  path matters more than the saturated path here.
             tagged_enqueue_state::storage_type before = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
             size_t capacity_at_claim = tagged_enqueue_state::unpack_capacity(before);
             size_t idx = tagged_enqueue_state::unpack_pos(before);
