@@ -96,6 +96,12 @@ namespace MINIMAL_STD_NAMESPACE
         static constexpr int CAPACITY_BITS = 32;
         static constexpr storage_type POS_MASK = (storage_type{1} << (64 - CAPACITY_BITS)) - 1;
 
+        //  Known nit, not fixed: capacity (or pos) values at or beyond
+        //  2^32 silently truncate into each other's bits instead of
+        //  asserting -- accepted per the file comment above on why 32/32
+        //  headroom is already treated as "physically implausible to
+        //  reach," the same standard the rest of this header holds
+        //  itself to (e.g. the 16-bit epoch in tagged_position).
         static constexpr storage_type pack(size_t capacity, size_t pos)
         {
             return (static_cast<storage_type>(capacity) << (64 - CAPACITY_BITS)) | (static_cast<storage_type>(pos) & POS_MASK);
@@ -588,8 +594,9 @@ namespace MINIMAL_STD_NAMESPACE
             //  Multi-consumer only: arbitrates who actually calls
             //  retire_and_grow_multi() for a given life. Normally that's
             //  uniquely the one consumer thread whose CAS completes the
-            //  last position (see try_pop_from's "no straggler left"
-            //  note). But maybe_shrink_active_segment() can close a life
+            //  last position (see try_pop_from's current_ re-check
+            //  comment for why desc is provably still correct at that
+            //  point). But maybe_shrink_active_segment() can close a life
             //  early at a point the consumer side has *already* fully
             //  drained -- in that case no future pop would ever re-check
             //  completion, so the shrink-check must trigger it instead;
@@ -624,6 +631,21 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * capacity, alignof(slot_type));
                 capacity = 0;
+
+                //  Known nit, not fixed: a segment that fails its VERY
+                //  FIRST allocation (at queue construction; every later
+                //  allocate() failure is instead handled by the recycle-
+                //  in-place fallbacks in retire_and_grow/retire_and_grow_multi,
+                //  which never call this with a null buffer_) leaves
+                //  buffer_ null and original_capacity_/capacity_ at 0.
+                //  Teardown then calls deallocate(nullptr, 0), which
+                //  MINIMAL_STD_ALLOCATION_FAILURE_POLICY_LEGACY-style
+                //  allocators tend to treat as a harmless no-op but which
+                //  the standard allocator contract does not strictly
+                //  guarantee. Left as-is: MINIMAL_STD_OUT_OF_MEMORY already
+                //  traps/aborts by default (MINIMAL_STD_FAILURE_POLICY_DEFAULT),
+                //  so reaching this line at all means a non-default policy
+                //  was deliberately chosen to tolerate allocation failure.
             }
 
             for (size_t i = 0; i < capacity; ++i)
@@ -702,10 +724,11 @@ namespace MINIMAL_STD_NAMESPACE
             //  < capacity_at_claim) needs no such protection: it is, by
             //  construction, guaranteed to be within [0, capacity) for
             //  whichever life is current at the moment of the fetch_add, and
-            //  that life cannot retire until this exact claim publishes (see
-            //  try_pop_from's "no straggler left" note) -- so reading the
-            //  buffer afterward, however delayed, is safe without any
-            //  further check.
+            //  that life cannot retire until this exact claim publishes (a
+            //  retirement requires every position up to and including this
+            //  one to have been claimed AND consumed, in order) -- so
+            //  reading the buffer afterward, however delayed, is safe
+            //  without any further check.
             //
             //  Note: a test-and-test-and-set peek before this fetch_add
             //  (load, check full, skip the RMW) was tried to soften the
@@ -770,13 +793,63 @@ namespace MINIMAL_STD_NAMESPACE
                     return false;
                 }
 
+                //  When idle rotation is disabled, capacity_ is provably
+                //  immutable for desc's whole life (maybe_shrink_active_segment
+                //  is the only writer, and it's only reachable when
+                //  idle_rotation_interval_ != 0) -- read it once instead of
+                //  on every loop iteration and again after the CAS.
+                const bool capacity_is_fixed = (idle_rotation_interval_ == 0);
+                size_t fixed_capacity = capacity_is_fixed ? desc->capacity_.load(memory_order_acquire) : 0;
+
                 tagged_position::storage_type state = seg.dequeue_state_.load(memory_order_acquire);
 
                 while (true)
                 {
-                    size_t pos = tagged_position::unpack_pos(state);
+                    //  Re-validate desc against the life `state` actually
+                    //  belongs to. Without this, a retirement that swaps in
+                    //  a brand-new descriptor between desc's protection
+                    //  above and this iteration's use of it goes
+                    //  undetected: `state`, freshly read (or refreshed by a
+                    //  CAS failure below), can already reflect the NEW
+                    //  life while `desc` still points at the OLD one --
+                    //  desc's buffer_[pos] would then be read against the
+                    //  wrong life entirely (a genuine bug this fixes: two
+                    //  consumers -- this one and the OLD life's rightful
+                    //  claimant -- would each believe they own the same
+                    //  physical slot, one of them corrupting/double-
+                    //  destroying it while the NEW life's real position at
+                    //  that index is silently skipped forever).
+                    //
+                    //  This check is sufficient, not just necessary: if it
+                    //  passes and the CAS below subsequently succeeds, desc
+                    //  is PROVABLY still correct at the moment of that
+                    //  success -- current_ only ever changes as part of a
+                    //  retirement that also changes dequeue_state_ (in that
+                    //  order: current_'s release-store precedes
+                    //  dequeue_state_'s in retire_and_grow_multi), so a CAS
+                    //  succeeding with `state` unchanged since it was read
+                    //  proves no such retirement completed in between --
+                    //  hence current_ didn't change either. Any retirement
+                    //  that DOES race in is instead caught for free: it
+                    //  changes dequeue_state_, which simply makes the CAS
+                    //  fail (state no longer matches), forcing a fresh loop
+                    //  iteration that re-runs this same check.
+                    //
+                    //  seq_cst load, paired with the seq_cst "unlink" store
+                    //  in retire_and_grow_multi and the seq_cst hazard-slot
+                    //  store/scan in hazard_pointer -- this is the same
+                    //  Dekker's-algorithm/store-buffering pattern as
+                    //  hazard_guard::protect(); see the extensive comment
+                    //  there for why plain acquire is insufficient here.
+                    if (seg.current_.load(memory_order_seq_cst) != desc)
+                    {
+                        return false;
+                    }
 
-                    if (pos >= desc->capacity_.load(memory_order_acquire))
+                    size_t pos = tagged_position::unpack_pos(state);
+                    size_t capacity = capacity_is_fixed ? fixed_capacity : desc->capacity_.load(memory_order_acquire);
+
+                    if (pos >= capacity)
                     {
                         return false;
                     }
@@ -796,25 +869,14 @@ namespace MINIMAL_STD_NAMESPACE
                         allocator_traits_type::destroy(allocator_, s.element_ptr());
                         s.ready_.store(false, memory_order_relaxed);
 
-                        //  Claim order is safe to trigger on directly here:
-                        //  the CAS above only ever advances dequeue_state_ by
-                        //  exactly one position at a time, and only past a
-                        //  position whose ready_ flag was just observed
-                        //  true -- so by the time this position reaches
-                        //  capacity_, every earlier position in this life has
-                        //  already been claimed AND completed, in order,
-                        //  which in turn required every one of their
-                        //  producers to have already finished publishing.
-                        //  There is no straggler left to protect against;
-                        //  the hazard guard above exists to protect THIS
-                        //  thread's own read, not to stagger the trigger.
-                        //  Fresh (acquire) read: capacity_ may have been
-                        //  opportunistically reduced by
+                        //  Fresh (acquire) read when not fixed: capacity_
+                        //  may have been opportunistically reduced by
                         //  maybe_shrink_active_segment() since this call
                         //  started, and that reduced value is exactly what
                         //  this life's completion should be measured
-                        //  against.
-                        size_t effective_capacity = desc->capacity_.load(memory_order_acquire);
+                        //  against. See the current_ re-check above for why
+                        //  desc is still guaranteed correct at this point.
+                        size_t effective_capacity = capacity_is_fixed ? fixed_capacity : desc->capacity_.load(memory_order_acquire);
 
                         if (pos + 1 == effective_capacity)
                         {
@@ -892,6 +954,21 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 size_t pos = tagged_position::unpack_pos(seg.dequeue_state_.load(memory_order_acquire));
+
+                //  Re-validate desc against the freshly-read position --
+                //  mirrors try_pop_from's identical guard against a
+                //  retirement racing in between protecting desc and
+                //  reading the position; see the comment there. No CAS
+                //  here to fall back on as a second line of defense, but a
+                //  stale answer from this specific window is merely
+                //  imprecise (matches empty()'s already-documented
+                //  best-effort contract), never unsafe -- this call never
+                //  claims or mutates anything. seq_cst for the same reason
+                //  as try_pop_from's identical check -- see there.
+                if (seg.current_.load(memory_order_seq_cst) != desc)
+                {
+                    return false;
+                }
 
                 if (pos >= desc->capacity_.load(memory_order_acquire))
                 {
@@ -1025,6 +1102,24 @@ namespace MINIMAL_STD_NAMESPACE
             seg.enqueue_pos_.store(tagged_enqueue_state::pack(effective_capacity, 0), memory_order_release);
         }
 
+        //  Shared reopen tail for retire_and_grow_multi's two paths (normal
+        //  regrow with a fresh descriptor, and the allocation-failure
+        //  recycle of the same one): reset retire_claimed_, bump the
+        //  epoch, and release-publish dequeue_state_/enqueue_pos_ for the
+        //  new life at the given capacity. If this life's descriptor is
+        //  being swapped (the normal path), that swap (seg.current_.store)
+        //  MUST happen before calling this -- producers/other consumers
+        //  gate on dequeue_state_/enqueue_pos_ (acquire) before trusting
+        //  current_ to already reflect the new life.
+        void reopen_life_multi(segment &seg, size_t capacity)
+        {
+            seg.retire_claimed_.store(false, memory_order_relaxed);
+
+            uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
+            seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(capacity, 0), memory_order_release);
+        }
+
         //  Multi-consumer only: called once `desc` (the descriptor this
         //  thread just finished reading the last position of) is proven
         //  fully drained, at effective_capacity (the life's capacity_ at
@@ -1033,7 +1128,7 @@ namespace MINIMAL_STD_NAMESPACE
         //  only ever swaps in a brand-new descriptor and hands `desc` off
         //  to the domain via retire() -- since other consumer threads may
         //  still be mid-call with a hazard guard protecting `desc`, reading
-        //  its fields (see try_pop_from's "no straggler left" note: those
+        //  its fields (see try_pop_from's current_ re-check comment: those
         //  reads are always stale-but-safe, never a live race, precisely
         //  because buffer_/original_capacity_/allocator_ never change after
         //  construction; capacity_ is the sole exception, see its comment).
@@ -1127,10 +1222,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  when recycling the same (already fully-sized) physical
                 //  buffer.
                 desc->capacity_.store(desc->original_capacity_, memory_order_relaxed);
-                seg.retire_claimed_.store(false, memory_order_relaxed);
-                uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
-                seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-                seg.enqueue_pos_.store(tagged_enqueue_state::pack(desc->original_capacity_, 0), memory_order_release);
+                reopen_life_multi(seg, desc->original_capacity_);
                 return;
             }
 
@@ -1141,16 +1233,21 @@ namespace MINIMAL_STD_NAMESPACE
 
             retired_descriptor *new_desc = new retired_descriptor(domain_, new_buffer, new_capacity, &allocator_);
 
-            //  Reopen gates: the descriptor swap MUST precede these
-            //  release-stores, since producers/other consumers gate on
-            //  enqueue_pos_/dequeue_state_ (acquire) before trusting
-            //  seg.current_ to already reflect this new life.
-            seg.current_.store(new_desc, memory_order_release);
-            seg.retire_claimed_.store(false, memory_order_relaxed);
-
-            uint16_t next_epoch = static_cast<uint16_t>(tagged_position::unpack_epoch(seg.dequeue_state_.load(memory_order_relaxed)) + 1);
-            seg.dequeue_state_.store(tagged_position::pack(0, next_epoch), memory_order_release);
-            seg.enqueue_pos_.store(tagged_enqueue_state::pack(new_capacity, 0), memory_order_release);
+            //  Reopen gate: the descriptor swap MUST precede
+            //  reopen_life_multi's release-stores -- see its comment.
+            //
+            //  seq_cst, not just release: this store is the reclaiming
+            //  thread's "unlink" half of the classic hazard-pointer
+            //  Dekker's-algorithm/store-buffering pattern against
+            //  try_pop_from's/has_ready's current_ re-check loads and
+            //  against hazard_guard::protect()'s store-then-reload -- see
+            //  the extensive comment in protect() for why plain
+            //  release/acquire cannot guarantee at least one side observes
+            //  the other's store, and why this codebase settled on making
+            //  every operation in the pattern seq_cst rather than relying
+            //  on fences.
+            seg.current_.store(new_desc, memory_order_seq_cst);
+            reopen_life_multi(seg, new_capacity);
 
             //  Hand the old descriptor off for hazard-protected deferred
             //  deletion -- safe to reclaim immediately once no consumer
