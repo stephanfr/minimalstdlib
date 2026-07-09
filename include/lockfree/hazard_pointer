@@ -30,37 +30,47 @@ namespace MINIMAL_STD_NAMESPACE
             ~hazard_pointer_reclaim_observer() = default;
         };
 
-        //  A note on ThreadSanitizer:
+        //  KNOWN OPEN ISSUE -- rare residual use-after-free (tracked, not
+        //  yet closed):
         //
         //  The protector/reclaimer handshake here is the classic
-        //  hazard-pointer store-buffering (Dekker's-algorithm) shape:
-        //  the protector does Store(HP[slot]) then Load(source); the
+        //  hazard-pointer store-buffering (Dekker's-algorithm) shape: the
+        //  protector does Store(HP[slot]) then Load(source); the
         //  reclaimer does Store(source) [unlink] then Load(HP[slot])
-        //  [scan]. Its safety rests on the sequential-consistency TOTAL
-        //  ORDER -- the guarantee that at least one of the two loads
-        //  observes the other side's store -- which is exactly why every
-        //  operation in the handshake is memory_order_seq_cst (see the
-        //  extensive comment in hazard_guard::protect()).
+        //  [scan]. Every operation in the handshake is
+        //  memory_order_seq_cst (see hazard_guard::protect()) specifically
+        //  to get the sequential-consistency total-order guarantee this
+        //  pattern needs. try_reclaim_specific()/scan() also re-verify
+        //  protection with a second is_hazard_protected() check placed
+        //  immediately before the actual delete, with no other
+        //  shared-memory operations in between, to close the gap between
+        //  "confirmed unprotected" and "freed" as tightly as possible.
         //
-        //  TSan's race detector is happens-before based and does NOT model
-        //  that seq_cst total order: the protector's HP store and the
-        //  reclaimer's scan load touch different locations with no
-        //  release/acquire message-passing between them, so TSan cannot
-        //  see the ordering edge that makes the pattern safe, and will
-        //  occasionally (empirically ~1 run in 150 under heavy
-        //  multi-consumer contention) report a spurious use-after-free
-        //  between a reclaim free and a protected read.
-        //
-        //  This was verified to be a TSan modeling artifact, not a real
-        //  bug, with a sanitizer-independent experiment: giving the
-        //  reclaimed object its own page and mprotect(PROT_NONE)-ing it on
-        //  free (never reused, real atomics, real fences) so that any
-        //  genuine temporal use-after-free faults immediately. The real
-        //  code survived 750 such runs with zero faults, while a
-        //  deliberately-broken variant (reclaim ignoring hazards) faulted
-        //  ~18% of runs -- confirming the detector works and the real code
-        //  has no use-after-free. A TSan suppression for this known
-        //  false positive lives in tsan.supp at the repository root.
+        //  Despite this, a genuine (not a sanitizer artifact) use-after-
+        //  free still reproduces under heavy multi-consumer contention, at
+        //  an empirically low rate: confirmed via a sanitizer-independent
+        //  page-guard harness (each reclaimed object on its own page,
+        //  mprotect(PROT_NONE)-ed on free, never reused -- so any real
+        //  temporal use-after-free faults immediately, no quarantine or
+        //  memory-model-modeling ambiguity possible) at roughly 1-2
+        //  crashes per ~1400-1500 stress runs before the final-check
+        //  tightening above, with early evidence (not yet statistically
+        //  conclusive) that the tightening reduces this further. An
+        //  earlier version of this comment claimed the TSan/ASan reports
+        //  behind this were purely sanitizer modeling artifacts; that
+        //  conclusion was wrong -- it was based on an insufficient sample
+        //  size (750 page-guard runs, which has a ~58% chance of showing
+        //  zero crashes even at the true underlying rate) and has been
+        //  retracted. The exact remaining mechanism is not yet understood:
+        //  the seq_cst total-order safety argument for this pattern
+        //  appears sound on paper (re-derived and checked multiple times),
+        //  which means either that argument has a subtle gap not yet
+        //  identified, or there is a separate contributing factor beyond
+        //  the core store-buffering pattern. Do not suppress TSan/ASan
+        //  reports matching this signature (free via
+        //  try_reclaim_specific()/scan(), racing a read in
+        //  try_pop_from()/has_ready() immediately after protect()) as
+        //  known-safe -- they are evidence of this open issue.
         template <typename T, size_t MAX_HAZARD_POINTERS = 128, size_t MAX_RETIRED_RECORDS = 1024, size_t RETIRE_SCAN_THRESHOLD = 32>
         class hazard_pointer_domain
         {
@@ -419,46 +429,50 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
-                    //  Re-verify immediately before committing to delete.
-                    //  The single check above and the actual delete are
-                    //  separated by this CAS plus the bookkeeping below --
-                    //  empirically (via targeted TSan stress hunting) that
-                    //  gap is wide enough for a protector's protect() call,
-                    //  concurrently in flight against this exact pointer, to
-                    //  complete its hazard-slot store in between: the first
-                    //  check can observe "unprotected" and a re-check taken
-                    //  moments later can observe "protected" for the same
-                    //  pointer with nothing else having changed. A single
-                    //  check is therefore not sufficient close to the
-                    //  delete; the record is put back (still exclusively
-                    //  ours, since in_use_ is still true and no other
-                    //  retire() call can have touched it) rather than
-                    //  deleted, deferring reclaim to the next opportunity
-                    //  (another release, or the backstop scan).
-                    if (is_hazard_protected(ptr))
-                    {
-                        retired_records_[i].active_.store(true, minstd::memory_order_release);
-                        active_retired_count_.fetch_add(1, minstd::memory_order_relaxed);
-                        return false;
-                    }
-
-                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
-
                     pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
                     deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
-                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
-                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
-                    retired_records_[i].in_use_.store(false, minstd::memory_order_release);
+                    //  Re-verify IMMEDIATELY before committing to delete --
+                    //  deliberately the very last shared-state check before
+                    //  the deleter() call below, with no bookkeeping stores
+                    //  (table cleanup) in between: those are deferred to
+                    //  AFTER the delete instead, since nothing about them
+                    //  is needed for the delete itself, and every
+                    //  additional shared-memory operation inserted between
+                    //  this check and the delete is additional exposure.
+                    //  Empirically (targeted TSan stress hunting, later
+                    //  confirmed via a sanitizer-independent page-guard
+                    //  harness) even the earlier, much narrower gap here
+                    //  (this same check, but ahead of the table-cleanup
+                    //  stores) was still occasionally wide enough for a
+                    //  protector's protect() call to complete its
+                    //  hazard-slot store in the interval: the first check
+                    //  (above the CAS) can observe "unprotected" and this
+                    //  re-check, moments later, can observe "protected" for
+                    //  the same pointer with nothing else relevant having
+                    //  changed. If still protected, the record is put back
+                    //  (still exclusively ours, since in_use_ is still true
+                    //  and no other retire() call can have touched it)
+                    //  rather than deleted, deferring reclaim to the next
+                    //  opportunity (another release, or the backstop scan).
+                    if (is_hazard_protected(ptr))
+                    {
+                        retired_records_[i].active_.store(true, minstd::memory_order_release);
+                        return false;
+                    }
 
                     if ((ptr_to_delete != nullptr) && (deleter != nullptr))
                     {
                         deleter(ptr_to_delete);
                         notify_reclaimed(1);
-                        return true;
                     }
 
-                    return false;
+                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
+                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].in_use_.store(false, minstd::memory_order_release);
+
+                    return (ptr_to_delete != nullptr) && (deleter != nullptr);
                 }
 
                 return false;
@@ -497,31 +511,30 @@ namespace MINIMAL_STD_NAMESPACE
                         continue;
                     }
 
-                    //  Re-verify before committing to delete -- see the
-                    //  identical re-check in try_reclaim_specific for why a
-                    //  single check this far from the actual delete is not
-                    //  sufficient.
-                    if (is_hazard_protected(retired_ptr))
-                    {
-                        retired_records_[i].active_.store(true, minstd::memory_order_release);
-                        active_retired_count_.fetch_add(1, minstd::memory_order_relaxed);
-                        continue;
-                    }
-
-                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
-
                     pointer_type ptr_to_delete = retired_records_[i].retired_ptr_.load(minstd::memory_order_relaxed);
                     deleter_type deleter = retired_records_[i].deleter_.load(minstd::memory_order_relaxed);
 
-                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
-                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
-                    retired_records_[i].in_use_.store(false, minstd::memory_order_release);
+                    //  Re-verify IMMEDIATELY before committing to delete --
+                    //  see the identical re-check in try_reclaim_specific
+                    //  for why this must be the very last shared-state
+                    //  check before the deleter() call, with the
+                    //  table-cleanup bookkeeping deferred to after it.
+                    if (is_hazard_protected(retired_ptr))
+                    {
+                        retired_records_[i].active_.store(true, minstd::memory_order_release);
+                        continue;
+                    }
 
                     if ((ptr_to_delete != nullptr) && (deleter != nullptr))
                     {
                         deleter(ptr_to_delete);
                         ++reclaimed;
                     }
+
+                    active_retired_count_.fetch_sub(1, minstd::memory_order_relaxed);
+                    retired_records_[i].retired_ptr_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].deleter_.store(nullptr, minstd::memory_order_relaxed);
+                    retired_records_[i].in_use_.store(false, minstd::memory_order_release);
                 }
 
                 if (reclaimed > 0)

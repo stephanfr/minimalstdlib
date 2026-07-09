@@ -609,6 +609,36 @@ namespace MINIMAL_STD_NAMESPACE
             //  case directly, with no concurrent caller to arbitrate
             //  against.
             atomic<bool> retire_claimed_{false};
+
+            //  Multi-consumer only, and non-null only for the rare span
+            //  between a degraded retire_and_grow_multi() completion and
+            //  its deferred finish (see try_complete_pending_multi()).
+            //  Deferring instead of spin-waiting keeps every push_back/
+            //  pop_front call bounded in its own step count, regardless
+            //  of how long a straggler consumer takes to release the
+            //  descriptor -- required for the queue to be lock-free (in
+            //  the formal sense) on these paths too, not just the common
+            //  ones. Exactly one of the two can be set at a time:
+            //  retire_claimed_ gates re-entering retire_and_grow_multi
+            //  for this segment until whichever is set gets cleared.
+            //
+            //  pending_recycle_: an allocation failure meant the SAME
+            //  descriptor needs reopening in place once no hazard slot
+            //  still protects it (retire_and_grow_multi's
+            //  allocation-failure branch never unlinks current_, so the
+            //  pending descriptor is always exactly seg.current_).
+            //
+            //  pending_delete_: the retired-record table was full when a
+            //  normal regrow needed to hand its old (already-unlinked)
+            //  descriptor off for reclaim; it just needs retire() retried
+            //  once a table slot frees up -- retire()'s own internal
+            //  hazard check handles waiting for protection to clear, so
+            //  this one needs no is_protected() check of its own.
+            //
+            //  Left null (harmless) and never touched when MultiConsumer
+            //  is false.
+            atomic<retired_descriptor *> pending_recycle_{nullptr};
+            atomic<retired_descriptor *> pending_delete_{nullptr};
         };
 
         //  Layout guards: catch any future field reordering/addition that
@@ -678,6 +708,18 @@ namespace MINIMAL_STD_NAMESPACE
                 //  precondition as spsc_queue): safe to delete the current
                 //  descriptor directly rather than going through retire().
                 delete seg.current_.load(memory_order_relaxed);
+
+                //  pending_recycle_ (if set) is always exactly current_ --
+                //  already handled by the delete above, nothing further to
+                //  do for it. pending_delete_, if still set, is a SEPARATE,
+                //  already-unlinked descriptor that a deferred
+                //  retire_and_grow_multi() handed off for a later thread to
+                //  retire() once a retired-record table slot freed up (see
+                //  try_complete_pending_multi()) -- if no such call ever
+                //  came before destruction, it would otherwise leak here.
+                //  Same no-concurrent-activity precondition makes a direct
+                //  delete safe.
+                delete seg.pending_delete_.load(memory_order_relaxed);
             }
             else
             {
@@ -737,7 +779,15 @@ namespace MINIMAL_STD_NAMESPACE
             //  regression on the uncontended 1P/1C fast path (the
             //  dependent load+branch ahead of the RMW stalls the tight
             //  producer loop), so it was deliberately rejected: the fast
-            //  path matters more than the saturated path here.
+            //  path matters more than the saturated path here. For the
+            //  same reason, a full segment here does not opportunistically
+            //  call try_complete_pending_multi() the way try_pop_from does
+            //  -- consumer traffic alone is sufficient (pop_front visits
+            //  every segment every call, from every consumer thread, and
+            //  a queue with producers but no consumers ever calling
+            //  pop_front makes no progress regardless), so producers stay
+            //  on their unconditional fast path and simply move on to the
+            //  next segment, exactly as before.
             tagged_enqueue_state::storage_type before = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
             size_t capacity_at_claim = tagged_enqueue_state::unpack_capacity(before);
             size_t idx = tagged_enqueue_state::unpack_pos(before);
@@ -770,6 +820,18 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if constexpr (MultiConsumer)
             {
+                //  Opportunistically finish any deferred completion left
+                //  pending on this segment by an earlier degraded
+                //  retire_and_grow_multi() call -- see
+                //  try_complete_pending_multi()'s comment. Two relaxed
+                //  loads when nothing is pending (the overwhelming common
+                //  case). MUST run before this thread's own guard touches
+                //  seg.current_ below: pending_recycle_'s target (when
+                //  set) IS seg.current_, and this thread's own upcoming
+                //  protect() call would otherwise make the pending check's
+                //  is_protected() always see itself as a protector.
+                try_complete_pending_multi(seg);
+
                 //  Protects the descriptor -- and therefore the buffer it
                 //  points to -- for the entire duration of this call: peek,
                 //  CAS, read, and destroy all happen while the caller's
@@ -1120,6 +1182,60 @@ namespace MINIMAL_STD_NAMESPACE
             seg.enqueue_pos_.store(tagged_enqueue_state::pack(capacity, 0), memory_order_release);
         }
 
+        //  Multi-consumer only: opportunistically finishes whichever
+        //  deferred completion retire_and_grow_multi() left pending on
+        //  `seg`, if any -- see the field comments on
+        //  pending_recycle_/pending_delete_. A single non-blocking attempt
+        //  each, never a loop: if a resource is still protected (or the
+        //  retired-record table is still full), it goes straight back for
+        //  a later caller to try, rather than this call waiting for it.
+        //  That is what keeps retire_and_grow_multi's degraded paths from
+        //  turning any specific caller's pop_front into an unbounded wait
+        //  on another thread's scheduling -- the queue stays lock-free
+        //  (bounded steps per call) even on these paths, at the cost of a
+        //  segment occasionally staying capped for a few extra pop_front
+        //  calls system-wide until the pending condition clears.
+        //
+        //  Called opportunistically from try_pop_from; harmless (two
+        //  relaxed loads) when nothing is pending, which is the
+        //  overwhelming common case. Not called from push_back's
+        //  try_claim_and_publish deliberately -- see its comment.
+        void try_complete_pending_multi(segment &seg)
+        {
+            retired_descriptor *pending_recycle = seg.pending_recycle_.load(memory_order_relaxed);
+
+            if (pending_recycle != nullptr &&
+                seg.pending_recycle_.compare_exchange_strong(pending_recycle, nullptr, memory_order_acq_rel, memory_order_relaxed))
+            {
+                if (domain_.is_protected(pending_recycle))
+                {
+                    //  Still not safe -- put it back for a later attempt.
+                    seg.pending_recycle_.store(pending_recycle, memory_order_relaxed);
+                }
+                else
+                {
+                    pending_recycle->capacity_.store(pending_recycle->original_capacity_, memory_order_relaxed);
+                    reopen_life_multi(seg, pending_recycle->original_capacity_);
+                }
+            }
+
+            retired_descriptor *pending_delete = seg.pending_delete_.load(memory_order_relaxed);
+
+            if (pending_delete != nullptr &&
+                seg.pending_delete_.compare_exchange_strong(pending_delete, nullptr, memory_order_acq_rel, memory_order_relaxed))
+            {
+                //  retire() is itself non-blocking (bounded: two passes
+                //  over MAX_RETIRED_RECORDS plus a scan()) and, on
+                //  success, defers to the domain's own hazard-protected
+                //  reclaim -- no is_protected() check needed here.
+                if (!pending_delete->retire())
+                {
+                    //  Table still (or again) full -- put it back.
+                    seg.pending_delete_.store(pending_delete, memory_order_relaxed);
+                }
+            }
+        }
+
         //  Multi-consumer only: called once `desc` (the descriptor this
         //  thread just finished reading the last position of) is proven
         //  fully drained, at effective_capacity (the life's capacity_ at
@@ -1133,11 +1249,14 @@ namespace MINIMAL_STD_NAMESPACE
         //  because buffer_/original_capacity_/allocator_ never change after
         //  construction; capacity_ is the sole exception, see its comment).
         //  guard: the caller's hazard guard currently protecting `desc`.
-        //  May be CLEARED by the degraded paths below (allocation failure,
-        //  retired-record exhaustion), which need to wait until nothing
-        //  protects desc -- including this thread. Callers must not
-        //  dereference the descriptor after this returns (neither call
-        //  site does).
+        //  May be CLEARED by the allocation-failure degraded path below,
+        //  which needs to exclude this thread's own protection from its
+        //  is_protected() check. Neither degraded path below blocks:
+        //  each makes exactly one non-blocking attempt and defers to
+        //  try_complete_pending_multi() if not yet safe -- see the
+        //  pending_recycle_/pending_delete_ field comments. Callers must
+        //  not dereference the descriptor after this returns (neither
+        //  call site does).
         void retire_and_grow_multi(segment &seg, retired_descriptor *desc, size_t effective_capacity_at_close, typename domain_type::hazard_guard &guard)
         {
             //  Was this life's capacity_ opportunistically reduced below
@@ -1188,35 +1307,52 @@ namespace MINIMAL_STD_NAMESPACE
                 //  completing, so a consumer that won its CAS and was then
                 //  descheduled before moving/destroying its element can
                 //  still be mid-slot right now. Reopening the same buffer
-                //  without waiting would let new-life producers construct
-                //  over that live slot -- corruption -- and the
-                //  straggler's deferred ready_=false store would then
-                //  permanently strand the new item. So: wait until no
-                //  hazard slot still protects `desc` before reopening.
-                //  Our own guard must be cleared first (it protects desc
-                //  and would spin forever) -- safe, because desc is never
-                //  retired on this path, so there is no reclamation this
-                //  thread needs protection from, and this thread's own
-                //  continued use of desc's immutable fields is safe
-                //  regardless. New consumers that protect desc while we
-                //  wait are gated out by the still-exhausted
-                //  dequeue_state_ bound check before they touch any slot,
-                //  and their transient protection just extends the wait by
-                //  one guard cycle. Stragglers' slot writes happen-before
-                //  their hazard-slot release/retarget (release store), and
-                //  our acquire scan reads that -- so everything they wrote
-                //  is visible before the reopen stores below publish the
-                //  buffer to new producers.
+                //  before that consumer is done would let new-life
+                //  producers construct over that live slot -- corruption
+                //  -- and the straggler's deferred ready_=false store
+                //  would then permanently strand the new item. So: only
+                //  reopen once no hazard slot still protects `desc`.
                 //
-                //  This path can therefore briefly WAIT (bounded by the
-                //  longest concurrent pop_front) -- acceptable for an
-                //  allocation-failure fallback.
+                //  Our own guard must be cleared first (it protects desc
+                //  too, and would make the check below always see
+                //  "protected" by ourselves) -- safe, because desc is
+                //  never retired on this path, so there is no reclamation
+                //  this thread needs protection from, and this thread's
+                //  own continued use of desc's immutable fields is safe
+                //  regardless.
                 guard.clear();
 
-                while (domain_.is_protected(desc))
+                if (domain_.is_protected(desc))
                 {
+                    //  A straggler still holds it -- defer instead of
+                    //  spin-waiting: hand desc off to pending_recycle_ and
+                    //  return now. New consumers that protect desc while
+                    //  it's pending are gated out by the still-exhausted
+                    //  dequeue_state_ bound check before they touch any
+                    //  slot, so this can't accumulate protectors forever.
+                    //  try_complete_pending_multi(), called
+                    //  opportunistically from try_pop_from, retries the
+                    //  same check later from whichever thread happens to
+                    //  visit this segment next -- so this call returns in
+                    //  bounded steps regardless of how long the straggler
+                    //  takes, which is what makes this path (not just the
+                    //  common one) lock-free in the formal sense: no
+                    //  caller's pop_front can be blocked by another
+                    //  specific thread's scheduling. Stragglers' slot
+                    //  writes happen-before their hazard-slot
+                    //  release/retarget (release store), and the eventual
+                    //  completing thread's acquire scan reads that -- so
+                    //  everything they wrote is visible before the reopen
+                    //  stores publish the buffer to new producers,
+                    //  whenever that completion actually happens.
+                    seg.pending_recycle_.store(desc, memory_order_release);
+                    return;
                 }
 
+                //  Already safe -- the common case, since an allocation
+                //  failure overlapping a still-active straggler is a rare
+                //  coincidence of two independently rare events. Finish
+                //  synchronously, identically to the deferred path above.
                 //  capacity_ is reset back to the full original_capacity_
                 //  since there's no reason to keep a shrunk logical size
                 //  when recycling the same (already fully-sized) physical
@@ -1258,21 +1394,24 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 //  Retired-record table exhausted (implies dozens of
                 //  concurrently stalled reclamations -- effectively never,
-                //  but previously a silent leak). desc is already
+                //  but previously a silent leak, and before that a
+                //  spin-wait-then-delete that could block this call on
+                //  another thread's scheduling). desc is already
                 //  unreachable: current_ now points at new_desc, and
                 //  protect()'s validation re-read makes any in-flight
                 //  stale protection attempt retry against the new value
-                //  rather than return desc. So drain existing protectors
-                //  (clearing our own guard first -- see the parameter
-                //  note) and delete directly, same wait pattern as the
-                //  allocation-failure reopen above.
-                guard.clear();
-
-                while (domain_.is_protected(desc))
-                {
-                }
-
-                delete desc;
+                //  rather than return desc. So defer instead of waiting:
+                //  hand desc off to pending_delete_ and return now.
+                //  try_complete_pending_multi(), called opportunistically
+                //  from try_pop_from, retries retire() on it later from
+                //  whichever thread happens to visit this segment next,
+                //  once a table slot has freed up -- retire()'s own
+                //  internal hazard check handles waiting for desc's
+                //  protection to clear, asynchronously, exactly like the
+                //  common (non-exhausted) case, so no is_protected() wait
+                //  is needed here at all. This call returns in bounded
+                //  steps regardless of how long that takes.
+                seg.pending_delete_.store(desc, memory_order_release);
             }
         }
 
