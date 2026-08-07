@@ -6,7 +6,7 @@
 
 #include <minstdconfig.h>
 
-#include <lockfree/mp_mc_sc_growable_ring_queue>
+#include <lockfree/mp_sc_growable_ring_queue>
 #include <lockfree/spsc_queue>
 
 #include <__memory_resource/memory_resource.h>
@@ -37,9 +37,8 @@
 //    representative.
 //
 //  Thread counts are chosen to bracket the actual deployment shape this
-//  queue was built for (mostly 1 producer/1 consumer, with occasional bursts
-//  of up to 4-5 producers against a single consumer), plus a couple of
-//  higher counts purely for multi-consumer scaling reference.
+//  queue was built for: mostly 1 producer/1 consumer, with occasional bursts
+//  of up to 4-5 producers against the single consumer.
 namespace
 {
     struct perf_item
@@ -130,11 +129,11 @@ namespace
         return static_cast<double>(total_items) / (now_seconds() - start);
     }
 
-    //  ---- ring queue: configurable producer/consumer counts and capacity regime ----
-    template <bool MultiConsumer, size_t SegmentCount, size_t NumProducers, size_t NumConsumers>
+    //  ---- ring queue: configurable producer count and capacity regime ----
+    template <size_t SegmentCount, size_t NumProducers, size_t NumConsumers>
     struct ring_perf_runner
     {
-        using queue_t = minstd::mp_mc_sc_growable_ring_queue<perf_item, MultiConsumer, SegmentCount>;
+        using queue_t = minstd::mp_sc_growable_ring_queue<perf_item, SegmentCount>;
         using alloc_t = minstd::pmr::polymorphic_allocator<typename queue_t::allocator_type::value_type>;
 
         queue_t *queue_ = nullptr;
@@ -241,18 +240,18 @@ namespace
     };
 }
 
-TEST_GROUP (MpMcScGrowableRingQueuePerformanceTests)
+TEST_GROUP (MpScGrowableRingQueuePerformanceTests)
 {
 };
 
 //  Fixed capacity, sized well above the total item count so no regrowth ever
 //  occurs -- isolates steady-state per-push/per-pop cost.
-TEST(MpMcScGrowableRingQueuePerformanceTests, FixedLargeCapacityNoRegrow)
+TEST(MpScGrowableRingQueuePerformanceTests, FixedLargeCapacityNoRegrow)
 {
     constexpr size_t TOTAL_ITEMS = DEFAULT_TOTAL_ITEMS;
     constexpr size_t CAPACITY = TOTAL_ITEMS + 1024;
 
-    perf_report report("MpMcScGrowableRingQueuePerformanceTests", "FixedLargeCapacityNoRegrow");
+    perf_report report("MpScGrowableRingQueuePerformanceTests", "FixedLargeCapacityNoRegrow");
 
     printf("\n=== Fixed capacity (%zu), no regrowth: %zu items ===\n", CAPACITY, TOTAL_ITEMS);
     printf("%-46s : %14s\n", "Scenario", "Items/sec");
@@ -262,38 +261,17 @@ TEST(MpMcScGrowableRingQueuePerformanceTests, FixedLargeCapacityNoRegrow)
     report.record("spsc_queue baseline (1P,1C)", spsc, 2, TOTAL_ITEMS);
 
     {
-        ring_perf_runner<false, 2, 1, 1> r;
+        ring_perf_runner<2, 1, 1> r;
         auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
-        printf("%-46s : %14.0f\n", "ring<SC> (1P, 1C)", ops);
-        report.record("ring<SC> (1P,1C)", ops, 2, TOTAL_ITEMS);
+        printf("%-46s : %14.0f\n", "ring (1P, 1C)", ops);
+        report.record("ring (1P,1C)", ops, 2, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
     }
     {
-        ring_perf_runner<false, 2, 5, 1> r;
+        ring_perf_runner<2, 5, 1> r;
         auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
-        printf("%-46s : %14.0f\n", "ring<SC> (5P, 1C)", ops);
-        report.record("ring<SC> (5P,1C)", ops, 6, TOTAL_ITEMS);
-        CHECK_TRUE(ops > 0);
-    }
-    {
-        ring_perf_runner<true, 2, 5, 1> r;
-        auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
-        printf("%-46s : %14.0f\n", "ring<MC> (5P, 1C)", ops);
-        report.record("ring<MC> (5P,1C)", ops, 6, TOTAL_ITEMS);
-        CHECK_TRUE(ops > 0);
-    }
-    {
-        ring_perf_runner<true, 2, 5, 3> r;
-        auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
-        printf("%-46s : %14.0f\n", "ring<MC> (5P, 3C)", ops);
-        report.record("ring<MC> (5P,3C)", ops, 8, TOTAL_ITEMS);
-        CHECK_TRUE(ops > 0);
-    }
-    {
-        ring_perf_runner<true, 2, 8, 8> r;
-        auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
-        printf("%-46s : %14.0f\n", "ring<MC> (8P, 8C)", ops);
-        report.record("ring<MC> (8P,8C)", ops, 16, TOTAL_ITEMS);
+        printf("%-46s : %14.0f\n", "ring (5P, 1C)", ops);
+        report.record("ring (5P,1C)", ops, 6, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
     }
 
@@ -304,63 +282,29 @@ TEST(MpMcScGrowableRingQueuePerformanceTests, FixedLargeCapacityNoRegrow)
 //  drain-then-regrow cycles across the run instead of none. Deliberately
 //  compared side by side with the fixed-capacity scenario above rather than
 //  assumed to be slower -- see the file-level comment for why.
-//
-//  Expect the MultiConsumer=true rows here to be both slower AND far more
-//  run-to-run variable than MultiConsumer=false's. push_back()/pop_front()
-//  both "stick" to whichever segment last succeeded, only trying the sibling
-//  once the current one fails -- in single-consumer mode producer and
-//  consumer stay in tight lockstep (no atomics beyond the per-slot flag), so
-//  the two segments alternate almost every cycle and growth is a clean,
-//  deterministic 1.25x per step. Under MultiConsumer, the extra per-pop cost
-//  (hazard guard, CAS) lets the producer refill-and-drain the SAME segment
-//  many times before the consumer ever gets to the sibling's already-
-//  published backlog, so growth stalls in bursts instead of alternating --
-//  confirmed by instrumenting a debug build: single-consumer retirements
-//  never saw a repeated (stale) sibling capacity, while multi-consumer runs
-//  saw streaks of 80+ consecutive retirements stuck on the same capacity.
-//  This is a fairness/latency characteristic, not a correctness bug -- no
-//  data is lost or duplicated, and the exact item count is still correct
-//  every run -- but it explains why these particular numbers should be read
-//  as a range, not a point value.
-TEST(MpMcScGrowableRingQueuePerformanceTests, SmallInitialCapacityContinuousGrowth)
+TEST(MpScGrowableRingQueuePerformanceTests, SmallInitialCapacityContinuousGrowth)
 {
     constexpr size_t TOTAL_ITEMS = DEFAULT_TOTAL_ITEMS;
     constexpr size_t INITIAL_CAPACITY = 64;
 
-    perf_report report("MpMcScGrowableRingQueuePerformanceTests", "SmallInitialCapacityContinuousGrowth");
+    perf_report report("MpScGrowableRingQueuePerformanceTests", "SmallInitialCapacityContinuousGrowth");
 
     printf("\n=== Small initial capacity (%zu), continuous growth: %zu items ===\n", INITIAL_CAPACITY, TOTAL_ITEMS);
     printf("%-46s : %14s   %s\n", "Scenario", "Items/sec", "Final capacity");
 
     {
-        ring_perf_runner<false, 2, 1, 1> r;
+        ring_perf_runner<2, 1, 1> r;
         auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
-        printf("%-46s : %14.0f   %zu\n", "ring<SC> (1P, 1C)", ops, cap);
-        report.record("ring<SC> growing (1P,1C)", ops, 2, TOTAL_ITEMS);
+        printf("%-46s : %14.0f   %zu\n", "ring (1P, 1C)", ops, cap);
+        report.record("ring growing (1P,1C)", ops, 2, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
         CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
     }
     {
-        ring_perf_runner<true, 2, 1, 1> r;
+        ring_perf_runner<2, 5, 1> r;
         auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
-        printf("%-46s : %14.0f   %zu\n", "ring<MC> (1P, 1C)", ops, cap);
-        report.record("ring<MC> growing (1P,1C)", ops, 2, TOTAL_ITEMS);
-        CHECK_TRUE(ops > 0);
-        CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
-    }
-    {
-        ring_perf_runner<false, 2, 5, 1> r;
-        auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
-        printf("%-46s : %14.0f   %zu\n", "ring<SC> (5P, 1C)", ops, cap);
-        report.record("ring<SC> growing (5P,1C)", ops, 6, TOTAL_ITEMS);
-        CHECK_TRUE(ops > 0);
-        CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
-    }
-    {
-        ring_perf_runner<true, 2, 5, 1> r;
-        auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
-        printf("%-46s : %14.0f   %zu\n", "ring<MC> (5P, 1C)", ops, cap);
-        report.record("ring<MC> growing (5P,1C)", ops, 6, TOTAL_ITEMS);
+        printf("%-46s : %14.0f   %zu\n", "ring (5P, 1C)", ops, cap);
+        report.record("ring growing (5P,1C)", ops, 6, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
         CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
     }

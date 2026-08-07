@@ -1,0 +1,706 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <allocator>
+#include "allocator_traits"
+#include <new>
+#include <stddef.h>
+#include <stdint.h>
+#include <type_traits>
+#include <utility>
+
+#include <atomic>
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    //  Packs a position together with the CURRENT LIFE's capacity into one
+    //  atomic word, for the enqueue side.  A plain ascending fetch_add
+    //  compared, after the fact, against a separately-read capacity_ field
+    //  is not safe: a producer that gets an overflowing (invalid) claim and
+    //  is then descheduled before checking it can wake up after the segment
+    //  has since drained and regrown to a larger capacity, and have that
+    //  later, larger capacity make its stale claim look valid.  Since
+    //  capacity only ever grows, this is not a rare corner case -- it is the
+    //  expected outcome whenever a producer is delayed across a regrow.
+    //  Packing the claiming life's own capacity into the same atomic word
+    //  the position comes from makes the bound check self-contained: the
+    //  capacity a producer checks its claim against is always the exact one
+    //  in effect at the moment of its own fetch_add, never a later one.
+    //  (An earlier attempt to fix this by counting DOWN from capacity
+    //  instead -- so overflow was detectable from the return value alone,
+    //  with no capacity read at all -- turned out to invert claim order to
+    //  a top-down suffix, which breaks the low-to-high contiguous-prefix
+    //  claim order the sequential dequeue side depends on: whenever
+    //  production stops before a segment is fully claimed, which is the
+    //  common case at shutdown, the consumer would permanently stall on
+    //  low, never-claimed slots while already-published high slots sit
+    //  unreachable behind them. This scheme keeps ascending claim order
+    //  intact and fixes only the staleness of the bound check itself.)
+    struct tagged_enqueue_state
+    {
+        using storage_type = uint64_t;
+
+        //  Split evenly at 32/32. Capacity needs real headroom -- under
+        //  sustained, saturated throughput (producer and consumer both
+        //  continuously busy, never idling) a segment genuinely fills and
+        //  triggers a real regrow every single life, with no natural lull
+        //  to let growth taper off, so capacity climbs for as long as that
+        //  throughput continues; 24 bits (16.7M) was observed to be crossed
+        //  within a single benchmark run. Position needs real headroom too:
+        //  nothing blocks other producer threads from continuing to
+        //  fetch_add against an already-exhausted counter for the entire
+        //  duration of the regrow's allocate+construct loop (whose own cost
+        //  scales with the new capacity), so a narrow position budget is
+        //  its own overflow-into-capacity-bits hazard at large capacities.
+        //  32 bits each gives ~4.29 billion headroom on both sides --
+        //  already a physically implausible capacity (would require
+        //  terabytes of backing memory) or claim-pileup count.
+        static constexpr int CAPACITY_BITS = 32;
+        static constexpr storage_type POS_MASK = (storage_type{1} << (64 - CAPACITY_BITS)) - 1;
+
+        //  Known nit, not fixed: capacity (or pos) values at or beyond
+        //  2^32 silently truncate into each other's bits instead of
+        //  asserting -- accepted per the file comment above on why 32/32
+        //  headroom is already treated as "physically implausible to
+        //  reach," the same standard the rest of this header holds
+        //  itself to.
+        static constexpr storage_type pack(size_t capacity, size_t pos)
+        {
+            return (static_cast<storage_type>(capacity) << (64 - CAPACITY_BITS)) | (static_cast<storage_type>(pos) & POS_MASK);
+        }
+
+        static constexpr size_t unpack_capacity(storage_type value)
+        {
+            return static_cast<size_t>(value >> (64 - CAPACITY_BITS));
+        }
+
+        static constexpr size_t unpack_pos(storage_type value)
+        {
+            return static_cast<size_t>(value & POS_MASK);
+        }
+    };
+
+    //  Multi-producer / single-consumer lock-free queue, growable via
+    //  SegmentCount ring-buffer segments arranged in a fixed cycle.
+    //
+    //  push_back() may be called from any number of producer threads
+    //  concurrently.  pop_front()/empty() are consumer-thread-only and use
+    //  no atomics beyond a per-slot published-flag check -- zero contention
+    //  on the pop side is the whole point.  (Safe concurrent multi-consumer
+    //  pop was deliberately removed: it required hazard-pointer reclamation
+    //  of drained buffers, which added substantial complexity and a subtle
+    //  reclamation hazard, for a role outside this queue's single-consumer
+    //  scope.)
+    //
+    //  A segment is only ever resized once fully drained, so growth never
+    //  copies live data -- it just reallocates empty memory to a larger
+    //  capacity (growth_numerator_/growth_denominator_ x the next segment's
+    //  current capacity in ring order, ~1.25x by default) and brings it
+    //  back into rotation.
+    //
+    //  idle_rotation_interval (constructor parameter, 0/default disables
+    //  this) opportunistically closes a segment's life early -- before it
+    //  organically fills -- if it is running under 50% loaded once that
+    //  many pops have occurred, so it can reopen SMALLER instead of only
+    //  ever being eligible to shrink after being completely refilled to a
+    //  possibly burst-inflated capacity again first (which, once a burst
+    //  subsides, may never happen). See maybe_shrink_active_segment().
+    //
+    //  SegmentCount (default 2) controls how many segments are kept in
+    //  rotation simultaneously.  Raising it gives push_back() more
+    //  pre-allocated headroom to absorb a producer burst before ever
+    //  returning false, WITHOUT introducing any new coordination between
+    //  producer threads: every segment in the ring is always already
+    //  allocated ahead of need (via the same drain-then-regrow mechanism as
+    //  the 2-segment case), so walking to the next one during a burst is
+    //  only ever a pointer follow, never an on-demand allocation racing
+    //  multiple producers to decide who performs it. Raising SegmentCount
+    //  only raises the threshold before the ring is genuinely exhausted --
+    //  it cannot eliminate that possibility for a long enough sustained
+    //  burst, so push_back() can still return false and callers must still
+    //  handle that (the same way any bounded queue's caller must).
+    //
+    //  Ordering: two pushes from the same producer thread that land in the
+    //  same segment are observed by the consumer in that order.  There is no
+    //  ordering guarantee across different producer threads, nor across a
+    //  segment boundary -- a push into a newly-active segment can be
+    //  observed before an earlier push still queued behind a slower
+    //  publisher in another segment.  This relaxation is required: always
+    //  draining one segment to its declared capacity before ever considering
+    //  the rest of the ring would permanently strand published items
+    //  whenever production stops before a segment's capacity happens to be
+    //  exactly exhausted.
+    template <typename T, size_t SegmentCount = 2>
+    class mp_sc_growable_ring_queue
+    {
+        static_assert(SegmentCount >= 2, "mp_sc_growable_ring_queue requires at least 2 segments");
+
+    public:
+        using value_type = T;
+
+        struct slot_type
+        {
+            atomic<bool> ready_;
+            alignas(T) unsigned char storage_[sizeof(T)];
+
+            slot_type()
+                : ready_(false)
+            {
+            }
+
+            T *element_ptr()
+            {
+                return reinterpret_cast<T *>(storage_);
+            }
+        };
+
+        using allocator_type = allocator<slot_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
+
+    public:
+        //  idle_rotation_interval: every that many successful pops,
+        //  opportunistically check whether the currently-active segment is
+        //  running under 50% loaded, and if so, close its current life
+        //  early so it can reopen smaller once it finishes draining --
+        //  see maybe_shrink_active_segment(). 0 (the default) disables
+        //  this entirely: capacity then only ever grows. This exists so a
+        //  queue that grew during a burst can give some of that memory back
+        //  afterward, without requiring the segment to be completely
+        //  refilled to its (now inflated) capacity again first -- which,
+        //  after a burst subsides, may never happen. The "every Nth pop"
+        //  is counted with a plain global counter (free -- the sole
+        //  consumer owns it).
+        explicit mp_sc_growable_ring_queue(allocator_type &allocator,
+                                           size_t initial_capacity,
+                                           size_t growth_numerator = 5,
+                                           size_t growth_denominator = 4,
+                                           size_t idle_rotation_interval = 0)
+            : allocator_(allocator),
+              growth_numerator_(growth_numerator),
+              growth_denominator_(growth_denominator),
+              idle_rotation_interval_(idle_rotation_interval)
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                open_segment(segments_[i], initial_capacity);
+            }
+
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                segments_[i].next_ = &segments_[(i + 1) % SegmentCount];
+            }
+
+            producer_target_.store(&segments_[0], memory_order_relaxed);
+            consumer_target_ = &segments_[0];
+        }
+
+        mp_sc_growable_ring_queue(const mp_sc_growable_ring_queue &) = delete;
+        mp_sc_growable_ring_queue(mp_sc_growable_ring_queue &&) = delete;
+        mp_sc_growable_ring_queue &operator=(const mp_sc_growable_ring_queue &) = delete;
+        mp_sc_growable_ring_queue &operator=(mp_sc_growable_ring_queue &&) = delete;
+
+        //  Precondition: no producer threads are concurrently pushing during
+        //  destruction (same convention as spsc_queue).
+        ~mp_sc_growable_ring_queue()
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                destroy_segment(segments_[i]);
+            }
+        }
+
+        //  May be called from any number of producer threads concurrently.
+        //  Returns false only when every segment in the ring is currently
+        //  full.
+        template <class... Args>
+        bool push_back(Args &&...args)
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
+            {
+                //  Safe to forward on every attempt even though args may be
+                //  needed again below: try_claim_and_publish only ever
+                //  touches args if the claim succeeds (in which case we
+                //  return immediately and never need them again); a failed
+                //  claim returns before constructing anything.
+                if (try_claim_and_publish(*target, minstd::forward<Args>(args)...))
+                {
+                    return true;
+                }
+
+                if (attempt + 1 < SegmentCount)
+                {
+                    target = target->next_;
+
+                    //  No CAS needed: next_ is a fixed, pre-existing ring
+                    //  member, not something producers race to create --
+                    //  redundant stores of the same value from multiple
+                    //  producers are race-free.  Storing between every
+                    //  attempt (not just the last) lets the next push_back
+                    //  call resume from wherever this one left off, instead
+                    //  of re-trying segments already known to be exhausted.
+                    producer_target_.store(target, memory_order_relaxed);
+                }
+            }
+
+            return false;
+        }
+
+        //  Consumer-thread-only: must only be called from a single thread.
+        //  Returning false does not always mean the queue is empty -- it can
+        //  also mean a producer is transiently mid-push.  Callers must retry.
+        bool pop_front(T &front)
+        {
+            segment *candidate = consumer_target_;
+
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
+            {
+                if (try_pop_from(*candidate, front))
+                {
+                    if (attempt != 0)
+                    {
+                        consumer_target_ = candidate;
+                    }
+
+                    //  idle_rotation_interval_ == 0 (the default) disables
+                    //  this entirely -- capacity then only ever grows.
+                    if (idle_rotation_interval_ != 0 && ++pop_count_ % idle_rotation_interval_ == 0)
+                    {
+                        maybe_shrink_active_segment();
+                    }
+
+                    return true;
+                }
+
+                candidate = candidate->next_;
+            }
+
+            return false;
+        }
+
+        //  Consumer-thread-only (a best-effort hint, not a linearizable
+        //  query): false is authoritative, true only means "nothing
+        //  available right now."
+        bool empty() const
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                if (has_ready(segments_[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        //  Consumer-thread-only diagnostic: sum of every segment's current
+        //  declared capacity.  Lets callers confirm growth actually happened.
+        size_t capacity_estimate() const
+        {
+            size_t total = 0;
+
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                total += segments_[i].capacity_;
+            }
+
+            return total;
+        }
+
+    private:
+        //  Padding audit finding: an unpadded segment (all fields below,
+        //  declared as plain consecutive members with no isolation) fit in
+        //  EXACTLY one 64-byte cache line. That meant enqueue_pos_ (written
+        //  by every producer on every push_back) and dequeue_state_ (written
+        //  by the consumer on every pop_front) were guaranteed to share one
+        //  line -- real false sharing that hits the primary
+        //  1-producer/1-consumer case just as hard as any multi-producer
+        //  burst, since it bounces the same line between the two cores on
+        //  every single operation in either direction.
+        //
+        //  The fields are split by ACCESS pattern, not by which role "owns"
+        //  them, into three cache lines:
+        //
+        //  1. read-mostly (next_/original_capacity_/capacity_/buffer_): read
+        //     by producers on every push and by the consumer on every pop,
+        //     but written only at segment open/regrow -- so the line sits in
+        //     Shared state on every core and nobody invalidates anyone.
+        //
+        //  2. producer-hot (enqueue_pos_): the only field producers write
+        //     on the fast path, alone on its line.
+        //
+        //  3. consumer-hot (dequeue_state_): written by the consumer on
+        //     every pop, alone on its line.
+        static constexpr size_t CACHE_LINE_SIZE = 64;
+
+        struct segment
+        {
+            //  --- Cache line 1: read-mostly, written only at open/regrow ---
+
+            //  Fixed ring member -- always the next segment in a
+            //  SegmentCount-length cycle (never reallocated, never
+            //  repointed after construction).  Named next_ rather than
+            //  other_/sibling_ because with SegmentCount > 2 it is one of
+            //  several ring neighbors, not a single dedicated partner; for
+            //  the SegmentCount == 2 default it is exactly the old sibling_
+            //  (a 2-cycle: A -> B -> A).
+            alignas(CACHE_LINE_SIZE) segment *next_ = nullptr;
+
+            //  Authoritative, plain fields -- no indirection, no atomics
+            //  beyond enqueue_pos_ below, since only one thread ever touches
+            //  this segment's buffer on the consumer side.
+            //
+            //  original_capacity_ is the PHYSICAL size this buffer was
+            //  allocated at this life (used for destructor cleanup and
+            //  deallocate()'s size argument); capacity_ is the CURRENT,
+            //  effective size for this life, which maybe_shrink_active_segment()
+            //  may reduce below original_capacity_ exactly once per life.
+            //  Both remain plain, non-atomic fields: the sole consumer
+            //  thread is the only one that ever reads or writes either,
+            //  including when performing that shrink -- no new
+            //  synchronization is needed on this path.
+            size_t original_capacity_ = 0;
+            size_t capacity_ = 0;
+            slot_type *buffer_ = nullptr;
+
+            //  --- Cache line 2: producer-hot ---
+
+            //  Packs the claiming life's capacity together with the
+            //  ascending position counter -- see tagged_enqueue_state above.
+            //  The single hottest producer-side field in the structure --
+            //  isolated on its own line so no consumer-side write ever
+            //  invalidates it, and vice versa.
+            alignas(CACHE_LINE_SIZE) atomic<tagged_enqueue_state::storage_type> enqueue_pos_{0};
+
+            //  --- Cache line 3: consumer-hot ---
+
+            //  Plain size_t (single-consumer, no atomics at all): the sole
+            //  consumer's ascending drain cursor for the current life.
+            alignas(CACHE_LINE_SIZE) size_t dequeue_state_{};
+        };
+
+        //  Layout guards: catch any future field reordering/addition that
+        //  would silently reintroduce the false sharing this padding was
+        //  added to eliminate.
+        static_assert(offsetof(segment, next_) == 0,
+                      "read-mostly group must start the struct");
+        static_assert(offsetof(segment, enqueue_pos_) == CACHE_LINE_SIZE,
+                      "enqueue_pos_ must start its own cache line, isolated from the read-mostly group");
+        static_assert(offsetof(segment, dequeue_state_) == 2 * CACHE_LINE_SIZE,
+                      "dequeue_state_ must start its own cache line, isolated from enqueue_pos_");
+
+        void open_segment(segment &seg, size_t capacity)
+        {
+            slot_type *buffer = allocator_traits_type::allocate(allocator_, capacity);
+
+            if (buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * capacity, alignof(slot_type));
+                capacity = 0;
+
+                //  Known nit, not fixed: a segment that fails its VERY
+                //  FIRST allocation (at queue construction; every later
+                //  allocate() failure is instead handled by the recycle-
+                //  in-place fallback in retire_and_grow, which never calls
+                //  this with a null buffer_) leaves buffer_ null and
+                //  original_capacity_/capacity_ at 0.  Teardown then calls
+                //  deallocate(nullptr, 0), which
+                //  MINIMAL_STD_ALLOCATION_FAILURE_POLICY_LEGACY-style
+                //  allocators tend to treat as a harmless no-op but which
+                //  the standard allocator contract does not strictly
+                //  guarantee. Left as-is: MINIMAL_STD_OUT_OF_MEMORY already
+                //  traps/aborts by default (MINIMAL_STD_FAILURE_POLICY_DEFAULT),
+                //  so reaching this line at all means a non-default policy
+                //  was deliberately chosen to tolerate allocation failure.
+            }
+
+            for (size_t i = 0; i < capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &buffer[i]);
+            }
+
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(capacity, 0), memory_order_relaxed);
+            seg.buffer_ = buffer;
+            seg.original_capacity_ = capacity;
+            seg.capacity_ = capacity;
+            seg.dequeue_state_ = 0;
+        }
+
+        void destroy_segment(segment &seg)
+        {
+            //  Iterates original_capacity_ (the physical allocation),
+            //  not capacity_ (which may have been opportunistically
+            //  reduced below the physical size) -- see the comment on
+            //  segment::original_capacity_.
+            for (size_t i = 0; i < seg.original_capacity_; ++i)
+            {
+                //  Only slots a producer actually published still hold a
+                //  live T (production may have stopped mid-fill, leaving
+                //  a non-contiguous mix of claimed and never-claimed
+                //  slots) -- skip past unclaimed slots, never stop
+                //  early.
+                if (seg.buffer_[i].ready_.load(memory_order_acquire))
+                {
+                    seg.buffer_[i].element_ptr()->~T();
+                }
+
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
+        }
+
+        template <class... Args>
+        bool try_claim_and_publish(segment &seg, Args &&...args)
+        {
+            //  fetch_add still hands out an ascending, contiguous-from-zero
+            //  position within the current life (unchanged claim order --
+            //  the sequential dequeue side depends on it), but the capacity
+            //  to validate that position against comes from the SAME atomic
+            //  word, frozen at the exact instant of this producer's own
+            //  fetch_add (see tagged_enqueue_state above).  That makes the
+            //  bound check self-contained: it can never observe a LATER
+            //  life's (larger) capacity, however long this producer is
+            //  delayed before checking it, closing a real hazard where a
+            //  producer with an overflowing claim could otherwise wake after
+            //  the segment regrew and have the new, larger capacity make its
+            //  stale claim look valid -- corrupting a slot two lives now
+            //  race over.  A valid claim (idx < capacity_at_claim) needs no
+            //  such protection: it is, by construction, guaranteed to be
+            //  within [0, capacity) for whichever life is current at the
+            //  moment of the fetch_add, and that life cannot retire until
+            //  this exact claim publishes (a retirement requires every
+            //  position up to and including this one to have been claimed
+            //  AND consumed, in order) -- so reading the buffer afterward,
+            //  however delayed, is safe without any further check.
+            //
+            //  Note: a test-and-test-and-set peek before this fetch_add
+            //  (load, check full, skip the RMW) was tried to soften the
+            //  RMW ping-pong that blocked producers cause while spinning
+            //  against a full ring -- and measured a consistent 20-35%
+            //  regression on the uncontended 1P/1C fast path (the
+            //  dependent load+branch ahead of the RMW stalls the tight
+            //  producer loop), so it was deliberately rejected: the fast
+            //  path matters more than the saturated path here.
+            tagged_enqueue_state::storage_type before = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
+            size_t capacity_at_claim = tagged_enqueue_state::unpack_capacity(before);
+            size_t idx = tagged_enqueue_state::unpack_pos(before);
+
+            if (idx >= capacity_at_claim)
+            {
+                return false;
+            }
+
+            allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
+            seg.buffer_[idx].ready_.store(true, memory_order_release);
+
+            return true;
+        }
+
+        bool try_pop_from(segment &seg, T &front)
+        {
+            if (seg.dequeue_state_ >= seg.capacity_)
+            {
+                return false;
+            }
+
+            slot_type &s = seg.buffer_[seg.dequeue_state_];
+
+            if (!s.ready_.load(memory_order_acquire))
+            {
+                return false;
+            }
+
+            front = minstd::move(*s.element_ptr());
+            allocator_traits_type::destroy(allocator_, s.element_ptr());
+            s.ready_.store(false, memory_order_relaxed);
+            ++seg.dequeue_state_;
+
+            if (seg.dequeue_state_ == seg.capacity_)
+            {
+                retire_and_grow(seg);
+            }
+
+            return true;
+        }
+
+        bool has_ready(const segment &seg) const
+        {
+            size_t pos = seg.dequeue_state_;
+
+            if (pos >= seg.capacity_)
+            {
+                return false;
+            }
+
+            return seg.buffer_[pos].ready_.load(memory_order_acquire);
+        }
+
+        size_t compute_new_capacity(size_t reference_capacity) const
+        {
+            size_t grown = (reference_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
+            return grown > reference_capacity ? grown : reference_capacity + 1;
+        }
+
+        //  Inverse of compute_new_capacity, applied to a segment's OWN
+        //  just-closed size (not a sibling reference) when a life was
+        //  closed early by maybe_shrink_active_segment() rather than
+        //  filling organically. Shrinks gradually (by the same ratio
+        //  growth uses, in reverse) so repeated idle cycles settle toward
+        //  a smaller size rather than jumping to an arbitrary reference;
+        //  floored at 1 to avoid a degenerate zero-capacity segment.
+        size_t compute_shrunk_capacity(size_t current) const
+        {
+            size_t shrunk = (current * growth_denominator_) / growth_numerator_;
+            return shrunk > 0 ? shrunk : 1;
+        }
+
+        //  Only ever called once a segment is proven fully drained, by the
+        //  sole consumer thread, so there is exactly one caller and no
+        //  concurrent reader/writer of buffer_/capacity_ to protect against.
+        void retire_and_grow(segment &seg)
+        {
+            //  Was this life's capacity_ opportunistically reduced below
+            //  its original_capacity_ (see maybe_shrink_active_segment)? If
+            //  so, this is not an organic full-drain -- demand fell off
+            //  before this life ever filled -- so the next life should
+            //  shrink, not grow, relative to its OWN just-closed size. An
+            //  organic full-drain (capacity_ == original_capacity_) grows
+            //  as always, relative to the NEXT segment in the ring.
+            bool was_capped = seg.capacity_ < seg.original_capacity_;
+
+            //  For SegmentCount == 2 the "next segment" reference is the
+            //  same single sibling as before; for SegmentCount > 2 it is
+            //  simply a fixed, consistent reference point. Growth is
+            //  monotonic and every segment eventually reopens based on
+            //  whatever its neighbor grew to, so all ring members converge
+            //  to within one growth factor of each other over enough
+            //  cycles.
+            size_t new_capacity = was_capped
+                                      ? compute_shrunk_capacity(seg.capacity_)
+                                      : compute_new_capacity(seg.next_->capacity_);
+
+            //  Allocate the new buffer before freeing the old one, so an
+            //  allocator failure degrades to "recycle at the old physical
+            //  capacity" instead of leaving the segment without a buffer.
+            slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
+            size_t effective_capacity = new_capacity;
+
+            //  Destroys/deallocates using original_capacity_ (the physical
+            //  allocation), not capacity_ (which may be smaller if this
+            //  life was capped) -- see the comment on segment::original_capacity_.
+            for (size_t i = 0; i < seg.original_capacity_; ++i)
+            {
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            if (new_buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
+                new_buffer = seg.buffer_;
+                effective_capacity = seg.original_capacity_;
+            }
+            else
+            {
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
+            }
+
+            for (size_t i = 0; i < effective_capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &new_buffer[i]);
+            }
+
+            seg.buffer_ = new_buffer;
+            seg.original_capacity_ = effective_capacity;
+            seg.capacity_ = effective_capacity;
+
+            //  Reopen gates: plain buffer_/capacity_ writes above MUST
+            //  precede this release-store, since the sole consumer thread's
+            //  own next dequeue_state_ read is a plain (non-atomic) read
+            //  that simply follows program order, and the producer side's
+            //  fetch_add on enqueue_pos_ (acquire) must observe it.
+            seg.dequeue_state_ = 0;
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(effective_capacity, 0), memory_order_release);
+        }
+
+        //  Opportunistically closes the currently-active segment's life
+        //  early if it is running well under capacity, so it can reopen
+        //  smaller once it finishes draining, instead of only ever being
+        //  eligible to shrink after being completely refilled to its
+        //  (possibly burst-inflated) declared capacity again first -- which,
+        //  once a burst subsides, may never happen. Called from pop_front()
+        //  every idle_rotation_interval_ successful pops (0 disables this
+        //  entirely). A single opportunistic CAS attempt, not a retry loop:
+        //  if it fails (some producer claimed another slot in the
+        //  meantime), this check is simply skipped for now -- there will be
+        //  another chance at the next interval.
+        void maybe_shrink_active_segment()
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            tagged_enqueue_state::storage_type state = target->enqueue_pos_.load(memory_order_acquire);
+            size_t capacity_at_check = tagged_enqueue_state::unpack_capacity(state);
+            size_t position_at_check = tagged_enqueue_state::unpack_pos(state);
+
+            //  Skip: nothing claimed yet (capping to zero would be
+            //  degenerate), already overflowing (this life is already
+            //  organically complete or completing), or already at/above the
+            //  50% load threshold.
+            if (position_at_check == 0 || position_at_check >= capacity_at_check || position_at_check * 2 >= capacity_at_check)
+            {
+                return;
+            }
+
+            tagged_enqueue_state::storage_type capped_state = tagged_enqueue_state::pack(position_at_check, position_at_check);
+
+            if (!target->enqueue_pos_.compare_exchange_strong(state, capped_state, memory_order_acq_rel, memory_order_relaxed))
+            {
+                return;
+            }
+
+            target->capacity_ = position_at_check;
+
+            //  This thread IS the sole consumer, so there is no concurrent
+            //  completion path to arbitrate against -- if the segment is
+            //  already caught up relative to the new capacity, triggering
+            //  the regrow directly here is the only place it will ever be
+            //  recognized.
+            if (target->dequeue_state_ >= position_at_check)
+            {
+                retire_and_grow(*target);
+            }
+        }
+
+        //  allocator_ (a stored reference) is read by BOTH producers and
+        //  the consumer on every construct/destroy, and the growth/interval
+        //  fields are read at life boundaries -- all read-only after
+        //  construction, so this first line stays in Shared state
+        //  everywhere. pop_count_ deliberately does NOT live here: it is
+        //  written by the consumer on every pop when idle rotation is
+        //  enabled, which would invalidate this line under every reader --
+        //  it lives with the other consumer-written fields below instead.
+        allocator_type &allocator_;
+        size_t growth_numerator_;
+        size_t growth_denominator_;
+        size_t idle_rotation_interval_;
+        segment segments_[SegmentCount];
+
+        //  Same false-sharing concern as within segment above: producer_target_
+        //  is read on every push_back and written on every segment-switch,
+        //  while consumer_target_ is written on every successful pop_front --
+        //  declared back-to-back with no isolation, they would otherwise be
+        //  virtually guaranteed to share a line.
+        alignas(CACHE_LINE_SIZE) atomic<segment *> producer_target_;
+
+        //  Consumer-thread-only; plain because the sole consumer owns it.
+        alignas(CACHE_LINE_SIZE) segment *consumer_target_ = nullptr;
+        size_t pop_count_ = 0;
+    };
+}
