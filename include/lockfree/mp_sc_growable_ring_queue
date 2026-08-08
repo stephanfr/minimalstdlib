@@ -175,15 +175,35 @@ namespace MINIMAL_STD_NAMESPACE
         //  after a burst subsides, may never happen. The "every Nth pop"
         //  is counted with a plain global counter (free -- the sole
         //  consumer owns it).
+        //
+        //  max_capacity: a growth ceiling. Organic growth
+        //  (compute_new_capacity) never grows a segment's next life beyond
+        //  this many slots -- once at the ceiling the queue stops growing
+        //  and behaves as a bounded queue (push_back returns false when
+        //  full, applying backpressure). The default -- static_cast<size_t>(-1),
+        //  i.e. unbounded -- preserves the original behavior exactly, so
+        //  this parameter is non-breaking. It matters under SUSTAINED
+        //  saturated load: without a ceiling, every full drain grows the
+        //  segment ~growth_numerator_/growth_denominator_ x and the queue
+        //  never converges (capacity climbs with items processed, wasting
+        //  memory and eventually pushing the active ring out of cache).
+        //  A ceiling bounds memory and keeps the ring cache-resident while
+        //  still absorbing bursts up to the cap. It governs GROWTH only:
+        //  initial_capacity is honored as given even if larger (a segment
+        //  that starts above the ceiling simply converges down to it on
+        //  its next regrow), and idle-rotation shrink can still take a
+        //  segment below it.
         explicit mp_sc_growable_ring_queue(allocator_type &allocator,
                                            size_t initial_capacity,
                                            size_t growth_numerator = 5,
                                            size_t growth_denominator = 4,
-                                           size_t idle_rotation_interval = 0)
+                                           size_t idle_rotation_interval = 0,
+                                           size_t max_capacity = static_cast<size_t>(-1))
             : allocator_(allocator),
               growth_numerator_(growth_numerator),
               growth_denominator_(growth_denominator),
-              idle_rotation_interval_(idle_rotation_interval)
+              idle_rotation_interval_(idle_rotation_interval),
+              max_capacity_(max_capacity)
         {
             for (size_t i = 0; i < SegmentCount; ++i)
             {
@@ -546,7 +566,19 @@ namespace MINIMAL_STD_NAMESPACE
         size_t compute_new_capacity(size_t reference_capacity) const
         {
             size_t grown = (reference_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
-            return grown > reference_capacity ? grown : reference_capacity + 1;
+            grown = grown > reference_capacity ? grown : reference_capacity + 1;
+
+            //  Growth ceiling (see the max_capacity constructor note). Clamp
+            //  LAST -- after the monotonic +1 bump above -- so a reference
+            //  already at the ceiling yields exactly max_capacity_ (a stable
+            //  fixed point) rather than max_capacity_ + 1. The default
+            //  ceiling of static_cast<size_t>(-1) makes this a no-op.
+            if (grown > max_capacity_)
+            {
+                grown = max_capacity_;
+            }
+
+            return grown;
         }
 
         //  Inverse of compute_new_capacity, applied to a segment's OWN
@@ -690,6 +722,7 @@ namespace MINIMAL_STD_NAMESPACE
         size_t growth_numerator_;
         size_t growth_denominator_;
         size_t idle_rotation_interval_;
+        size_t max_capacity_;
         segment segments_[SegmentCount];
 
         //  Same false-sharing concern as within segment above: producer_target_

@@ -180,7 +180,7 @@ namespace
             return nullptr;
         }
 
-        void run(size_t idle_rotation_interval = 0)
+        void run(size_t idle_rotation_interval = 0, size_t max_capacity = static_cast<size_t>(-1))
         {
             Resource resource;
             alloc_t alloc(&resource);
@@ -188,7 +188,7 @@ namespace
             //  Deliberately small initial capacity relative to
             //  ITEMS_PER_PRODUCER, forcing many real growth cycles across
             //  every segment in the ring under contention.
-            queue_t q(alloc, 8, 5, 4, idle_rotation_interval);
+            queue_t q(alloc, 8, 5, 4, idle_rotation_interval, max_capacity);
             queue_ = &q;
 
             pthread_t producers[NUM_PRODUCERS];
@@ -230,6 +230,15 @@ namespace
             //  With SegmentCount segments each starting at capacity 8, the
             //  ring should have grown well past its starting total.
             CHECK_TRUE(q.capacity_estimate() > 8 * SegmentCount);
+
+            //  When a growth ceiling was set, growth must have honored it:
+            //  no segment can exceed max_capacity, so the ring total is
+            //  bounded by SegmentCount * max_capacity even under heavy
+            //  sustained contention (which otherwise grows without bound).
+            if (max_capacity != static_cast<size_t>(-1))
+            {
+                CHECK_TRUE(q.capacity_estimate() <= SegmentCount * max_capacity);
+            }
         }
     };
 }
@@ -468,4 +477,69 @@ TEST(MpScGrowableRingQueueTests, RingUnderContentionSingleConsumerWithAllocation
 {
     ring_stress_harness<4, flaky_test_resource> harness;
     harness.run();
+}
+
+//  Growth ceiling (max_capacity): under sustained full-drain cycles the
+//  queue would otherwise grow without bound. With a ceiling, capacity must
+//  ratchet up from the initial size, then plateau at exactly the ceiling
+//  (a stable fixed point -- never ceiling+1), while FIFO delivery stays
+//  correct. Single-threaded for a deterministic check of the fixed point.
+TEST(MpScGrowableRingQueueTests, MaxCapacityCapsGrowthUnderSustainedFullDrains)
+{
+    minstd::pmr::monotonic_buffer_resource resource(scratch_buffer, SCRATCH_BUFFER_SIZE, nullptr);
+
+    using queue_t = minstd::mp_sc_growable_ring_queue<int>; // SegmentCount == 2
+    minstd::pmr::polymorphic_allocator<queue_t::allocator_type::value_type> alloc(&resource);
+
+    constexpr size_t INITIAL = 8;
+    constexpr size_t CEILING = 32;
+
+    //  initial 8, growth 5/4 (1.25x), no idle rotation, ceiling 32.
+    queue_t q(alloc, INITIAL, 5, 4, 0, CEILING);
+
+    int next_push = 0;
+    int next_pop = 0;
+    long long push_sum = 0;
+    long long pop_sum = 0;
+
+    //  Each cycle fills every segment to capacity then fully drains them,
+    //  triggering a real regrow on every segment -- 200 cycles is far more
+    //  than the handful needed to climb 8 -> 32 and pin at the ceiling.
+    //  Integrity is checked order-agnostically (count + sum): the queue
+    //  gives no cross-segment ordering guarantee, but every value pushed
+    //  in a cycle must come back out exactly once in that cycle.
+    for (int cycle = 0; cycle < 200; ++cycle)
+    {
+        while (q.push_back(next_push))
+        {
+            push_sum += next_push;
+            ++next_push;
+        }
+
+        int v = -1;
+
+        while (q.pop_front(v))
+        {
+            pop_sum += v;
+            ++next_pop;
+        }
+    }
+
+    CHECK_EQUAL(next_push, next_pop); // every pushed item came back out
+    CHECK_EQUAL(push_sum, pop_sum);   // ... exactly once, none dropped/duplicated
+
+    //  Capacity climbed above the initial total and is now pinned at the
+    //  ceiling on both segments -- exactly SegmentCount * CEILING, never more.
+    CHECK_TRUE(q.capacity_estimate() > 2 * INITIAL);
+    CHECK_EQUAL(2 * CEILING, q.capacity_estimate());
+}
+
+//  Same ceiling, but under real multi-producer/single-consumer contention
+//  with heavy backpressure (24000 items through a ring capped at 4 * 64
+//  slots): growth must stay bounded and every item must still be delivered
+//  exactly once. The harness asserts the SegmentCount * max_capacity bound.
+TEST(MpScGrowableRingQueueTests, MaxCapacityBoundsGrowthUnderContention)
+{
+    ring_stress_harness<4> harness;
+    harness.run(0, /*max_capacity*/ 64);
 }
