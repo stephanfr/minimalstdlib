@@ -86,6 +86,9 @@ PERFORMANCE_OBJ := $(patsubst $(PERFORMANCE_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR
 	                  $(PERFORMANCE_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(PERFORMANCE_OBJ_DIR)/shared_%.o,\
 	                  $(SHARED_SRC))
+
+# External reference-implementation runners append to PERFORMANCE_OBJ.
+include test/performance/external/Makefile
 SOAK_OBJ        := $(patsubst $(SOAK_SRC_DIR)/%.cpp,$(SOAK_OBJ_DIR)/%.o,\
 	                  $(SOAK_SRC)) \
 	               $(patsubst $(SHARED_SRC_DIR)/%.cpp,$(SOAK_OBJ_DIR)/shared_%.o,\
