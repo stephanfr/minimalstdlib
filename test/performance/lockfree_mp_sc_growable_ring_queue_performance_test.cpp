@@ -15,6 +15,9 @@
 #include "../shared/perf_report.h"
 #include "../shared/perf_test_config.h"
 
+#include "external/mp_sc_growable_ring_queue/jiffy_queue.h"
+#include "external/mp_sc_growable_ring_queue/moodycamel_runner.h"
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -384,6 +387,241 @@ TEST(MpScGrowableRingQueuePerformanceTests, GrowthStrategies)
         report.record("ring grow tiny ceiling (5P,1C)", ops, 6, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
         CHECK_TRUE(cap <= 2 * CEILING); // ceiling honored: bounded memory
+    }
+
+    report.finalize();
+}
+
+
+// ---------------------------------------------------------------------------
+//  External comparison tests — all three MPSC implementations, same load
+//
+//  Reference implementations under external/mp_sc_growable_ring_queue/:
+//    Jiffy      — DolevAdas/Jiffy, wait-free MPSC, fixed 1620-slot segments
+//    Moodycamel — cameron314/concurrentqueue, lock-free MPMC used in MPSC
+//                 mode with ProducerToken/ConsumerToken; runner compiled in a
+//                 separate TU without -Iinclude (needs real std::atomic).
+// ---------------------------------------------------------------------------
+namespace
+{
+    template <size_t NumProducers>
+    struct jiffy_perf_runner
+    {
+        using queue_t = JiffyMpScQueue<perf_item>;
+
+        queue_t *queue_ = nullptr;
+        size_t items_per_producer_ = 0;
+        minstd::atomic<uint64_t> popped_{0};
+        minstd::atomic<uint64_t> finished_producers_{0};
+
+        struct producer_args { jiffy_perf_runner *self; };
+
+        static void *produce(void *arg)
+        {
+            auto *a = static_cast<producer_args *>(arg);
+            jiffy_perf_runner *self = a->self;
+            delete a;
+
+            for (size_t i = 0; i < self->items_per_producer_; ++i)
+                self->queue_->enqueue(perf_item{i});
+
+            self->finished_producers_.fetch_add(1, minstd::memory_order_acq_rel);
+            return nullptr;
+        }
+
+        static void *consume(void *arg)
+        {
+            auto *self = static_cast<jiffy_perf_runner *>(arg);
+            size_t total = self->items_per_producer_ * NumProducers;
+
+            while (true)
+            {
+                perf_item it{0};
+                if (self->queue_->dequeue(it))
+                {
+                    self->popped_.fetch_add(1, minstd::memory_order_acq_rel);
+                }
+                else if (self->finished_producers_.load(minstd::memory_order_acquire) == NumProducers &&
+                         self->popped_.load(minstd::memory_order_acquire) == total)
+                {
+                    break;
+                }
+            }
+            return nullptr;
+        }
+
+        double run(queue_t& q, size_t total_items)
+        {
+            items_per_producer_ = total_items / NumProducers;
+            popped_.store(0, minstd::memory_order_relaxed);
+            finished_producers_.store(0, minstd::memory_order_relaxed);
+
+            queue_ = &q;
+
+            pthread_t producers[NumProducers];
+            pthread_t consumer;
+
+            double start = now_seconds();
+
+            for (size_t i = 0; i < NumProducers; ++i)
+                pthread_create(&producers[i], nullptr, produce, new producer_args{this});
+
+            pthread_create(&consumer, nullptr, consume, this);
+
+            for (size_t i = 0; i < NumProducers; ++i)
+                pthread_join(producers[i], nullptr);
+
+            pthread_join(consumer, nullptr);
+
+            size_t actual_total = items_per_producer_ * NumProducers;
+            return static_cast<double>(actual_total) / (now_seconds() - start);
+        }
+    };
+}
+
+TEST_GROUP(MpScGrowableRingQueueExternalComparisonPerformanceTests){};
+
+//  All three queues, fixed ring capacity (no regrowth), 1P/1C and 5P/1C.
+TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, FixedLargeCapacityNoRegrow)
+{
+    constexpr size_t WARMUP_ITEMS = DEFAULT_WARMUP_ITEMS;
+    constexpr size_t TOTAL_ITEMS = DEFAULT_TOTAL_ITEMS;
+    constexpr size_t CAPACITY = WARMUP_ITEMS + TOTAL_ITEMS + 1024;
+
+    perf_report report("MpScGrowableRingQueueExternalComparisonPerformanceTests", "FixedLargeCapacityNoRegrow");
+
+    printf("\n=== Ring (fixed %zu) vs Jiffy vs Moodycamel: %zu items ===\n", CAPACITY, TOTAL_ITEMS);
+    printf("%-50s : %14s\n", "Scenario", "Items/sec");
+
+    double ring_1p, ring_5p;
+
+    {
+        ring_perf_runner<2, 1, 1> r;
+        auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY);
+        ring_1p = ops;
+        printf("%-50s : %14.0f\n", "ring fixed (1P, 1C)", ops);
+        report.record("ring fixed (1P,1C)", ops, 2, TOTAL_ITEMS);
+        CHECK_TRUE(ops > 0);
+    }
+    {
+        ring_perf_runner<8, 5, 1> r;
+        auto [ops, cap] = r.run(TOTAL_ITEMS, CAPACITY / 4);
+        ring_5p = ops;
+        printf("%-50s : %14.0f\n", "ring fixed (5P, 1C)", ops);
+        report.record("ring fixed (5P,1C)", ops, 6, TOTAL_ITEMS);
+        CHECK_TRUE(ops > 0);
+    }
+    {
+        jiffy_perf_runner<1> r;
+        jiffy_perf_runner<1>::queue_t q;
+        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+        double jiffy = r.run(q, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
+        double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
+        report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
+                                    jiffy / ring_1p, 2, TOTAL_ITEMS);
+        CHECK_TRUE(jiffy > 0);
+    }
+    {
+        jiffy_perf_runner<5> r;
+        jiffy_perf_runner<5>::queue_t q;
+        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+        double jiffy = r.run(q, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
+        double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
+        report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
+                                    jiffy / ring_5p, 6, TOTAL_ITEMS);
+        CHECK_TRUE(jiffy > 0);
+    }
+    {
+        double mc = run_moodycamel(1, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "moodycamel (1P, 1C)", mc);
+        double delta = 100.0 * (mc - ring_1p) / ring_1p;
+        report.record_with_baseline("moodycamel (1P,1C)", mc, ring_1p, delta,
+                                    mc / ring_1p, 2, TOTAL_ITEMS);
+        CHECK_TRUE(mc > 0);
+    }
+    {
+        double mc = run_moodycamel(5, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "moodycamel (5P, 1C)", mc);
+        double delta = 100.0 * (mc - ring_5p) / ring_5p;
+        report.record_with_baseline("moodycamel (5P,1C)", mc, ring_5p, delta,
+                                    mc / ring_5p, 6, TOTAL_ITEMS);
+        CHECK_TRUE(mc > 0);
+    }
+
+    report.finalize();
+}
+
+//  All three queues, ring starting at capacity 64 with continuous regrowth.
+TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, SmallInitialCapacityContinuousGrowth)
+{
+    constexpr size_t WARMUP_ITEMS = DEFAULT_WARMUP_ITEMS;
+    constexpr size_t TOTAL_ITEMS = DEFAULT_TOTAL_ITEMS;
+    constexpr size_t INITIAL_CAPACITY = 64;
+
+    perf_report report("MpScGrowableRingQueueExternalComparisonPerformanceTests", "SmallInitialCapacityContinuousGrowth");
+
+    printf("\n=== Ring (initial %zu, growing) vs Jiffy vs Moodycamel: %zu items ===\n", INITIAL_CAPACITY, TOTAL_ITEMS);
+    printf("%-50s : %14s\n", "Scenario", "Items/sec");
+
+    double ring_1p, ring_5p;
+
+    {
+        ring_perf_runner<2, 1, 1> r;
+        auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
+        ring_1p = ops;
+        printf("%-50s : %14.0f\n", "ring growing (1P, 1C)", ops);
+        report.record("ring growing (1P,1C)", ops, 2, TOTAL_ITEMS);
+        CHECK_TRUE(ops > 0);
+        CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
+    }
+    {
+        ring_perf_runner<8, 5, 1> r;
+        auto [ops, cap] = r.run(TOTAL_ITEMS, INITIAL_CAPACITY);
+        ring_5p = ops;
+        printf("%-50s : %14.0f\n", "ring growing (5P, 1C)", ops);
+        report.record("ring growing (5P,1C)", ops, 6, TOTAL_ITEMS);
+        CHECK_TRUE(ops > 0);
+        CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
+    }
+    {
+        jiffy_perf_runner<1> r;
+        jiffy_perf_runner<1>::queue_t q;
+        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+        double jiffy = r.run(q, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
+        double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
+        report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
+                                    jiffy / ring_1p, 2, TOTAL_ITEMS);
+        CHECK_TRUE(jiffy > 0);
+    }
+    {
+        jiffy_perf_runner<5> r;
+        jiffy_perf_runner<5>::queue_t q;
+        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+        double jiffy = r.run(q, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
+        double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
+        report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
+                                    jiffy / ring_5p, 6, TOTAL_ITEMS);
+        CHECK_TRUE(jiffy > 0);
+    }
+    {
+        double mc = run_moodycamel(1, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "moodycamel (1P, 1C)", mc);
+        double delta = 100.0 * (mc - ring_1p) / ring_1p;
+        report.record_with_baseline("moodycamel (1P,1C)", mc, ring_1p, delta,
+                                    mc / ring_1p, 2, TOTAL_ITEMS);
+        CHECK_TRUE(mc > 0);
+    }
+    {
+        double mc = run_moodycamel(5, TOTAL_ITEMS);
+        printf("%-50s : %14.0f\n", "moodycamel (5P, 1C)", mc);
+        double delta = 100.0 * (mc - ring_5p) / ring_5p;
+        report.record_with_baseline("moodycamel (5P,1C)", mc, ring_5p, delta,
+                                    mc / ring_5p, 6, TOTAL_ITEMS);
+        CHECK_TRUE(mc > 0);
     }
 
     report.finalize();
