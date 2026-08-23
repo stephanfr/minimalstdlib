@@ -29,6 +29,8 @@ extern "C" void __assert(const char *msg, const char *file, int line);
 #define MINIMAL_STD_NAMESPACE minstd
 #define FMT_FORMATTERS_NAMESPACE fmt_formatters
 
+#define MINSTD_CACHE_LINE_SIZE 64
+
 namespace MINIMAL_STD_NAMESPACE
 {
     using failure_hook_type = void (*)(const char *reason,

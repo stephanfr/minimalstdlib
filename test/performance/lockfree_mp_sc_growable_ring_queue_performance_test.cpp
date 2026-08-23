@@ -87,6 +87,7 @@ namespace
     };
 
     constexpr size_t DEFAULT_TOTAL_ITEMS = 6'000'000;
+    constexpr size_t DEFAULT_WARMUP_ITEMS = 500'000;
 
     //  ---- original spsc_queue: fixed baseline, unaffected by anything below ----
     double run_spsc_baseline(size_t total_items, size_t capacity)

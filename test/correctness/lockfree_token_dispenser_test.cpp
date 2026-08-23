@@ -23,18 +23,18 @@ namespace
 
     struct args
     {
-        minstd::token_dispenser<64> *dispenser;
+        minstd::token_dispenser *dispenser;
         minstd::array<uint32_t, 1020> *tokens;
     };
 
     void *get_tokens(void *arguments)
     {
-        minstd::token_dispenser<64> &dispenser = *static_cast<args *>(arguments)->dispenser;
+        minstd::token_dispenser &dispenser = *static_cast<args *>(arguments)->dispenser;
         minstd::array<uint32_t, 1020> &tokens = *static_cast<args *>(arguments)->tokens;
 
         for (int i = 0; i < 1020; i++)
         {
-            minstd::token_dispenser<64>::token token = dispenser.get_token();
+            minstd::token_dispenser::token token = dispenser.get_token();
 
             tokens[i] = token.value();
         }
