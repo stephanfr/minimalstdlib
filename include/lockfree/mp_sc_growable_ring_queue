@@ -1,0 +1,471 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <allocator>
+#include "allocator_traits"
+#include <new>
+#include <stddef.h>
+#include <stdint.h>
+#include <type_traits>
+#include <utility>
+
+#include <atomic>
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    //  Packs position and current-life capacity into one atomic word so a
+    //  delayed producer's bound check always uses the capacity in effect at
+    //  its own fetch_add, not a later, larger one after a regrow.
+
+    struct tagged_enqueue_state
+    {
+        using storage_type = uint64_t;
+
+        //  32/32 split: 4.29B headroom on each side -- a physically
+        //  implausible capacity or claim-pileup at any achievable throughput.
+        static constexpr int CAPACITY_BITS = 32;
+        static constexpr storage_type POS_MASK = (storage_type{1} << (64 - CAPACITY_BITS)) - 1;
+
+        //  Known nit: values at or beyond 2^32 silently truncate; treated
+        //  as unreachable given the 32-bit headroom.
+        static constexpr storage_type pack(size_t capacity, size_t pos)
+        {
+            return (static_cast<storage_type>(capacity) << (64 - CAPACITY_BITS)) | (static_cast<storage_type>(pos) & POS_MASK);
+        }
+
+        static constexpr size_t unpack_capacity(storage_type value)
+        {
+            return static_cast<size_t>(value >> (64 - CAPACITY_BITS));
+        }
+
+        static constexpr size_t unpack_pos(storage_type value)
+        {
+            return static_cast<size_t>(value & POS_MASK);
+        }
+    };
+
+    //  Multi-producer / single-consumer lock-free queue over SegmentCount
+    //  ring-buffer segments.  push_back() is thread-safe for any number of
+    //  producers; pop_front()/empty() are single consumer-thread-only.
+    //
+    //  Segments grow (~1.25x) only when fully drained; growth never copies
+    //  live data.  idle_rotation_interval enables early close + shrink for
+    //  underloaded segments.  SegmentCount > 2 adds pre-allocated burst
+    //  headroom; push_back() still returns false when all segments are full.
+    //
+    //  Ordering: same-producer pushes within a segment are ordered; no
+    //  guarantee across producers or segment boundaries.
+    template <typename T, size_t SegmentCount = 2>
+    class mp_sc_growable_ring_queue
+    {
+        static_assert(SegmentCount >= 2, "mp_sc_growable_ring_queue requires at least 2 segments");
+
+    public:
+        using value_type = T;
+
+        struct slot_type
+        {
+            atomic<bool> ready_;
+            alignas(T) unsigned char storage_[sizeof(T)];
+
+            slot_type()
+                : ready_(false)
+            {
+            }
+
+            T *element_ptr()
+            {
+                return reinterpret_cast<T *>(storage_);
+            }
+        };
+
+        using allocator_type = allocator<slot_type>;
+        using allocator_traits_type = minstd::allocator_traits<allocator_type>;
+
+    public:
+        //  idle_rotation_interval: every N pops, close the active segment
+        //  early if under 50% loaded so it can reopen smaller.  0 disables.
+        //
+        //  max_capacity: growth ceiling; queue becomes bounded once reached.
+        //  Default (SIZE_MAX) is unbounded.  Governs growth only -- segments
+        //  may start above it and converge down, or shrink below it.
+        explicit mp_sc_growable_ring_queue(allocator_type &allocator,
+                                           size_t initial_capacity,
+                                           size_t growth_numerator = 5,
+                                           size_t growth_denominator = 4,
+                                           size_t idle_rotation_interval = 0,
+                                           size_t max_capacity = static_cast<size_t>(-1))
+            : allocator_(allocator),
+              growth_numerator_(growth_numerator),
+              growth_denominator_(growth_denominator),
+              idle_rotation_interval_(idle_rotation_interval),
+              max_capacity_(max_capacity)
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                open_segment(segments_[i], initial_capacity);
+            }
+
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                segments_[i].next_ = &segments_[(i + 1) % SegmentCount];
+            }
+
+            producer_target_.store(&segments_[0], memory_order_relaxed);
+            consumer_target_ = &segments_[0];
+        }
+
+        mp_sc_growable_ring_queue(const mp_sc_growable_ring_queue &) = delete;
+        mp_sc_growable_ring_queue(mp_sc_growable_ring_queue &&) = delete;
+        mp_sc_growable_ring_queue &operator=(const mp_sc_growable_ring_queue &) = delete;
+        mp_sc_growable_ring_queue &operator=(mp_sc_growable_ring_queue &&) = delete;
+
+        //  Precondition: no producers are concurrently pushing.
+        ~mp_sc_growable_ring_queue()
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                destroy_segment(segments_[i]);
+            }
+        }
+
+        //  Thread-safe for any number of producers; returns false only when all segments are full.
+        template <class... Args>
+        bool push_back(Args &&...args)
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
+            {
+                if (try_claim_and_publish(*target, minstd::forward<Args>(args)...))
+                {
+                    return true;
+                }
+
+                if (attempt + 1 < SegmentCount)
+                {
+                    target = target->next_;
+
+                    //  Race-free: next_ is fixed; redundant stores of the same value are safe.
+                    producer_target_.store(target, memory_order_relaxed);
+                }
+            }
+
+            return false;
+        }
+
+        //  Consumer-thread-only; false may mean a producer is mid-push, not empty.
+        bool pop_front(T &front)
+        {
+            segment *candidate = consumer_target_;
+
+            for (size_t attempt = 0; attempt < SegmentCount; ++attempt)
+            {
+                if (try_pop_from(*candidate, front))
+                {
+                    if (attempt != 0)
+                    {
+                        consumer_target_ = candidate;
+                    }
+
+                    if (idle_rotation_interval_ != 0 && ++pop_count_ % idle_rotation_interval_ == 0)
+                    {
+                        maybe_shrink_active_segment();
+                    }
+
+                    return true;
+                }
+
+                candidate = candidate->next_;
+            }
+
+            return false;
+        }
+
+        //  Consumer-thread-only hint; true means "nothing available right now."
+        bool empty() const
+        {
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                if (has_ready(segments_[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        //  Consumer-thread-only diagnostic: sum of all segments' declared capacities.
+        size_t capacity_estimate() const
+        {
+            size_t total = 0;
+
+            for (size_t i = 0; i < SegmentCount; ++i)
+            {
+                total += segments_[i].capacity_;
+            }
+
+            return total;
+        }
+
+    private:
+        //  Fields split across three cache lines to prevent false sharing:
+        //  1. read-mostly (next_/capacities/buffer_): written only at open/regrow
+        //  2. producer-hot (enqueue_pos_): written on every push
+        //  3. consumer-hot (dequeue_state_): written on every pop
+
+        struct segment
+        {
+            //  --- Cache line 1: read-mostly, written only at open/regrow ---
+
+            //  Next segment in the ring; never repointed after construction.
+            alignas(MINSTD_CACHE_LINE_SIZE) segment *next_ = nullptr;
+
+            //  original_capacity_: physical allocation size (for destroy/deallocate).
+            //  capacity_: effective size this life; may be reduced by maybe_shrink_active_segment().
+            size_t original_capacity_ = 0;
+            size_t capacity_ = 0;
+            slot_type *buffer_ = nullptr;
+
+            //  --- Cache line 2: producer-hot ---
+
+            //  Packs capacity + ascending position; see tagged_enqueue_state.
+            alignas(MINSTD_CACHE_LINE_SIZE) atomic<tagged_enqueue_state::storage_type> enqueue_pos_{0};
+
+            //  --- Cache line 3: consumer-hot ---
+
+            //  Consumer's ascending drain cursor; plain (single-consumer, no atomics).
+            alignas(MINSTD_CACHE_LINE_SIZE) size_t dequeue_state_{};
+        };
+
+        //  Catch any future field reordering that would reintroduce false sharing.
+        static_assert(offsetof(segment, next_) == 0,
+                      "read-mostly group must start the struct");
+        static_assert(offsetof(segment, enqueue_pos_) == MINSTD_CACHE_LINE_SIZE,
+                      "enqueue_pos_ must start its own cache line, isolated from the read-mostly group");
+        static_assert(offsetof(segment, dequeue_state_) == 2 * MINSTD_CACHE_LINE_SIZE,
+                      "dequeue_state_ must start its own cache line, isolated from enqueue_pos_");
+
+        void open_segment(segment &seg, size_t capacity)
+        {
+            slot_type *buffer = allocator_traits_type::allocate(allocator_, capacity);
+
+            if (buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * capacity, alignof(slot_type));
+                capacity = 0;
+
+                //  Known nit: construction-time failure leaves buffer_ null; deallocate(nullptr,0)
+                //  is only safe because the default policy traps before reaching this.
+            }
+
+            for (size_t i = 0; i < capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &buffer[i]);
+            }
+
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(capacity, 0), memory_order_relaxed);
+            seg.buffer_ = buffer;
+            seg.original_capacity_ = capacity;
+            seg.capacity_ = capacity;
+            seg.dequeue_state_ = 0;
+        }
+
+        void destroy_segment(segment &seg)
+        {
+            //  Use original_capacity_ (physical size), not capacity_ (may be reduced).
+            for (size_t i = 0; i < seg.original_capacity_; ++i)
+            {
+                //  Only destroy slots that were actually published.
+                if (seg.buffer_[i].ready_.load(memory_order_acquire))
+                {
+                    seg.buffer_[i].element_ptr()->~T();
+                }
+
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
+        }
+
+        template <class... Args>
+        bool try_claim_and_publish(segment &seg, Args &&...args)
+        {
+            //  Capacity is read from the same atomic word as the position so the
+            //  bound check uses the exact capacity at claim time, not a later life's.
+            //  A TTAS pre-peek was measured at 20-35% regression on the fast path.
+            tagged_enqueue_state::storage_type before = seg.enqueue_pos_.fetch_add(1, memory_order_acquire);
+            size_t capacity_at_claim = tagged_enqueue_state::unpack_capacity(before);
+            size_t idx = tagged_enqueue_state::unpack_pos(before);
+
+            if (idx >= capacity_at_claim)
+            {
+                return false;
+            }
+
+            allocator_traits_type::construct(allocator_, seg.buffer_[idx].element_ptr(), minstd::forward<Args>(args)...);
+            seg.buffer_[idx].ready_.store(true, memory_order_release);
+
+            return true;
+        }
+
+        bool try_pop_from(segment &seg, T &front)
+        {
+            if (seg.dequeue_state_ >= seg.capacity_)
+            {
+                return false;
+            }
+
+            slot_type &s = seg.buffer_[seg.dequeue_state_];
+
+            if (!s.ready_.load(memory_order_acquire))
+            {
+                return false;
+            }
+
+            front = minstd::move(*s.element_ptr());
+            allocator_traits_type::destroy(allocator_, s.element_ptr());
+            s.ready_.store(false, memory_order_relaxed);
+            ++seg.dequeue_state_;
+
+            if (seg.dequeue_state_ == seg.capacity_)
+            {
+                retire_and_grow(seg);
+            }
+
+            return true;
+        }
+
+        bool has_ready(const segment &seg) const
+        {
+            size_t pos = seg.dequeue_state_;
+
+            if (pos >= seg.capacity_)
+            {
+                return false;
+            }
+
+            return seg.buffer_[pos].ready_.load(memory_order_acquire);
+        }
+
+        size_t compute_new_capacity(size_t reference_capacity) const
+        {
+            size_t grown = (reference_capacity * growth_numerator_ + growth_denominator_ - 1) / growth_denominator_;
+            grown = grown > reference_capacity ? grown : reference_capacity + 1;
+
+            //  Clamp after the +1 bump so a segment at the ceiling stays at max_capacity_.
+            if (grown > max_capacity_)
+            {
+                grown = max_capacity_;
+            }
+
+            return grown;
+        }
+
+        //  Gradual shrink (same ratio as growth, reversed); floored at 1.
+        size_t compute_shrunk_capacity(size_t current) const
+        {
+            size_t shrunk = (current * growth_denominator_) / growth_numerator_;
+            return shrunk > 0 ? shrunk : 1;
+        }
+
+        //  Called by the sole consumer once a segment is fully drained.
+        void retire_and_grow(segment &seg)
+        {
+            //  Capped life (early close by maybe_shrink_active_segment) shrinks;
+            //  organic full-drain grows relative to the next segment.
+            bool was_capped = seg.capacity_ < seg.original_capacity_;
+
+            size_t new_capacity = was_capped
+                                      ? compute_shrunk_capacity(seg.capacity_)
+                                      : compute_new_capacity(seg.next_->capacity_);
+
+            //  Allocate before freeing so failure degrades to recycle-in-place.
+            slot_type *new_buffer = allocator_traits_type::allocate(allocator_, new_capacity);
+            size_t effective_capacity = new_capacity;
+
+            //  Destroy using original_capacity_, not capacity_ (may be smaller if capped).
+            for (size_t i = 0; i < seg.original_capacity_; ++i)
+            {
+                allocator_traits_type::destroy(allocator_, &seg.buffer_[i]);
+            }
+
+            if (new_buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(slot_type) * new_capacity, alignof(slot_type));
+                new_buffer = seg.buffer_;
+                effective_capacity = seg.original_capacity_;
+            }
+            else
+            {
+                allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
+            }
+
+            for (size_t i = 0; i < effective_capacity; ++i)
+            {
+                allocator_traits_type::construct(allocator_, &new_buffer[i]);
+            }
+
+            seg.buffer_ = new_buffer;
+            seg.original_capacity_ = effective_capacity;
+            seg.capacity_ = effective_capacity;
+
+            //  Release-store ensures producers see buffer_/capacity_ before enqueue_pos_.
+            seg.dequeue_state_ = 0;
+            seg.enqueue_pos_.store(tagged_enqueue_state::pack(effective_capacity, 0), memory_order_release);
+        }
+
+        //  Closes the active segment early if under 50% loaded, so it can
+        //  reopen smaller.  Single CAS attempt; skipped if contended.
+        void maybe_shrink_active_segment()
+        {
+            segment *target = producer_target_.load(memory_order_relaxed);
+
+            tagged_enqueue_state::storage_type state = target->enqueue_pos_.load(memory_order_acquire);
+            size_t capacity_at_check = tagged_enqueue_state::unpack_capacity(state);
+            size_t position_at_check = tagged_enqueue_state::unpack_pos(state);
+
+            //  Skip: unclaimed, already overflowing, or above 50% load.
+            if (position_at_check == 0 || position_at_check >= capacity_at_check || position_at_check * 2 >= capacity_at_check)
+            {
+                return;
+            }
+
+            tagged_enqueue_state::storage_type capped_state = tagged_enqueue_state::pack(position_at_check, position_at_check);
+
+            if (!target->enqueue_pos_.compare_exchange_strong(state, capped_state, memory_order_acq_rel, memory_order_relaxed))
+            {
+                return;
+            }
+
+            target->capacity_ = position_at_check;
+
+            //  If already caught up to the new cap, trigger regrow now -- no other path will.
+            if (target->dequeue_state_ >= position_at_check)
+            {
+                retire_and_grow(*target);
+            }
+        }
+
+        //  All read-only after construction (Shared cache state); pop_count_ lives below
+        //  to avoid false-sharing with consumer_target_.
+        allocator_type &allocator_;
+        size_t growth_numerator_;
+        size_t growth_denominator_;
+        size_t idle_rotation_interval_;
+        size_t max_capacity_;
+        segment segments_[SegmentCount];
+
+        //  Isolated to prevent false sharing between producers and consumer.
+        alignas(MINSTD_CACHE_LINE_SIZE) atomic<segment *> producer_target_;
+
+        alignas(MINSTD_CACHE_LINE_SIZE) segment *consumer_target_ = nullptr;
+        size_t pop_count_ = 0;
+    };
+}
