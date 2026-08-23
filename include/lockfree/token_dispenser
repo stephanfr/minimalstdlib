@@ -13,7 +13,6 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
-    template <size_t CACHE_LINE_SIZE = 64>
     class token_dispenser
     {
     public:
@@ -102,9 +101,9 @@ namespace MINIMAL_STD_NAMESPACE
     private:
         uint32_t number_of_tokens_;
 
-        alignas(CACHE_LINE_SIZE) minstd::atomic<uint64_t> tokens_;
+        alignas(MINSTD_CACHE_LINE_SIZE) minstd::atomic<uint64_t> tokens_;
 
-        alignas(CACHE_LINE_SIZE) minstd::atomic<size_t> token_counter_;
+        alignas(MINSTD_CACHE_LINE_SIZE) minstd::atomic<size_t> token_counter_;
     };
 
 } // namespace MINIMAL_STD_NAMESPACE
