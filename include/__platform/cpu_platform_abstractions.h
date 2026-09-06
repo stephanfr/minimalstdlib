@@ -18,7 +18,10 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #elif defined(__aarch64__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnarrowing"
 #include <arm_neon.h>
+#pragma GCC diagnostic pop
 #endif
 
 namespace MINIMAL_STD_NAMESPACE
