@@ -41,6 +41,15 @@ namespace MINIMAL_STD_NAMESPACE
             pointer_to_copy.wrapped_pointer_ = nullptr;
         }
 
+        //  Implicit U*→T* conversion; compile error if U is not derived from T.
+        template <typename U>
+        unique_ptr(unique_ptr<U> &&other)
+            : wrapped_pointer_(other.wrapped_pointer_),
+              resource_(other.resource_)
+        {
+            other.wrapped_pointer_ = nullptr;
+        }
+
         ~unique_ptr()
         {
             destroy_wrapped_pointer();
@@ -55,6 +64,19 @@ namespace MINIMAL_STD_NAMESPACE
             wrapped_pointer_ = pointer_to_move.wrapped_pointer_;
             resource_ = pointer_to_move.resource_;
             pointer_to_move.wrapped_pointer_ = nullptr;
+
+            return *this;
+        }
+
+        //  Implicit U*→T* conversion; compile error if U is not derived from T.
+        template <typename U>
+        unique_ptr &operator=(unique_ptr<U> &&other)
+        {
+            destroy_wrapped_pointer();
+
+            wrapped_pointer_ = other.wrapped_pointer_;
+            resource_ = other.resource_;
+            other.wrapped_pointer_ = nullptr;
 
             return *this;
         }
@@ -118,5 +140,8 @@ namespace MINIMAL_STD_NAMESPACE
 
         T *wrapped_pointer_ = nullptr;
         minstd::pmr::memory_resource *resource_ = nullptr;
+
+        template <typename U>
+        friend class unique_ptr;
     };
 }   //  namespace MINSTD
