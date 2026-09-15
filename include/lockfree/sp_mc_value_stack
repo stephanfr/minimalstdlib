@@ -1,0 +1,145 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <atomic>
+#include <stddef.h>
+#include <stdint.h>
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    namespace lockfree
+    {
+        //  Fixed-capacity lock-free stack for trivially-copyable value types.
+        //
+        //  Push contract  : called by exactly ONE producer thread at a time.
+        //  Pop  contract  : safe for any number of concurrent consumer threads.
+        //
+        //  Correctness
+        //    A plain count-only CAS is vulnerable to ABA: count can cycle
+        //    N → N-1 (pop) → N (push) between a consumer's load and its CAS,
+        //    letting two consumers claim the same slot.  A 64-bit state word
+        //    eliminates this: the high 32 bits hold a generation that is
+        //    incremented on every push.  A pop CAS must match the FULL state
+        //    (count AND generation), so a count cycle after any push is
+        //    distinguishable.
+        //
+        //  Memory ordering
+        //    push() writes the slot, then does a CAS with release ordering so
+        //    every consumer that acquires the new state sees the slot content.
+        //    pop()  does an acquire-release CAS; on success the consumer has
+        //    synchronised with the push that committed the matching generation.
+        //
+        //  State layout  (single uint64_t)
+        //    [63:32]  generation  –  monotonically incrementing push counter
+        //    [31: 0]  count       –  current number of live entries
+
+        template <typename T, size_t Capacity>
+        class sp_mc_value_stack
+        {
+        public:
+            static_assert(Capacity > 0, "sp_mc_value_stack: Capacity must be > 0");
+            static_assert(Capacity <= 0xFFFFFFFFu, "sp_mc_value_stack: Capacity must fit in 32 bits");
+
+            using value_type = T;
+
+            static constexpr size_t CAPACITY = Capacity;
+
+            sp_mc_value_stack() = default;
+
+            sp_mc_value_stack(const sp_mc_value_stack &) = delete;
+            sp_mc_value_stack(sp_mc_value_stack &&) = delete;
+            sp_mc_value_stack &operator=(const sp_mc_value_stack &) = delete;
+            sp_mc_value_stack &operator=(sp_mc_value_stack &&) = delete;
+
+            //  Single-producer push.  Returns false if the stack is full.
+            bool push(T value) noexcept
+            {
+                uint64_t old = state_.load(memory_order_acquire);
+
+                while (true)
+                {
+                    const uint32_t count = lo32(old);
+                    const uint32_t gen   = hi32(old);
+
+                    if (count >= static_cast<uint32_t>(CAPACITY))
+                    {
+                        return false;
+                    }
+
+                    slots_[count] = value;
+
+                    const uint64_t desired = pack(gen + 1, count + 1);
+
+                    if (state_.compare_exchange_weak(old, desired,
+                                                     memory_order_release,
+                                                     memory_order_acquire))
+                    {
+                        return true;
+                    }
+                    //  A pop shifted the stack between our slot write and CAS.
+                    //  old is refreshed; re-evaluate the slot and retry.
+                }
+            }
+
+            //  Multi-consumer pop.  Returns false if the stack is empty.
+            bool pop(T &out) noexcept
+            {
+                uint64_t old = state_.load(memory_order_acquire);
+
+                while (lo32(old) != 0)
+                {
+                    const uint32_t count = lo32(old);
+                    const uint32_t gen   = hi32(old);
+
+                    //  Read the candidate slot before the CAS.  If the CAS
+                    //  fails (another pop or push changed state_), old is
+                    //  refreshed and we re-read on the next iteration.
+                    const T val = slots_[count - 1];
+
+                    //  Pop does NOT change the generation — only push does.
+                    //  This means a push between our load and our CAS changes
+                    //  the generation, so our CAS fails and we see the correct
+                    //  new state.
+                    const uint64_t desired = pack(gen, count - 1);
+
+                    if (state_.compare_exchange_weak(old, desired,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire))
+                    {
+                        out = val;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            bool empty() const noexcept
+            {
+                return lo32(state_.load(memory_order_acquire)) == 0;
+            }
+
+            uint32_t size() const noexcept
+            {
+                return lo32(state_.load(memory_order_acquire));
+            }
+
+        private:
+            static constexpr uint64_t pack(uint32_t gen, uint32_t count) noexcept
+            {
+                return (static_cast<uint64_t>(gen) << 32) | count;
+            }
+
+            static constexpr uint32_t lo32(uint64_t v) noexcept { return static_cast<uint32_t>(v); }
+            static constexpr uint32_t hi32(uint64_t v) noexcept { return static_cast<uint32_t>(v >> 32); }
+
+            alignas(MINSTD_CACHE_LINE_SIZE) atomic<uint64_t> state_{0};
+            T slots_[Capacity];
+        };
+    }
+}
