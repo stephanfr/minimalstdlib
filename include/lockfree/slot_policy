@@ -147,7 +147,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t acquire_slot() const
         {
-            const uint32_t cpu_id = pmr::platform::get_cpu_id();
+            const uint32_t cpu_id = platform::get_cpu_id();
             const size_t initial_slot = static_cast<size_t>(cpu_id) % NUM_SLOTS;
 
             for (size_t probe = 0; probe < NUM_SLOTS; ++probe)

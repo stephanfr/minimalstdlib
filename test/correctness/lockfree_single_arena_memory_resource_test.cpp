@@ -37,7 +37,7 @@ namespace
 
     typedef minstd::pmr::lockfree_single_arena_resource_impl<
         test_userspace_signal_mask_interrupt_policy,
-        minstd::pmr::platform::default_platform_provider,
+        minstd::platform::default_platform_provider,
         128 * 1024 * 1024,
         5,
 
@@ -47,7 +47,7 @@ namespace
         
     typedef minstd::pmr::lockfree_single_arena_resource_impl<
         test_userspace_signal_mask_interrupt_policy,
-        minstd::pmr::platform::default_platform_provider,
+        minstd::platform::default_platform_provider,
         128 * 1024 * 1024,
         5,
 
@@ -300,7 +300,7 @@ struct test_unmasked_interrupt_policy
 
 typedef minstd::pmr::lockfree_single_arena_resource_impl<
     test_unmasked_interrupt_policy,
-    minstd::pmr::platform::default_platform_provider,
+    minstd::platform::default_platform_provider,
     128 * 1024 * 1024,
     5,
         128,
@@ -560,7 +560,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ExhaustAndRecoverUnderContention)
 
     typedef minstd::pmr::lockfree_single_arena_resource_impl<
         test_userspace_signal_mask_interrupt_policy,
-        minstd::pmr::platform::default_platform_provider,
+        minstd::platform::default_platform_provider,
         16 * 1024 * 1024,
         5,
         10,

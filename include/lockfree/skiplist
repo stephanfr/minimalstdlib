@@ -1790,7 +1790,7 @@ namespace MINIMAL_STD_NAMESPACE
             void backoff(uint32_t &backoff_state, size_t /*cpu_slot*/)
             {
                 size_t retries = backoff_state;
-                pmr::platform::default_platform_provider::back_off(retries);
+                platform::default_platform_provider::back_off(retries);
                 backoff_state = static_cast<uint32_t>((retries < BACKOFF_MAX_RELAX_SPINS) ? retries : BACKOFF_MAX_RELAX_SPINS);
             }
 

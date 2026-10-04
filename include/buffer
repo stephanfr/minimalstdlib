@@ -127,6 +127,7 @@ namespace MINIMAL_STD_NAMESPACE
     class heap_buffer : public buffer<T>
     {
     public:
+
         heap_buffer(pmr::memory_resource &resource, size_t size)
             : resource_(resource),
               buffer_size_(size),
@@ -134,6 +135,24 @@ namespace MINIMAL_STD_NAMESPACE
               buffer_(static_cast<T *>(resource_.allocate(sizeof(T) * size, alignof(T))))
         {
         }
+
+        //  Moving transfers ownership of the block.  The source is left empty, and the
+        //      destructor already skips a null buffer_, so the block is freed exactly once.
+
+        heap_buffer(heap_buffer &&buffer_to_move) noexcept
+            : resource_(buffer_to_move.resource_),
+              buffer_size_(buffer_to_move.buffer_size_),
+              size_(buffer_to_move.size_),
+              buffer_(buffer_to_move.buffer_)
+        {
+            buffer_to_move.buffer_ = nullptr;
+            buffer_to_move.buffer_size_ = 0;
+            buffer_to_move.size_ = 0;
+        }
+   
+        heap_buffer(const heap_buffer &) = delete;
+        heap_buffer &operator=(const heap_buffer &) = delete;
+        heap_buffer &operator=(heap_buffer &&) = delete;
 
         virtual ~heap_buffer()
         {
@@ -191,13 +210,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t append(const T *block_to_append, size_t elements_to_append) override
         {
-            size_t bytes_appended = min(buffer_size_ - size_, elements_to_append);
+            size_t elements_appended = min(buffer_size_ - size_, elements_to_append);
 
-            memcpy(buffer_ + size_, block_to_append, bytes_appended);
+            memcpy(buffer_ + size_, block_to_append, elements_appended * sizeof(T));
 
-            size_ += bytes_appended;
+            size_ += elements_appended;
 
-            return bytes_appended;
+            return elements_appended;
         }
 
         void pop_back()

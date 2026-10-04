@@ -20,6 +20,9 @@
 
 #include <stdint.h>
 
+using MINIMAL_STD_NAMESPACE::platform::default_interrupt_policy;
+using MINIMAL_STD_NAMESPACE::platform::default_platform_provider;
+
 namespace MINIMAL_STD_NAMESPACE
 {
     namespace pmr
@@ -49,7 +52,7 @@ namespace MINIMAL_STD_NAMESPACE
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 
         template <typename interrupt_policy_type,
-                  typename platform_provider_type = platform::default_platform_provider,
+                  typename platform_provider_type = default_platform_provider,
                   size_t max_bin_bytes = 32 * 1024 * 1024,
                   size_t max_waste_percent = 5,
                   size_t maintenance_window_threshold = 128,

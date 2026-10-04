@@ -222,8 +222,8 @@ namespace
 
             {
                 using composite_large_resource_type = minstd::pmr::lockfree_single_arena_resource_impl<
-                    minstd::pmr::platform::default_interrupt_policy,
-                    minstd::pmr::platform::default_platform_provider,
+                    minstd::platform::default_interrupt_policy,
+                    minstd::platform::default_platform_provider,
                     32 * 1024 * 1024,
                     5,
              128>;

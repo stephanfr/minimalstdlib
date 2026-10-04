@@ -47,7 +47,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 inline void install_test_cpu_id_provider()
                 {
-                    minstd::pmr::platform::set_test_cpu_id_provider(&get_cached_cpu_id_refresh_500);
+                    minstd::platform::set_test_cpu_id_provider(&get_cached_cpu_id_refresh_500);
                 }
 
                 inline uint32_t get_cpu_id()
@@ -91,7 +91,7 @@ namespace MINIMAL_STD_NAMESPACE
 #else
                 inline void install_test_cpu_id_provider()
                 {
-                    minstd::pmr::platform::clear_test_cpu_id_provider();
+                    minstd::platform::clear_test_cpu_id_provider();
                 }
 
                 inline uint32_t get_cpu_id()
