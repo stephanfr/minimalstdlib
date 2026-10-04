@@ -15,15 +15,6 @@
 #include "minstdconfig.h"
 #include <stdint.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <emmintrin.h>
-#elif defined(__aarch64__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wnarrowing"
-#include <arm_neon.h>
-#pragma GCC diagnostic pop
-#endif
-
 namespace MINIMAL_STD_NAMESPACE
 {
     namespace platform
@@ -233,34 +224,18 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         /**
-         * @brief Check if a 128-bit aligned chunk contains all ones.
+         * @brief Check whether two consecutive 64-bit words are both all ones (~0ULL).
          *
-         * This function uses SIMD instructions when available to efficiently
-         * check if two consecutive 64-bit words are both ~0ULL. Used for
-         * optimistic scanning in lock-free bitset structures.
+         * Used for optimistic scanning in lock-free bitset structures.  Plain scalar code: for
+         * two words it is as fast as SIMD (x64: two loads, AND, compare; ARM64: LDP, AND,
+         * compare), needs no intrinsics header, and has no alignment requirement.
          *
-         * On x64: Uses SSE2 instructions (_mm_load_si128, _mm_cmpeq_epi8)
-         * On ARM64: Uses NEON instructions (vld1q_u64, vceqq_u64)
-         * On other platforms: Falls back to scalar loads
-         *
-         * @param chunk_ptr Pointer to two consecutive uint64_t values (must be 16-byte aligned on x64)
+         * @param chunk_ptr Pointer to two consecutive uint64_t values
          * @return true if both words are all ones (~0ULL), false otherwise
          */
         inline bool simd_scan_128bit_is_all_ones(const uint64_t *chunk_ptr)
         {
-#if defined(__x86_64__) || defined(_M_X64)
-            __m128i data = _mm_load_si128(reinterpret_cast<const __m128i *>(chunk_ptr));
-            __m128i all_ff = _mm_set1_epi8(static_cast<char>(0xFF));
-            __m128i cmp = _mm_cmpeq_epi8(data, all_ff);
-            return _mm_movemask_epi8(cmp) == 0xFFFF;
-#elif defined(__aarch64__)
-            uint64x2_t data = vld1q_u64(chunk_ptr);
-            uint64x2_t all_ff = vdupq_n_u64(~0ULL);
-            uint64x2_t cmp = vceqq_u64(data, all_ff);
-            return (vgetq_lane_u64(cmp, 0) & vgetq_lane_u64(cmp, 1)) == ~0ULL;
-#else
-            return (chunk_ptr[0] == ~0ULL) && (chunk_ptr[1] == ~0ULL);
-#endif
+            return (chunk_ptr[0] & chunk_ptr[1]) == ~0ULL;
         }
 
         struct default_platform_provider
