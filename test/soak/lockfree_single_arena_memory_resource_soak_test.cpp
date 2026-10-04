@@ -36,7 +36,7 @@ namespace
 
     typedef minstd::pmr::lockfree_single_arena_resource_impl<
         test_userspace_signal_mask_interrupt_policy,
-        minstd::pmr::platform::default_platform_provider,
+        minstd::platform::default_platform_provider,
         128 * 1024 * 1024,
         5,
         128,
@@ -45,7 +45,7 @@ namespace
         
     typedef minstd::pmr::lockfree_single_arena_resource_impl<
         test_userspace_signal_mask_interrupt_policy,
-        minstd::pmr::platform::default_platform_provider,
+        minstd::platform::default_platform_provider,
         128 * 1024 * 1024,
         5,
         128,

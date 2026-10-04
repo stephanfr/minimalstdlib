@@ -36,9 +36,9 @@ namespace MINIMAL_STD_NAMESPACE
     public:
         static constexpr bool is_always_lock_free = __atomic_always_lock_free(sizeof(T), nullptr);
 
-        atomic() = default;
+        constexpr atomic() noexcept = default;
 
-        atomic(const T value)
+        constexpr atomic(const T value) noexcept
             : value_(value)
         {
         }

@@ -8,20 +8,17 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
-    namespace pmr
+    namespace platform
     {
-        namespace platform
+        namespace os_interrupt_abstractions
         {
-            namespace os_interrupt_abstractions
+            inline uint32_t enter_critical_section()
             {
-                inline uint32_t enter_critical_section()
-                {
-                    return 1u;
-                }
+                return 1u;
+            }
 
-                inline void leave_critical_section()
-                {
-                }
+            inline void leave_critical_section()
+            {
             }
         }
     }
