@@ -21,6 +21,33 @@ namespace
     alignas(64) char test_buffer[buffer_size];
     
     using bitblock_resource_type = minstd::pmr::lockfree_bitblock_resource<64, 1024, 32, 48, false>;
+
+    //  Forwards to an upstream resource and records whether every allocation was 64-byte aligned
+    class alignment_recording_resource : public minstd::pmr::memory_resource
+    {
+    public:
+        explicit alignment_recording_resource(minstd::pmr::memory_resource *upstream) : upstream_(upstream) {}
+
+        bool all_cache_line_aligned() const { return all_cache_line_aligned_; }
+        size_t allocation_count() const { return allocation_count_; }
+
+    private:
+        void *do_allocate(size_t bytes, size_t alignment) override
+        {
+            void *ptr = upstream_->allocate(bytes, alignment);
+            allocation_count_++;
+            all_cache_line_aligned_ = all_cache_line_aligned_ && ((reinterpret_cast<uintptr_t>(ptr) % 64) == 0);
+            return ptr;
+        }
+
+        void do_deallocate(void *ptr, size_t bytes, size_t alignment) override { upstream_->deallocate(ptr, bytes, alignment); }
+
+        bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override { return this == &other; }
+
+        minstd::pmr::memory_resource *upstream_;
+        bool all_cache_line_aligned_ = true;
+        size_t allocation_count_ = 0;
+    };
 }
 
 TEST(LockfreeBitblockResourceTests, ContiguousScanIntegrity)
@@ -66,4 +93,30 @@ TEST(LockfreeBitblockResourceTests, ContiguousScanIntegrity)
     for (int i = 1; i < 1000; i += 2) {
         small_pool.deallocate(pointers[i], 64, 16);
     }
+}
+
+TEST(LockfreeBitblockResourceTests, BlocksAreCacheLineAligned)
+{
+    minstd::pmr::single_block_resource upstream(test_buffer, buffer_size);
+    alignment_recording_resource recorder(&upstream);
+
+    {
+        bitblock_resource_type small_pool(&recorder, 2);   //  constructor allocates one block per arena
+
+        //  Exhaust the first blocks so add_new_block() runs too (1024 x 64-byte elements per block)
+        void *pointers[2100];
+        for (size_t i = 0; i < 2100; i++)
+        {
+            pointers[i] = small_pool.allocate(48, 16);
+            CHECK(pointers[i] != nullptr);
+        }
+
+        for (size_t i = 0; i < 2100; i++)
+        {
+            small_pool.deallocate(pointers[i], 48, 16);
+        }
+    }
+
+    CHECK(recorder.allocation_count() >= 3);
+    CHECK(recorder.all_cache_line_aligned());   //  before: blocks are 16-aligned (48 mod 64)
 }

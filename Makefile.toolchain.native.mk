@@ -53,3 +53,8 @@ TEST_LDFLAGS :=
 COVERAGE_CFLAGS := $(TEST_CFLAGS) -fprofile-arcs -ftest-coverage -fprofile-update=atomic -fno-inline -fno-inline-functions -fno-default-inline
 COVERAGE_CPP_FLAGS := $(COVERAGE_CFLAGS)
 COVERAGE_OPTIMIZATION_FLAGS := -O0
+
+ASAN_SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
+ASAN_CPP_FLAGS := $(TEST_CFLAGS) $(ASAN_SANITIZE_FLAGS)
+ASAN_OPTIMIZATION_FLAGS := -O1 -fno-omit-frame-pointer
+ASAN_LDFLAGS := $(ASAN_SANITIZE_FLAGS)

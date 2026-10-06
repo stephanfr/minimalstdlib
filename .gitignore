@@ -4,6 +4,7 @@ lib/
 
 # Test outputs
 test/build/
+test/build-asan/
 test/coverage/
 test/stats
 

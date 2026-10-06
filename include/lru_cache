@@ -254,10 +254,8 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (cache_entries_.size() >= max_cache_size_)
             {
-                typename list<cache_entry_type>::reference last_entry = cache_entries_.back();
-
+                cache_entry_map_.erase(cache_entries_.back().key_);
                 cache_entries_.pop_back();
-                cache_entry_map_.erase(last_entry.key_);
             }
         }
     };

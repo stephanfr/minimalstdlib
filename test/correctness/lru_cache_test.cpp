@@ -12,6 +12,8 @@
 #include <__memory_resource/polymorphic_allocator.h>
 #include <single_block_memory_heap>
 
+#include <../shared/poisoning_memory_resource.h>
+
 #include <memory>
 
 #define TEST_BUFFER_SIZE 65536
@@ -354,4 +356,32 @@ namespace
         CHECK_EQUAL(6, test_cache.size());
     }
 
+    TEST(LRUCacheTests, EvictionRemovesEvictedKeyFromMap)
+    {
+        minstd::pmr::test::poisoning_memory_resource entry_resource;
+        minstd::pmr::test::poisoning_memory_resource map_resource;
+
+        lru_cache_with_elementsEntryHeapAllocator entry_allocator(&entry_resource);
+        lru_cache_with_elementsMapHeapAllocator map_allocator(&map_resource);
+
+        {
+            lru_cache_with_elements test_cache(2, entry_allocator, map_allocator);
+
+            CHECK(test_cache.add(1, test_element(10)));
+            CHECK(test_cache.add(2, test_element(20)));
+            CHECK(test_cache.add(3, test_element(30))); //  evicts key 1
+
+            CHECK_EQUAL(2, test_cache.size());
+
+            //  If eviction read a freed key, key 1 is still in the map and this add is refused
+
+            CHECK(test_cache.add(1, test_element(11)));
+            CHECK(test_cache.find(1).has_value());
+        }
+
+        CHECK(entry_resource.freed_memory_intact());
+        CHECK(map_resource.freed_memory_intact());
+        CHECK_EQUAL(0, entry_resource.bytes_in_use());
+        CHECK_EQUAL(0, map_resource.bytes_in_use());
+    }
 }

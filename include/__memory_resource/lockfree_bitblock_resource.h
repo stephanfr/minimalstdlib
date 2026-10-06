@@ -183,7 +183,7 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
-                    auto new_block_space = upstream_resource_->allocate(sizeof(block));
+                    auto new_block_space = upstream_resource_->allocate(sizeof(block), alignof(block));
 
                     if (new_block_space == nullptr)
                     {
@@ -229,7 +229,7 @@ namespace MINIMAL_STD_NAMESPACE
                     arenas_[i].upstream_resource_ = memory_resource;
                     arenas_[i].parent_ = this;
                     arenas_[i].arena_index_ = i;
-                    auto initial_block = new (upstream_resource_->allocate(sizeof(block))) block();
+                    auto initial_block = new (upstream_resource_->allocate(sizeof(block), alignof(block))) block();
                     initial_block->arena_index_ = i;
                     arenas_[i].first_block_.store(initial_block, memory_order_release);
                     arenas_[i].block_count_ = 1;
@@ -248,7 +248,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         auto next_block = current_block->next_block_;
 
-                        upstream_resource_->deallocate(current_block, sizeof(block));
+                        upstream_resource_->deallocate(current_block, sizeof(block), alignof(block));
 
                         current_block = next_block;
                     }

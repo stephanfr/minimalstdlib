@@ -42,7 +42,13 @@ namespace MINIMAL_STD_NAMESPACE
 
             value_type *allocate(size_t num_elements)
             {
-                return static_cast<value_type *>(malloc(sizeof(value_type) * num_elements));
+                //  skip_node and slot_block are alignas(64); malloc only guarantees alignof(max_align_t).
+                //      aligned_alloc requires the size to be a multiple of the alignment.
+
+                constexpr size_t alignment = alignof(value_type) > alignof(max_align_t) ? alignof(value_type) : alignof(max_align_t);
+                const size_t bytes = ((sizeof(value_type) * num_elements + alignment - 1) / alignment) * alignment;
+
+                return static_cast<value_type *>(aligned_alloc(alignment, bytes));
             }
 
             void deallocate(value_type *ptr, size_t /*num_elements*/)

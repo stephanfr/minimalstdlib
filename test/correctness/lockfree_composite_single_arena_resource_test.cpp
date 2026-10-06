@@ -40,8 +40,8 @@ TEST(LockfreeCompositeSingleArenaResourceTests, DeallocationOriginTestingAndBoun
 
     void* alignment_shifted_ptr = composite.allocate(64, 32);
     CHECK(alignment_shifted_ptr != nullptr);
-    // lockfree_bitblock_resource guarantees 16-byte alignment in this configuration.
-    CHECK_EQUAL(0, (uintptr_t)alignment_shifted_ptr % 16);
+    //  A memory_resource must honour the requested alignment
+    CHECK_EQUAL(0, (uintptr_t)alignment_shifted_ptr % 32);
 
     // Clean up
     composite.deallocate(small_ptr, 1000, 16);
@@ -74,8 +74,8 @@ TEST(LockfreeCompositeSingleArenaResourceTests, AbsoluteAlignmentVerification)
 
         void* p64 = composite.allocate((i % 200) + 1, 64);
         CHECK(p64 != nullptr);
-        // lockfree_bitblock_resource guarantees 16-byte alignment in this configuration.
-        CHECK_EQUAL(0, (uintptr_t)p64 % 16);
+        //  A memory_resource must honour the requested alignment (skip_node and slot_block are alignas(64))
+        CHECK_EQUAL(0, (uintptr_t)p64 % 64);
         ptrs_64[i] = p64;
     }
     

@@ -58,7 +58,9 @@ namespace MINIMAL_STD_NAMESPACE
 
             static bool should_use_small_pool(size_t bytes, size_t alignment) noexcept
             {
-                return bytes <= THRESHOLD_BYTES && alignment <= ELEMENT_SIZE_IN_BYTES;
+                //  The bitblock pool returns element_base + 16-byte header, so it only guarantees 16-byte
+                //      alignment.  Anything stricter goes to the single-arena resource, which honours it.
+                return bytes <= THRESHOLD_BYTES && alignment <= 16;
             }
 
             void *do_allocate(size_t bytes, size_t alignment) override

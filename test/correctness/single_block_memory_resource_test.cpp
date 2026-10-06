@@ -7,6 +7,7 @@
 #include <__memory_resource/single_block_resource.h>
 
 #include <stdio.h>
+#include <string.h>
 
 namespace
 {
@@ -113,4 +114,64 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
     CHECK(resource.current_bytes_allocated() == 50 + 133);
     CHECK(resource.peak_allocated() == 4);
     CHECK(resource.total_deallocations() == 2);
+}
+
+TEST(SingleBlockMemoryResourceTests, SingleBlockResourceDoesNotReuseTooSmallBlock)
+{
+    minstd::pmr::single_block_resource resource(buffer, buffer_size);
+
+    void *ptr1 = resource.allocate(16);
+    void *ptr2 = resource.allocate(16);
+
+    resource.deallocate(ptr1, 16);
+    resource.deallocate(ptr2, 16);
+
+    //  The freed 16-byte blocks are in the reuse bins; a 900-byte request must not be given one of them.
+
+    char *big = static_cast<char *>(resource.allocate(900));
+    char *next = static_cast<char *>(resource.allocate(16));
+
+    CHECK(big != nullptr);
+    CHECK(next != nullptr);
+    CHECK((next >= big + 900) || (next + 16 <= big)); //  before the fix: the two allocations overlap
+
+    memset(big, 0xAB, 900);
+
+    auto alloc_info = resource.get_allocation_info(next);
+
+    CHECK(alloc_info.is_valid);
+    CHECK(alloc_info.in_use);
+    CHECK(alloc_info.size == 16); //  before the fix: header overwritten, size is garbage
+}
+
+TEST(SingleBlockMemoryResourceTests, SingleBlockResourceReusesFittingBlock)
+{
+    minstd::pmr::single_block_resource resource(buffer, buffer_size);
+
+    void *ptr1 = resource.allocate(100);
+    void *ptr2 = resource.allocate(100);
+    (void)ptr2;
+
+    resource.deallocate(ptr1, 100);
+
+    //  A smaller request fits in the freed 100-byte block, so it should be reused
+
+    CHECK_EQUAL(ptr1, resource.allocate(64)); //  before the fix: no reuse at all (bins never link up)
+}
+
+TEST(SingleBlockMemoryResourceTests, SingleBlockResourceHonoursRequestedAlignment)
+{
+    minstd::pmr::single_block_resource resource(buffer, buffer_size);
+
+    for (int i = 0; i < 8; i++)
+    {
+        void *ptr = resource.allocate(24, 64);
+
+        CHECK(ptr != nullptr);
+        CHECK_EQUAL(0, (uintptr_t)ptr % 64);   //  before: 16-aligned only
+
+        auto alloc_info = resource.get_allocation_info(ptr);
+        CHECK(alloc_info.is_valid);
+        CHECK(alloc_info.size == 24);
+    }
 }

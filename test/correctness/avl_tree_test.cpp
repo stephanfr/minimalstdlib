@@ -18,6 +18,8 @@
 #include <__memory_resource/tracking_memory_resource.h>
 #include <single_block_memory_heap>
 
+#include <../shared/poisoning_memory_resource.h>
+
 #include <memory>
 
 #define TEST_BUFFER_SIZE 65536
@@ -868,5 +870,87 @@ namespace
 
         CHECK_EQUAL(0, heap_allocator_resource.bytes_in_use());
         CHECK_EQUAL(0, string_allocator_resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, Testavl_treeEraseLeafDoesNotWriteToFreedNode)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        {
+            avl_tree tree(allocator);
+
+            tree.insert(2, test_element(20));
+            tree.insert(1, test_element(10)); //  leaf, left child of 2
+            tree.insert(3, test_element(30)); //  leaf, right child of 2
+
+            CHECK_EQUAL(1, tree.erase(1));
+            CHECK_EQUAL(1, tree.erase(3));
+
+            CHECK(poisoning_resource.freed_memory_intact());
+        }
+
+        //  The destructor's clear() erases leaves too
+
+        CHECK(poisoning_resource.freed_memory_intact());
+        CHECK_EQUAL(0, poisoning_resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, Testavl_treeReverseIterationAfterTwoChildErase)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        avl_tree tree(allocator);
+
+        const uint32_t keys[] = {5, 3, 8, 2, 7, 9, 10};
+
+        for (uint32_t key : keys)
+        {
+            tree.insert(key, test_element(key));
+        }
+
+        //  5 has two children.  Removing its successor (7) rotates 5's right subtree.
+
+        CHECK_EQUAL(1, tree.erase(5));
+
+        const uint32_t expected[] = {10, 9, 8, 7, 3, 2};
+        size_t count = 0;
+        auto itr = tree.end();
+
+        while (count < 10)
+        {
+            --itr;
+
+            if (itr == tree.end())
+            {
+                break;
+            }
+
+            CHECK_EQUAL(expected[count], get<0>(*itr));
+            count++;
+        }
+
+        CHECK_EQUAL(6, count);
+    }
+
+    TEST(avl_treeTests, Testavl_treeEraseByIteratorReturnsLiveSuccessor)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        avl_tree tree(allocator);
+
+        tree.insert(2, test_element(20));
+        tree.insert(1, test_element(10));
+        tree.insert(3, test_element(30));
+
+        //  2 has two children: erase moves 3's value into 2's node and frees 3's node
+
+        auto next = tree.erase(tree.find(2));
+
+        CHECK(next != tree.end());
+        CHECK_EQUAL(3, get<0>(*next));
+        CHECK_EQUAL(30, get<1>(*next).value());
     }
 }

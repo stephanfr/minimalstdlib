@@ -349,7 +349,7 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         if (value < 0)
         {
-            UnsignedIntToReversedString(buffer, (unsigned_T)-value, format.integer_base().value(), numeric_conversion_digits);
+            UnsignedIntToReversedString(buffer, (unsigned_T)(unsigned_T(0) - (unsigned_T)value), format.integer_base().value(), numeric_conversion_digits);
         }
         else
         {

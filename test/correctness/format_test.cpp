@@ -278,4 +278,14 @@ namespace
         STRCMP_EQUAL("This is a test: {Invalid format string: ':}<'}6} of            \n", minstd::format(formatted_string, "This is a test: {:}<6} {:14}\n", "of", "bad alignment").c_str());
     }
 
+    TEST(FormatTests, MostNegativeIntegers)
+    {
+        minstd::fixed_string<256> formatted_string;
+
+        STRCMP_EQUAL("-9223372036854775808", minstd::format(formatted_string, "{}", (int64_t)INT64_MIN).c_str());
+        STRCMP_EQUAL("-2147483648", minstd::format(formatted_string, "{}", (int32_t)INT32_MIN).c_str());
+        STRCMP_EQUAL("-32768", minstd::format(formatted_string, "{}", (int16_t)INT16_MIN).c_str());
+        STRCMP_EQUAL("-128", minstd::format(formatted_string, "{}", (int8_t)INT8_MIN).c_str());
+    }
+
 } // namespace
