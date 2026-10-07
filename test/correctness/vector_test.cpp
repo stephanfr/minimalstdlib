@@ -433,4 +433,9 @@ namespace
 
         CHECK_EQUAL(vec.max_size(), vec.size());
     }
+
+    TEST(VectorTests, VectorIsNotShallowCopyable)
+    {
+        CHECK_FALSE((__is_constructible(uint32t_vector, const uint32t_vector &)));
+    }
 }

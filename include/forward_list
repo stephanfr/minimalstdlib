@@ -66,6 +66,22 @@ namespace MINIMAL_STD_NAMESPACE
         {
         }
 
+        forward_list(const forward_list &) = delete;
+        forward_list &operator=(const forward_list &) = delete;
+
+        ~forward_list()
+        {
+            clear();
+        }
+
+        void clear()
+        {
+            while (front_ != nullptr)
+            {
+                pop_front();
+            }
+        }
+
         [[nodiscard]] bool empty() const noexcept
         {
             return front_ == nullptr;

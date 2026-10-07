@@ -10,6 +10,8 @@
 #include <__memory_resource/polymorphic_allocator.h>
 #include <forward_list>
 
+#include <../shared/poisoning_memory_resource.h>
+
 #define TEST_BUFFER_SIZE 65536
 
 namespace
@@ -208,5 +210,21 @@ namespace
         forward_list_monotonic_allocator monotonic_allocator(&monotonic_resource);
 
         testListFunctionality(monotonic_allocator);
+    }
+
+    TEST(ForwardListTests, DestructorReleasesAllNodes)
+    {
+        minstd::pmr::test::poisoning_memory_resource resource;
+        forward_list_static_heap_allocator allocator(&resource);
+
+        {
+            test_element_forward_list list(allocator);
+
+            list.push_front(test_element(1));
+            list.push_front(test_element(2));
+            list.emplace_front(3);
+        }
+
+        CHECK_EQUAL(0, resource.bytes_in_use()); //  before: 3 nodes' worth
     }
 }

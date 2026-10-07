@@ -99,6 +99,35 @@ namespace
         }
     };
 
+    template <typename T>
+    class guarded_allocator : public minstd::allocator<T>
+    {
+    public:
+        static constexpr unsigned char GUARD = 0xA5;
+
+        size_t max_size() const noexcept override { return 64; }
+
+        T *allocate(size_t n) override
+        {
+            memset(storage_, GUARD, sizeof(storage_));
+            return reinterpret_cast<T *>(storage_);
+        }
+
+        void deallocate(T *, size_t) override {}
+
+        bool guard_intact(size_t n) const
+        {
+            for (size_t i = sizeof(T) * n; i < sizeof(storage_); i++)
+            {
+                if (storage_[i] != GUARD) { return false; }
+            }
+            return true;
+        }
+
+    private:
+        alignas(T) unsigned char storage_[sizeof(T) * 8];
+    };
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
     TEST_GROUP(FailurePolicyTests)
@@ -181,5 +210,19 @@ namespace
         STRCMP_EQUAL("allocation_failure", g_failure_event.reason);
         STRCMP_EQUAL("MINIMAL_STD_OUT_OF_MEMORY", g_failure_event.message);
         CHECK(contains_text(g_failure_event.file, "include/lockfree/spsc_queue"));
+    }
+
+    TEST(FailurePolicyTests, VectorEmplaceBackWhenFullDoesNotOverflow)
+    {
+        guarded_allocator<uint32_t> allocator;
+        minstd::vector<uint32_t> v(allocator, 2);
+
+        v.emplace_back(1u);
+        v.emplace_back(2u);
+        v.emplace_back(3u); //  contract violation is logged; must not write element [2]
+
+        CHECK_EQUAL(1, g_failure_event.call_count);
+        CHECK_EQUAL(2u, v.size());
+        CHECK(allocator.guard_intact(2)); //  before: bytes 8..11 overwritten with 3
     }
 }

@@ -800,6 +800,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     //  Allocate exactly in order, then deallocate the tail blocks from multiple
     //  threads to stress the frontier reclaim path (try_reclaim_frontier_blocks).
 
+    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
+
     //  Use a single shard so pending maintenance is deterministic in this correctness test.
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -906,6 +908,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
         }
     }
 
+    minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
+
     CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
@@ -914,6 +918,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
 {
     //  Regression guard for packed block-state transitions when metadata is
     //  repeatedly recycled and reused across maintenance windows.
+
+    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
 
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -970,6 +976,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
                 resource.deallocate(flush_ptrs[i], flush_size);
             }
         }
+
+        minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
 
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
@@ -1075,4 +1083,88 @@ TEST(LockfreeSingleArenaMemoryResourceTests, MetadataTrimStress)
     //  Metadata count should not have grown unboundedly
     size_t final_metadata = resource.extended_metrics().metadata_count();
     CHECK(final_metadata <= NUM_BLOCKS);
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentChurnFullBlockIntegrity)
+{
+    //  Like ConcurrentAllocDeallocChurn, but every byte of every block is patterned and verified, so a
+    //      stray write anywhere inside a live allocation is caught.  Mixed sizes and LIFO-heavy frees keep
+    //      the frontier advancing and rolling back.  Probabilistic before the fix: loop it (see below).
+
+    constexpr size_t NUM_THREADS = 8;
+    constexpr size_t CYCLES_PER_THREAD = 20000;
+
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
+
+    struct args_type
+    {
+        minstd::pmr::memory_resource *resource;
+        minstd::atomic<bool> *go;
+        uint32_t thread_id;
+        minstd::atomic<uint32_t> *corruptions;
+    };
+
+    auto fn = [](void *arg) -> void *
+    {
+        auto *a = static_cast<args_type *>(arg);
+        while (!a->go->load(minstd::memory_order_acquire)) {}
+
+        uint64_t rng = a->thread_id * 0x9E3779B97F4A7C15ULL;
+        void *held[4] = {};
+        size_t held_size[4] = {};
+
+        for (size_t i = 0; i < CYCLES_PER_THREAD; ++i)
+        {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            const size_t slot = (rng >> 40) & 3;
+            const size_t size = ((rng >> 33) & 1) ? 64 + ((rng >> 20) % 192) : 1024 + ((rng >> 20) % 3072);
+            const unsigned char pattern = static_cast<unsigned char>((a->thread_id << 4) ^ i);
+
+            if (held[slot] != nullptr)
+            {
+                const unsigned char *bytes = static_cast<unsigned char *>(held[slot]);
+                const unsigned char expected = bytes[0];
+                for (size_t b = 0; b < held_size[slot]; ++b)
+                {
+                    if (bytes[b] != expected) { a->corruptions->fetch_add(1); break; }
+                }
+                a->resource->deallocate(held[slot], held_size[slot]);
+                held[slot] = nullptr;
+            }
+
+            void *ptr = a->resource->allocate(size);
+            if (ptr != nullptr)
+            {
+                memset(ptr, pattern, size);
+                held[slot] = ptr;
+                held_size[slot] = size;
+            }
+        }
+
+        for (size_t slot = 0; slot < 4; ++slot)
+        {
+            if (held[slot] != nullptr) { a->resource->deallocate(held[slot], held_size[slot]); }
+        }
+        return nullptr;
+    };
+
+    minstd::atomic<bool> go{false};
+    minstd::atomic<uint32_t> corruptions{0};
+    args_type args[NUM_THREADS];
+    pthread_t threads[NUM_THREADS];
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        args[t] = {&resource, &go, static_cast<uint32_t>(t + 1), &corruptions};
+        CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, fn, &args[t]));
+    }
+
+    go.store(true, minstd::memory_order_release);
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        pthread_join(threads[t], nullptr);
+    }
+
+    CHECK_EQUAL(0u, corruptions.load()); //  before (expected, probabilistic): > 0 on a multi-core host
 }

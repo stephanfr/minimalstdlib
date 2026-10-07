@@ -58,3 +58,9 @@ ASAN_SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefi
 ASAN_CPP_FLAGS := $(TEST_CFLAGS) $(ASAN_SANITIZE_FLAGS)
 ASAN_OPTIMIZATION_FLAGS := -O1 -fno-omit-frame-pointer
 ASAN_LDFLAGS := $(ASAN_SANITIZE_FLAGS)
+
+TSAN_SANITIZE_FLAGS := -fsanitize=thread
+TSAN_CPP_FLAGS := $(TEST_CFLAGS) $(TSAN_SANITIZE_FLAGS)
+TSAN_OPTIMIZATION_FLAGS := -O1 -fno-omit-frame-pointer
+# -no-pie keeps segment addresses below TSan's shadow region when mmap_rnd_bits=32
+TSAN_LDFLAGS := $(TSAN_SANITIZE_FLAGS) -no-pie

@@ -76,6 +76,9 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
+        vector(const vector &) = delete;
+        vector(vector &&) = delete;
+
         ~vector()
         {
             if (minstd::is_class<T>::value)
@@ -245,6 +248,19 @@ namespace MINIMAL_STD_NAMESPACE
         {
             MINIMAL_STD_ASSERT(size() < max_size());
             MINIMAL_STD_ASSERT(size() < current_allocated_size_);
+
+            if (size() >= max_size() || size() >= current_allocated_size_)
+            {
+                //  Never write past the buffer, even when the failure policy lets the assert return.
+                //      The return type cannot signal failure, so hand back the last element unchanged.
+
+                if (begin_ == end_)
+                {
+                    __builtin_trap();
+                }
+
+                return *(end_ - 1);
+            }
 
             T *new_node = end_;
             allocator_traits_type::construct(allocator_, end_, minstd::forward<Args>(args)...);

@@ -84,7 +84,6 @@ namespace MINIMAL_STD_NAMESPACE
         private:
             void *do_allocate(size_t bytes, size_t alignment) override
             {
-                //  B2: the payload must meet the requested alignment, never less than our default
                 const size_t effective_alignment = (alignment > DEFAULT_ALIGNMENT) ? alignment : DEFAULT_ALIGNMENT;
 
                 //  If the total number of deallocations is greater than 10% of the total number of allocations, then
@@ -98,7 +97,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     for (size_t i = 0; i < NUM_DEALLOCATION_BINS; i++)
                     {
-                        if (bytes + BLOCK_HEADER_SIZE <= DEALLOCATION_BIN_SIZES[i])                         //  C4 (a)
+                        if (bytes + BLOCK_HEADER_SIZE <= DEALLOCATION_BIN_SIZES[i])
                         {
                             deallocation_bin = i;
                             break;
@@ -112,10 +111,10 @@ namespace MINIMAL_STD_NAMESPACE
 
                     while (current->next_deallocated_.load(memory_order_acquire) != nullptr) //  The last block is the end_of_list_marker_ so we don't want to use that one
                     {
-                        block_header *next = current->next_deallocated_.load(memory_order_acquire);        //  C4 (c)
+                        block_header *next = current->next_deallocated_.load(memory_order_acquire);
                         void *return_value = (uint8_t *)current + BLOCK_HEADER_SIZE;
 
-                        if (!current->in_use_ &&                                                            //  C4 (c) + B2  <-- HERE
+                        if (!current->in_use_ &&
                             (current->actual_size_ >= bytes + BLOCK_HEADER_SIZE) &&
                             (((uintptr_t)return_value % effective_alignment) == 0))
                         {
@@ -137,7 +136,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                             return return_value;
                         }
-                        else if (current->in_use_)                                                          //  C4 (c)
+                        else if (current->in_use_)
                         {
                             //  If the block is in use, then we need to remove it from the deallocated list.
 
@@ -164,8 +163,7 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     block_header *next_block = next_empty_block_.load(memory_order_acquire);
 
-                    //  B2: pad in front of the header so the payload meets the requested alignment.
-                    //      At the default alignment there is no padding.
+                    //  At the default alignment there is no padding.
 
                     void *returned_pointer = align_pointer((char *)next_block + BLOCK_HEADER_SIZE, effective_alignment);
                     block_header *header = (block_header *)((char *)returned_pointer - BLOCK_HEADER_SIZE);
@@ -183,8 +181,8 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         header->in_use_ = true;
                         header->requested_size_ = bytes;
-                        header->actual_size_ = (char *)block_following_next_block - (char *)header;                 //  C4 (b), from header
-                        header->next_deallocated_.store(nullptr, memory_order_relaxed);                             //  C4 (b)
+                        header->actual_size_ = (char *)block_following_next_block - (char *)header;
+                        header->next_deallocated_.store(nullptr, memory_order_relaxed);
 
                         //  Add the block to the list of blocks in use
 

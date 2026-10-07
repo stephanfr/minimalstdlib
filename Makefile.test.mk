@@ -27,6 +27,8 @@ COVERAGE_OBJ_DIR    := test/coverage/correctness
 COVERAGE_LIB_OBJ_DIR := test/coverage/lib
 ASAN_OBJ_DIR        := test/build-asan/correctness
 ASAN_LIB_OBJ_DIR    := test/build-asan/lib
+TSAN_OBJ_DIR        := test/build-tsan/correctness
+TSAN_LIB_OBJ_DIR    := test/build-tsan/lib
 
 # ---------------------------------------------------------------------------
 # Executables
@@ -40,6 +42,8 @@ SOAK_EXE        := $(SOAK_OBJ_DIR)/cpputest_soak.exe
 COVERAGE_EXE    := $(COVERAGE_OBJ_DIR)/cpputest_correctness_coverage.exe
 ASAN_CORRECTNESS_EXE          := $(ASAN_OBJ_DIR)/cpputest_correctness_asan.exe
 ASAN_LOCKFREE_CORRECTNESS_EXE := $(ASAN_OBJ_DIR)/cpputest_lockfree_correctness_asan.exe
+TSAN_CORRECTNESS_EXE          := $(TSAN_OBJ_DIR)/cpputest_correctness_tsan.exe
+TSAN_LOCKFREE_CORRECTNESS_EXE := $(TSAN_OBJ_DIR)/cpputest_lockfree_correctness_tsan.exe
 
 # ---------------------------------------------------------------------------
 # Compiler / flag settings
@@ -111,6 +115,10 @@ ASAN_CORRECTNESS_OBJ          := $(patsubst $(CORRECTNESS_OBJ_DIR)/%,$(ASAN_OBJ_
 ASAN_LOCKFREE_CORRECTNESS_OBJ := $(patsubst $(CORRECTNESS_OBJ_DIR)/%,$(ASAN_OBJ_DIR)/%,$(LOCKFREE_CORRECTNESS_OBJ))
 ASAN_LIB_OBJ                  := $(patsubst $(CPP_SRC_DIR)/%.cpp,$(ASAN_LIB_OBJ_DIR)/%.o,$(LIB_SRC))
 
+TSAN_CORRECTNESS_OBJ          := $(patsubst $(CORRECTNESS_OBJ_DIR)/%,$(TSAN_OBJ_DIR)/%,$(CORRECTNESS_OBJ))
+TSAN_LOCKFREE_CORRECTNESS_OBJ := $(patsubst $(CORRECTNESS_OBJ_DIR)/%,$(TSAN_OBJ_DIR)/%,$(LOCKFREE_CORRECTNESS_OBJ))
+TSAN_LIB_OBJ                  := $(patsubst $(CPP_SRC_DIR)/%.cpp,$(TSAN_LIB_OBJ_DIR)/%.o,$(LIB_SRC))
+
 DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 	$(LOCKFREE_CORRECTNESS_OBJ:.o=.d) \
 	$(FAILURE_MODE_OBJ:.o=.d) \
@@ -122,12 +130,15 @@ DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 	$(COVERAGE_LIB_OBJ:.o=.d) \
 	$(ASAN_CORRECTNESS_OBJ:.o=.d) \
 	$(ASAN_LOCKFREE_CORRECTNESS_OBJ:.o=.d) \
-	$(ASAN_LIB_OBJ:.o=.d)
+	$(ASAN_LIB_OBJ:.o=.d) \
+	$(TSAN_CORRECTNESS_OBJ:.o=.d) \
+	$(TSAN_LOCKFREE_CORRECTNESS_OBJ:.o=.d) \
+	$(TSAN_LIB_OBJ:.o=.d)
 
 # ---------------------------------------------------------------------------
 # Phony targets
 # ---------------------------------------------------------------------------
-.PHONY: test test-correctness test-failure-modes test-performance test-performance-host-std test-soak test-coverage clean_test test-correctness-asan
+.PHONY: test test-correctness test-failure-modes test-performance test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
@@ -141,6 +152,10 @@ test-correctness: lib $(CORRECTNESS_EXE) $(LOCKFREE_CORRECTNESS_EXE)
 test-correctness-asan: $(ASAN_CORRECTNESS_EXE) $(ASAN_LOCKFREE_CORRECTNESS_EXE)
 	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_CORRECTNESS_EXE)
 	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_LOCKFREE_CORRECTNESS_EXE)
+
+test-correctness-tsan: $(TSAN_CORRECTNESS_EXE) $(TSAN_LOCKFREE_CORRECTNESS_EXE)
+	setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
+	setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
 
 test-failure-modes: lib $(FAILURE_MODE_EXE)
 	./$(FAILURE_MODE_EXE)
@@ -198,6 +213,12 @@ $(ASAN_CORRECTNESS_EXE): $(ASAN_LIB_OBJ) $(ASAN_CORRECTNESS_OBJ)
 
 $(ASAN_LOCKFREE_CORRECTNESS_EXE): $(ASAN_LIB_OBJ) $(ASAN_LOCKFREE_CORRECTNESS_OBJ)
 	$(LD) $(ASAN_LDFLAGS) $(ASAN_LIB_OBJ) $(ASAN_LOCKFREE_CORRECTNESS_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
+
+$(TSAN_CORRECTNESS_EXE): $(TSAN_LIB_OBJ) $(TSAN_CORRECTNESS_OBJ)
+	$(LD) $(TSAN_LDFLAGS) $(TSAN_LIB_OBJ) $(TSAN_CORRECTNESS_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
+
+$(TSAN_LOCKFREE_CORRECTNESS_EXE): $(TSAN_LIB_OBJ) $(TSAN_LOCKFREE_CORRECTNESS_OBJ)
+	$(LD) $(TSAN_LDFLAGS) $(TSAN_LIB_OBJ) $(TSAN_LOCKFREE_CORRECTNESS_OBJ) $(LDLIBS) $(TEST_LIB) -o $@
 
 # ---------------------------------------------------------------------------
 # Compile rules — correctness
@@ -288,11 +309,23 @@ $(ASAN_LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
 	@/bin/mkdir -p $(ASAN_LIB_OBJ_DIR)
 	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(ASAN_OPTIMIZATION_FLAGS) $(ASAN_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
 
+$(TSAN_OBJ_DIR)/%.o: $(CORRECTNESS_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(TSAN_OBJ_DIR)
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TSAN_OPTIMIZATION_FLAGS) $(TSAN_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
+
+$(TSAN_OBJ_DIR)/shared_%.o: $(SHARED_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(TSAN_OBJ_DIR)
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TSAN_OPTIMIZATION_FLAGS) $(TSAN_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
+
+$(TSAN_LIB_OBJ_DIR)/%.o: $(CPP_SRC_DIR)/%.cpp
+	@/bin/mkdir -p $(TSAN_LIB_OBJ_DIR)
+	$(CC) $(INCLUDE_DIRS) $(CPP_FLAGS) $(TSAN_OPTIMIZATION_FLAGS) $(TSAN_CPP_FLAGS) $(CDEFINES) $(DEPFLAGS) -c $< -o $@
+
 # ---------------------------------------------------------------------------
 # Clean
 # ---------------------------------------------------------------------------
 clean_test:
-	/bin/rm -rf test/build test/build-asan test/coverage > /dev/null 2> /dev/null || true
+	/bin/rm -rf test/build test/build-asan test/build-tsan test/coverage > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(CORRECTNESS_OBJ_DIR) > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(FAILURE_MODE_OBJ_DIR) > /dev/null 2> /dev/null || true
 	/bin/mkdir -p $(PERFORMANCE_OBJ_DIR) > /dev/null 2> /dev/null || true

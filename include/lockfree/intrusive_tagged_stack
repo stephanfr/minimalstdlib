@@ -23,6 +23,22 @@ namespace MINIMAL_STD_NAMESPACE
             using storage_type = typename tagged_ptr_type::storage_type;
             using counter_type = typename tagged_ptr_type::counter_type;
 
+            static_assert(sizeof(link_type) == 1 || sizeof(link_type) == 2 || sizeof(link_type) == 4 || sizeof(link_type) == 8,
+                          "intrusive_tagged_stack: link_type must be accessible with a single atomic load/store");
+
+            //  The link of a node can be read by a stale popper while its new owner rewrites it.  The tagged CAS on
+            //      head discards such stale reads, but the accesses themselves must be atomic to be defined.
+
+            static link_type load_link(const node_type &node) noexcept
+            {
+                return __atomic_load_n(&(node.*next_field), __ATOMIC_RELAXED);
+            }
+
+            static void store_link(node_type &node, link_type link) noexcept
+            {
+                __atomic_store_n(&(node.*next_field), link, __ATOMIC_RELAXED);
+            }
+
             template <typename adapter_type, typename backoff_type>
             static void push(atomic<storage_type> &head,
                              node_type &node,
@@ -34,7 +50,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 while (true)
                 {
-                    node.*next_field = adapter.to_link(tagged_ptr_type::unpack_ptr(current_tag));
+                    store_link(node, adapter.to_link(tagged_ptr_type::unpack_ptr(current_tag)));
 
                     storage_type desired_tag = tagged_ptr_type::pack(
                         &node,
@@ -70,9 +86,7 @@ namespace MINIMAL_STD_NAMESPACE
                         return nullptr;
                     }
 
-                    storage_type next_tag = tagged_ptr_type::pack(
-                        adapter.to_node(current->*next_field),
-                        static_cast<counter_type>(tagged_ptr_type::unpack_counter(current_tag) + 1));
+                    storage_type next_tag = tagged_ptr_type::pack( adapter.to_node(load_link(*current)), static_cast<counter_type>(tagged_ptr_type::unpack_counter(current_tag) + 1));
 
                     if (head.compare_exchange_strong(
                             current_tag,
@@ -80,7 +94,7 @@ namespace MINIMAL_STD_NAMESPACE
                             memory_order_acq_rel,
                             memory_order_acquire))
                     {
-                        current->*next_field = adapter.to_link(nullptr);
+                        store_link(*current, adapter.to_link(nullptr));
                         return current;
                     }
 
