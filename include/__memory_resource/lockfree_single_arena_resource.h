@@ -871,7 +871,7 @@ namespace MINIMAL_STD_NAMESPACE
                 while (true)
                 {
                     MINIMAL_STD_ASSERT(current >= stolen_count);
-                    
+
                     size_t updated = (current > stolen_count) ? (current - stolen_count) : 0;
 
                     if (pending_shards_[target_shard].count_.compare_exchange_weak(
@@ -1258,10 +1258,11 @@ namespace MINIMAL_STD_NAMESPACE
 
                 {
                     interrupt_guard_type guard;
+                    
+                    pending_shards_[target_shard].count_.add_fetch(1, memory_order_acq_rel);
                     free_block_stack::push(pending_shards_[target_shard].head_, *block_to_deallocate, get_adapter(), [this](size_t &retries)
                                            { this->back_off(retries); });
                 }
-                pending_shards_[target_shard].count_.add_fetch(1, memory_order_acq_rel);
 
                 maybe_open_maintenance_window(target_shard, false);
 
