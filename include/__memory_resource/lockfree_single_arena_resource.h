@@ -1314,7 +1314,6 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     //  Load the current frontier
                     uint64_t frontier_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    block_header *frontier_ptr = unpack_frontier(frontier_tag);
 
                     //  Follow previous_block_ to find the predecessor.  It is only a hint: an allocator may have
                     //      advanced the frontier without yet publishing the back-link, leaving a stale value here.

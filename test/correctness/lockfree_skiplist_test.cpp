@@ -751,4 +751,143 @@ namespace
         }
         CHECK_EQUAL(7, count);
     }
+
+    TEST(SkiplistTests, ConcurrentInsertRemoveOfSameKeysReclaimsEveryNode)
+    {
+        //  Threads insert and remove the same few keys.  Once the list is emptied and every level has been
+        //      helped, every node that was successfully inserted must have been reclaimed.  A node that
+        //      insert() published at an upper level after remove() retired it, or that was skipped by a stale
+        //      upper-level successor, is never unlinked at level 0 and is missing from nodes_reclaimed().
+
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14, minstd::skiplist_extensions::skiplist_statistics>;
+
+        constexpr uint32_t NUM_THREADS = 8;
+        constexpr uint32_t NUM_KEYS = 16;
+        constexpr uint32_t OPS_PER_THREAD = 100000;
+
+        list_type list;
+        list.reset_statistics();
+
+        struct args_type
+        {
+            list_type *list;
+            minstd::atomic<bool> *go;
+            minstd::atomic<uint32_t> *inserted;
+            uint64_t seed;
+        };
+
+        auto worker = [](void *arg) -> void *
+        {
+            auto *a = static_cast<args_type *>(arg);
+
+            while (!a->go->load(minstd::memory_order_acquire))
+            {
+            }
+
+            uint64_t rng = a->seed;
+
+            for (uint32_t i = 0; i < OPS_PER_THREAD; ++i)
+            {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                const uint32_t key = static_cast<uint32_t>((rng >> 33) % NUM_KEYS) + 1;
+
+                if (((rng >> 62) & 1) != 0)
+                {
+                    if (a->list->insert(key, key))
+                    {
+                        a->inserted->fetch_add(1);
+                    }
+                }
+                else
+                {
+                    a->list->remove(key);
+                }
+            }
+
+            return nullptr;
+        };
+
+        minstd::atomic<bool> go{false};
+        minstd::atomic<uint32_t> inserted{0};
+        args_type args[NUM_THREADS];
+        pthread_t threads[NUM_THREADS];
+
+        for (uint32_t t = 0; t < NUM_THREADS; ++t)
+        {
+            args[t] = {&list, &go, &inserted, 0x9E3779B97F4A7C15ULL * (t + 1)};
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, &args[t]));
+        }
+
+        go.store(true, minstd::memory_order_release);
+
+        for (uint32_t t = 0; t < NUM_THREADS; ++t)
+        {
+            pthread_join(threads[t], nullptr);
+        }
+
+        for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+        {
+            list.remove(key);
+        }
+
+        //  Help every level unlink, and let every CPU slot reclaim what it retired.
+        for (uint32_t round = 0; round < 64; ++round)
+        {
+            for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+            {
+                list.find(key);
+            }
+
+            for (size_t slot = 0; slot < SKIPLIST_STRESS_MAX_THREADS; ++slot)
+            {
+                list.advance_and_reclaim(slot);
+            }
+        }
+
+        CHECK_EQUAL(0u, list.size());
+        CHECK_EQUAL(inserted.load(), list.nodes_reclaimed()); //  before: fewer (stranded nodes)
+    }
+
+    TEST(SkiplistTests, SharedSlotReclaimThrottleIsRaceFree)
+    {
+        //  Several threads drive the throttle of ONE slot, as threads on one CPU (or an interrupt handler and
+        //      the code it interrupted) do through skip_list::remove().
+        using state_type = minstd::cpu_slot_policy_state<int, 16, 4>;
+
+        static state_type state;
+        state.initialize(0, 1);
+
+        constexpr size_t NUM_THREADS = 4;
+        constexpr size_t ITERATIONS = 100000;
+
+        auto worker = [](void *arg) -> void *
+        {
+            const bool freeing = (reinterpret_cast<uintptr_t>(arg) & 1) != 0;
+
+            for (size_t i = 0; i < ITERATIONS; ++i)
+            {
+                state.increment_reclaim_throttle();
+
+                if (state.reclaim_throttle_triggered())
+                {
+                    state.adapt_reclaim_throttle(freeing ? 1 : 0, freeing); //  before: TSan data race on the period
+                }
+            }
+
+            return nullptr;
+        };
+
+        pthread_t threads[NUM_THREADS];
+        for (uintptr_t t = 0; t < NUM_THREADS; ++t)
+        {
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, reinterpret_cast<void *>(t)));
+        }
+        for (auto &thread : threads)
+        {
+            pthread_join(thread, nullptr);
+        }
+
+        const uint32_t period = state.reclaim_throttle_period();
+        CHECK(period >= 4 && period <= 16);
+    }
 }

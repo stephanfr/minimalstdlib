@@ -1178,7 +1178,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {
@@ -1246,7 +1246,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {
@@ -1393,7 +1393,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                                     succ = curr->next_node[0].get(is_tombstoned);
 
-                                    if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                    if (upper_levels_drained(tombstoned_node))
                                     {
                                         if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                         {
@@ -1446,12 +1446,30 @@ namespace MINIMAL_STD_NAMESPACE
                                 pred = preds[level];
                                 succ = succs[level];
 
+                                //  Reserve the link before it can become visible, so a remover that reads the counter
+                                //      after this point leaves level 0 linked.  See upper_levels_drained().
+                                new_node->upper_levels_remaining_.fetch_add(1, memory_order_seq_cst);
+                                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                                //  Re-aim our own link at the current successor (it was set once, before the level-0
+                                //      link, and is stale after a retry).  This CAS fails if a remover has tombstoned the
+                                //      link: then the node is being removed and must not be published any higher.
+                                bool own_link_tombstoned = false;
+                                skip_node *own_next = new_node->next_node[level].get(own_link_tombstoned);
+
+                                if (own_link_tombstoned || ((own_next != succ) && !new_node->next_node[level].compare_exchange_strong(own_next, succ)))
+                                {
+                                    new_node->upper_levels_remaining_.fetch_sub(1, memory_order_acq_rel);
+                                    return true; //  inserted at level 0; a concurrent remove() owns it now
+                                }
+
                                 if (pred->next_node[level].compare_exchange_strong(succ, new_node))
                                 {
-                                    new_node->upper_levels_remaining_.fetch_add(1, memory_order_release);
                                     insert_upper_level_backoff = 0;
                                     break;
                                 }
+
+                                new_node->upper_levels_remaining_.fetch_sub(1, memory_order_acq_rel);
 
                                 ++upper_level_retry_count;
 
@@ -1536,7 +1554,7 @@ namespace MINIMAL_STD_NAMESPACE
                             {
                                 // this thread soft deleted the node
 
-                                if (node_to_remove->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(node_to_remove))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(node_to_remove, succ))
                                     {
@@ -1593,7 +1611,7 @@ namespace MINIMAL_STD_NAMESPACE
                                     curr = succ;
                                     succ = curr->next_node[0].get(is_tombstoned);
 
-                                    if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                    if (upper_levels_drained(tombstoned_node))
                                     {
                                         if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                         {
@@ -1798,6 +1816,12 @@ namespace MINIMAL_STD_NAMESPACE
                 size_t retries = backoff_state;
                 platform::default_platform_provider::back_off(retries);
                 backoff_state = static_cast<uint32_t>((retries < BACKOFF_MAX_RELAX_SPINS) ? retries : BACKOFF_MAX_RELAX_SPINS);
+            }
+
+            static bool upper_levels_drained(skip_node *node)
+            {
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                return node->upper_levels_remaining_.load(memory_order_acquire) <= 0;
             }
 
             void retire_node(skip_node *node, size_t cpu_slot)
@@ -2185,7 +2209,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {
