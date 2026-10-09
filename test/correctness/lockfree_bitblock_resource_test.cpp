@@ -8,6 +8,8 @@
 #include <__memory_resource/single_block_resource.h>
 #include <stdint.h>
 
+#include <../shared/process_isolation.h>
+
 namespace
 {
 #pragma GCC diagnostic push
@@ -119,4 +121,20 @@ TEST(LockfreeBitblockResourceTests, BlocksAreCacheLineAligned)
 
     CHECK(recorder.allocation_count() >= 3);
     CHECK(recorder.all_cache_line_aligned());   //  before: blocks are 16-aligned (48 mod 64)
+}
+
+TEST(LockfreeBitblockResourceTests, FailedUpstreamAllocationIsSurvivable)
+{
+    CHECK(minstd::pmr::test::runs_to_completion([]
+    {
+        class failing_resource : public minstd::pmr::memory_resource
+        {
+            void *do_allocate(size_t, size_t) override { return nullptr; }
+            void do_deallocate(void *, size_t, size_t) override {}
+            bool do_is_equal(const minstd::pmr::memory_resource &o) const noexcept override { return this == &o; }
+        } upstream;
+
+        minstd::pmr::lockfree_bitblock_resource<64, 1024, 4, 8> resource(&upstream, 2);
+        if (resource.allocate(32, 16) != nullptr) _exit(1);
+    })); //  before: child segfaults in the constructor
 }

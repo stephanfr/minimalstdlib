@@ -103,6 +103,44 @@ namespace
         char empty_space_[18];
     };
 
+    struct move_clearing_key //  like a string: a move empties the source
+    {
+        int value;
+
+        move_clearing_key(int v) : value(v) {}
+        move_clearing_key(const move_clearing_key &other) = default;
+        move_clearing_key(move_clearing_key &&other) : value(other.value) { other.value = -1; }
+        move_clearing_key &operator=(const move_clearing_key &other) = default;
+        move_clearing_key &operator=(move_clearing_key &&other) { value = other.value; other.value = -1; return *this; }
+
+        bool operator<(const move_clearing_key &other) const { return value < other.value; }
+        bool operator>(const move_clearing_key &other) const { return value > other.value; }
+        bool operator==(const move_clearing_key &other) const { return value == other.value; }
+    };
+
+    struct move_to_end_key
+    {
+        static constexpr int MOVED_FROM = 0x7fffffff;
+
+        int value;
+
+        move_to_end_key(int v) : value(v) {}
+        move_to_end_key(const move_to_end_key &other) = default;
+        move_to_end_key(move_to_end_key &&other) : value(other.value) { other.value = MOVED_FROM; }
+        move_to_end_key &operator=(const move_to_end_key &other) = default;
+        move_to_end_key &operator=(move_to_end_key &&other)
+        {
+            value = other.value;
+            other.value = MOVED_FROM;
+            return *this;
+        }
+
+        bool operator<(const move_to_end_key &other) const { return value < other.value; }
+        bool operator>(const move_to_end_key &other) const { return value > other.value; }
+        bool operator==(const move_to_end_key &other) const { return value == other.value; }
+    };
+
+
     using avl_tree = minstd::avl_tree<uint32_t, test_element>;
 
     using avl_treeAllocator = minstd::allocator<avl_tree::node_type>;
@@ -952,5 +990,72 @@ namespace
         CHECK(next != tree.end());
         CHECK_EQUAL(3, get<0>(*next));
         CHECK_EQUAL(30, get<1>(*next).value());
+    }
+
+    TEST(avl_treeTests, TwoChildEraseWithNonTrivialKey)
+    {
+        using tree_type = minstd::avl_tree<move_clearing_key, int>;
+
+        minstd::pmr::test::poisoning_memory_resource resource;
+        minstd::pmr::polymorphic_allocator<tree_type::node_type> allocator(&resource);
+
+        {
+            tree_type tree(allocator);
+
+            for (int key = 1; key <= 7; ++key) //  balanced: 4 is the root with two children
+            {
+                tree.insert(move_clearing_key(key), key * 10);
+            }
+
+            CHECK_EQUAL(1u, tree.erase(move_clearing_key(4)));
+            CHECK_EQUAL(6u, tree.size()); //  before: 7
+
+            const int expected[] = {1, 2, 3, 5, 6, 7};
+            size_t i = 0;
+            for (auto itr = tree.begin(); itr != tree.end(); ++itr, ++i)
+            {
+                CHECK(i < 6);
+                CHECK_EQUAL(expected[i], minstd::get<0>(*itr).value); //  before: a -1 key appears
+                CHECK_EQUAL(expected[i] * 10, minstd::get<1>(*itr));
+            }
+            CHECK_EQUAL(6u, i);
+        }
+
+        CHECK_EQUAL(0u, resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, TwoChildEraseFindsTheSuccessorByAnIntactKey)
+    {
+        using tree_type = minstd::avl_tree<move_to_end_key, int>;
+
+        minstd::pmr::test::poisoning_memory_resource resource;
+        minstd::pmr::polymorphic_allocator<tree_type::node_type> allocator(&resource);
+
+        {
+            tree_type tree(allocator);
+
+            for (int key = 1; key <= 7; ++key) //  balanced: 4 is the root, its successor 5 is a leaf under 6
+            {
+                tree.insert(move_to_end_key(key), key * 10);
+            }
+
+            CHECK_EQUAL(1u, tree.erase(move_to_end_key(4)));
+            CHECK_EQUAL(6u, tree.size()); //  before: 7 - the successor node was not found, so not removed
+
+            const int expected[] = {1, 2, 3, 5, 6, 7};
+            size_t i = 0;
+            for (auto itr = tree.begin(); itr != tree.end(); ++itr, ++i)
+            {
+                if (i >= 6)
+                {
+                    break; //  before: a 7th element (the stale successor) is still in the tree
+                }
+                CHECK_EQUAL(expected[i], minstd::get<0>(*itr).value);
+                CHECK_EQUAL(expected[i] * 10, minstd::get<1>(*itr));
+            }
+            CHECK_EQUAL(6u, i);
+        }
+
+        CHECK_EQUAL(0u, resource.bytes_in_use());
     }
 }

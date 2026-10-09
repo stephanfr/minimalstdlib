@@ -490,12 +490,17 @@ namespace MINIMAL_STD_NAMESPACE
 
                     node_type *subtree_front = find_front(subtree_root->right_);
 
-                    subtree_root->value_ = minstd::move(subtree_front->value_);
+                    //  Keep the successor's key intact until its node is gone: the erase below finds it by key.
+                    //      Take a copy of the key and only move the mapped value out.
+
+                    key_type successor_key = subtree_front->key();
+                    mapped_type successor_value = minstd::move(get<1>(subtree_front->value_));
 
                     //  Delete the ordered successor
 
-                    subtree_root->set_right(erase_recursive(subtree_root->right_, subtree_front->key()));
-                }
+                    subtree_root->set_right(erase_recursive(subtree_root->right_, successor_key));
+
+                    subtree_root->value_ = value_type(minstd::move(successor_key), minstd::move(successor_value));                }
             }
 
             if (subtree_root == nullptr)

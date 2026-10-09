@@ -109,6 +109,16 @@ namespace MINIMAL_STD_NAMESPACE
 
                     block *current_block = first_block_.load(memory_order_acquire);
 
+                    if (current_block == nullptr)
+                    {
+                        if (!add_new_block(cap_reached))
+                        {
+                            return nullptr;
+                        }
+
+                        current_block = first_block_.load(memory_order_acquire);
+                    }
+
                     minstd::optional<size_t> allocation;
 
                     while (!allocation.has_value())
@@ -224,18 +234,33 @@ namespace MINIMAL_STD_NAMESPACE
                 : upstream_resource_(memory_resource),
                   number_of_arenas_(clamp_arena_count(number_of_arenas))
             {
+                size_t blocks_created = 0;
+
                 for (size_t i = 0; i < number_of_arenas_; i++)
                 {
                     arenas_[i].upstream_resource_ = memory_resource;
                     arenas_[i].parent_ = this;
                     arenas_[i].arena_index_ = i;
-                    auto initial_block = new (upstream_resource_->allocate(sizeof(block), alignof(block))) block();
+                    arenas_[i].first_block_.store(nullptr, memory_order_relaxed);
+                    arenas_[i].block_count_ = 0;
+
+                    void *block_space = upstream_resource_->allocate(sizeof(block), alignof(block));
+
+                    if (block_space == nullptr)
+                    {
+                        //  Leave this arena empty; do_allocate() adds a block when memory becomes available.
+                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block), continue);
+                    }
+
+                    auto initial_block = new (block_space) block();
                     initial_block->arena_index_ = i;
+
                     arenas_[i].first_block_.store(initial_block, memory_order_release);
                     arenas_[i].block_count_ = 1;
+                    blocks_created++;
                 }
 
-                total_blocks_.store(number_of_arenas_, memory_order_release);
+                total_blocks_.store(blocks_created, memory_order_release);
             }
 
             ~lockfree_bitblock_resource()
