@@ -101,6 +101,11 @@ namespace MINIMAL_STD_NAMESPACE
         {
             size_t elements_appended = min(buffer_size_ - size_, elements_to_append);
 
+            if (elements_appended == 0)
+            {
+                return 0; //  also skips memcpy with a null buffer (failed allocation), which is undefined even for 0 bytes
+            }
+
             memcpy(buffer_ + size_, block_to_append, elements_appended * sizeof(T));
 
             size_ += elements_appended;
@@ -220,6 +225,11 @@ namespace MINIMAL_STD_NAMESPACE
         size_t append(const T *block_to_append, size_t elements_to_append) override
         {
             size_t elements_appended = min(buffer_size_ - size_, elements_to_append);
+
+            if (elements_appended == 0)
+            {
+                return 0; //  also skips memcpy with a null buffer (failed allocation), which is undefined even for 0 bytes
+            }
 
             memcpy(buffer_ + size_, block_to_append, elements_appended * sizeof(T));
 
