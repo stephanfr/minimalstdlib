@@ -154,7 +154,7 @@ namespace MINIMAL_STD_NAMESPACE
                         }
                     }
 
-                    allocation_hint_.store(current_block, memory_order_relaxed);
+                    allocation_hint_.store(current_block, memory_order_release);
                     return parent_->finalize_allocation(current_block, allocation.value(), num_elements);
                 }
 
@@ -173,7 +173,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                         if (allocation.has_value())
                         {
-                            allocation_hint_.store(current_block, memory_order_relaxed);
+                            allocation_hint_.store(current_block, memory_order_release);
                             return parent_->finalize_allocation(current_block, allocation.value(), num_elements);
                         }
 
@@ -344,8 +344,8 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 uint64_t core_id = platform::get_cpu_id();
                 size_t hint_index = core_id % MAX_NUMBER_OF_ARENAS;
-                core_hints_[hint_index].last_block.store(blk, memory_order_relaxed);
-                arenas_[blk->arena_index_].allocation_hint_.store(blk, memory_order_relaxed);
+                core_hints_[hint_index].last_block.store(blk, memory_order_release);
+                arenas_[blk->arena_index_].allocation_hint_.store(blk, memory_order_release);
             }
 
             static size_t clamp_arena_count(size_t requested) noexcept
@@ -398,7 +398,10 @@ namespace MINIMAL_STD_NAMESPACE
                 //  In churn workloads, the preceding deallocation stored the freed block here,
                 //  so this path provides O(1) allocation in the common case.
 
-                block *hint_blk = core_hints_[hint_index].last_block.load(memory_order_relaxed);
+                //  Hints are published release / read acquire: this thread may never have loaded first_block_
+                //      since the hinted block was constructed, and it reads the block's plain fields below.
+
+                block *hint_blk = core_hints_[hint_index].last_block.load(memory_order_acquire);
 
                 if (hint_blk != nullptr && hint_blk->arena_index_ == arena_in_use)
                 {
@@ -406,7 +409,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (allocation.has_value())
                     {
-                        arenas_[arena_in_use].allocation_hint_.store(hint_blk, memory_order_relaxed);
+                        arenas_[arena_in_use].allocation_hint_.store(hint_blk, memory_order_release);
                         return finalize_allocation(hint_blk, allocation.value(), num_elements);
                     }
                 }
@@ -415,7 +418,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  This catches cases where a different core freed space in the arena's
                 //  most recently successful block.
 
-                hint_blk = arenas_[arena_in_use].allocation_hint_.load(memory_order_relaxed);
+                hint_blk = arenas_[arena_in_use].allocation_hint_.load(memory_order_acquire);
 
                 if (hint_blk != nullptr)
                 {
@@ -423,7 +426,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (allocation.has_value())
                     {
-                        core_hints_[hint_index].last_block.store(hint_blk, memory_order_relaxed);
+                        core_hints_[hint_index].last_block.store(hint_blk, memory_order_release);
                         return finalize_allocation(hint_blk, allocation.value(), num_elements);
                     }
                 }
@@ -437,7 +440,7 @@ namespace MINIMAL_STD_NAMESPACE
                 if (result != nullptr)
                 {
                     block *successful_blk = block_from_allocation(result);
-                    core_hints_[hint_index].last_block.store(successful_blk, memory_order_relaxed);
+                    core_hints_[hint_index].last_block.store(successful_blk, memory_order_release);
                     return result;
                 }
 
@@ -456,7 +459,7 @@ namespace MINIMAL_STD_NAMESPACE
                     if (other_result != nullptr)
                     {
                         block *successful_blk = block_from_allocation(other_result);
-                        core_hints_[hint_index].last_block.store(successful_blk, memory_order_relaxed);
+                        core_hints_[hint_index].last_block.store(successful_blk, memory_order_release);
                         return other_result;
                     }
                 }
