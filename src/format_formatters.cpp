@@ -237,7 +237,10 @@ namespace FMT_FORMATTERS_NAMESPACE
     {
         static uint64_t const pow10[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000};
 
-        uint64_t decimal_multiplier = pow10[minstd::min(format.precision().value(), (uint32_t)8)];
+        const uint32_t precision = format.precision().value();
+        const uint32_t computed_digits = minstd::min(precision, (uint32_t)8);
+
+        uint64_t decimal_multiplier = pow10[computed_digits];
 
         uint64_t decimals;
         uint64_t units;
@@ -261,19 +264,31 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         size_t start_of_number = buffer.size();
 
-        for (size_t i = 0; i < format.precision().value(); i++)
+        //  Digits are emitted in reverse.  Digits beyond the 8 we compute are trailing zeros, so they come first.
+
+        for (size_t i = computed_digits; i < precision; i++)
+        {
+            buffer.push_back('0');
+        }
+
+        for (size_t i = 0; i < computed_digits; i++)
         {
             buffer.push_back((decimals % 10) + '0');
             decimals /= 10;
         }
 
-        buffer.push_back('.');
+        if (precision > 0)
+        {
+            buffer.push_back('.');
+        }
 
-        while (units > 0)
+        //  At least one units digit, so values below 1 get their leading zero
+
+        do
         {
             buffer.push_back((units % 10) + '0');
             units /= 10;
-        }
+        } while (units > 0);
 
         //  Align, pad and unreverse the number
 

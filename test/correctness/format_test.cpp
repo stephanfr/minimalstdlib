@@ -313,4 +313,16 @@ namespace
         STRCMP_EQUAL("7    ", minstd::format(buffer, "{:<5}", (int32_t)7).c_str()); //  unsigned case unchanged
         STRCMP_EQUAL("   -1", minstd::format(buffer, "{:>5}", (int32_t)-1).c_str());
     }
+
+    TEST(FormatTests, FloatingPointEdgeCases)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("0.5000", minstd::format(buffer, "{}", 0.5).c_str());                   //  before: ".5000"
+        STRCMP_EQUAL("-0.2500", minstd::format(buffer, "{}", -0.25).c_str());                //  before: "-.2500"
+        STRCMP_EQUAL("0.5000000000", minstd::format(buffer, "{:.10}", 0.5).c_str());         //  before: zeros before the 5
+        STRCMP_EQUAL("1.2500000000", minstd::format(buffer, "{:.10}", 1.25).c_str());
+        STRCMP_EQUAL("3", minstd::format(buffer, "{:.0}", 3.0).c_str());                     //  before: "3."
+        STRCMP_EQUAL("12.75", minstd::format(buffer, "{:.2}", 12.75).c_str());
+    }
 }
