@@ -15,7 +15,7 @@ CC := gcc
 LD := g++
 AR := ar
 CPREPROCESSOR := cpp
-C_FLAGS := -Wall -fno-exceptions -fno-unwind-tables
+C_FLAGS := -Wall -Werror=invalid-memory-model -fno-exceptions -fno-unwind-tables
 CPP_FLAGS := $(C_FLAGS) -std=c++20 -fno-rtti
 OPTIMIZATION_FLAGS := -O2
 LDFLAGS :=
