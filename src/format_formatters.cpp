@@ -213,7 +213,9 @@ namespace FMT_FORMATTERS_NAMESPACE
         //  If the width is specified and the number of characters is less than the width
         //      then we have to add fill characters for either left or center alignment.
 
-        number_length = (buffer.size() - start_of_number) + ( sign[0] != 0 ? 1 : 0 );
+        //  The sign, any prefix and any leading fill are in the buffer now, so do not count the sign again.
+
+        number_length = buffer.size() - start_of_number;
 
         if (format.width().has_value() && (format.width().value() > number_length))
         {

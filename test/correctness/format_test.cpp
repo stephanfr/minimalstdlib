@@ -300,4 +300,17 @@ namespace
         //  A '}' in the fill position is still rejected (an invalid placeholder consumes no argument)
         STRCMP_EQUAL("{Invalid format string: ':}<'}6} a", minstd::format(formatted_string, "{:}<6} {}", "a", "x").c_str());
     }
+
+    TEST(FormatTests, SignedLeftAndCenterAlignmentHonourWidth)
+    {
+        //  The trailing-fill pass counted the sign twice (it is already in the buffer by then).
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("-1   ", minstd::format(buffer, "{:<5}", (int32_t)-1).c_str()); //  before: "-1  "
+        STRCMP_EQUAL(" -1  ", minstd::format(buffer, "{:^5}", (int32_t)-1).c_str());
+        STRCMP_EQUAL("+7   ", minstd::format(buffer, "{:<+5}", (int32_t)7).c_str());
+        STRCMP_EQUAL("-2.50  ", minstd::format(buffer, "{:<7.2}", -2.5).c_str());
+        STRCMP_EQUAL("7    ", minstd::format(buffer, "{:<5}", (int32_t)7).c_str()); //  unsigned case unchanged
+        STRCMP_EQUAL("   -1", minstd::format(buffer, "{:>5}", (int32_t)-1).c_str());
+    }
 }
