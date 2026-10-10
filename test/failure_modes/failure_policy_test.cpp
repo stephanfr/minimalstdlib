@@ -7,6 +7,7 @@
 #include <minstdconfig.h>
 
 #include <lockfree/spsc_queue>
+#include <vector>
 
 #include <stddef.h>
 #include <stdint.h>
