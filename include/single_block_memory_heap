@@ -270,7 +270,8 @@ namespace MINIMAL_STD_NAMESPACE
                 }
                 else
                 {
-                    bytes_allocated_but_unused_ -= block_size_in_bytes;
+                    //  The whole block is reused, and deallocation will add back its whole size
+                    bytes_allocated_but_unused_ -= best_fit_block.header->block_size_;
                     blocks_allocated_but_unused_--;
                 }
 
