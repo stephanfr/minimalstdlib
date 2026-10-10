@@ -209,6 +209,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 MINIMAL_STD_ASSERT(block_ != nullptr);
                 MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
+                MINIMAL_STD_ASSERT((block_size_ / DEFAULT_ALIGNMENT) < NO_PREDECESSOR); //  frontier words hold 32-bit unit offsets (256 GiB)
 
                 uint8_t *current_ptr = static_cast<uint8_t *>(internal::align_pointer(block, DEFAULT_ALIGNMENT));
 
@@ -298,7 +299,6 @@ namespace MINIMAL_STD_NAMESPACE
 
         private:
             using metadata_tag = lockfree::tagged_ptr<block_metadata, uint16_t>;
-            using block_tag = lockfree::tagged_ptr<block_header, uint16_t>;
 
             static constexpr uint32_t NO_PREDECESSOR = 0xFFFFFFFFu;
 
@@ -1377,8 +1377,7 @@ namespace MINIMAL_STD_NAMESPACE
                     //  Load the current frontier
                     uint64_t frontier_tag = next_empty_memory_block_.load(memory_order_acquire);
 
-                    //  Follow previous_block_ to find the predecessor.  It is only a hint: an allocator may have
-                    //      advanced the frontier without yet publishing the back-link, leaving a stale value here.
+                    //  The predecessor comes from the frontier word, so it is the block that ends at the frontier.
                     block_header *prev = unpack_predecessor(frontier_tag);
 
                     if (prev == nullptr)
@@ -1468,7 +1467,7 @@ namespace MINIMAL_STD_NAMESPACE
                     interrupt_guard_type guard;
 
                     uint64_t current_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    current = block_tag::unpack_ptr(current_tag);
+                    current = unpack_frontier(current_tag);
 
                     size_t retries = 0;
 
@@ -1481,7 +1480,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                         //  If the next block intrudes into the metadata area, then we are out of memory so return null
 
-                        if ((uintptr_t)next >= (uintptr_t)metadata_start_ - ((current_metadata_record_count_.load(memory_order_acquire) + 1) * ALLOCATION_METADATA_SIZE))
+                        if (frontier_overlaps_metadata(next))
                         {
                             return nullptr;
                         }
@@ -1534,8 +1533,8 @@ namespace MINIMAL_STD_NAMESPACE
                     } while (true);
 
                     //  The CAS succeeded: we own [current, next) and next is the new frontier.  Record our size, then
-                    //      publish the back-link.  A reclaimer that looks at next before this store sees a stale hint
-                    //      and rejects it in its adjacency check (current is not AVAILABLE).
+                    //      the back-link.  The predecessor is published in the frontier word itself; this back-link is
+                    //      read only after the block is claimed.
 
                     __atomic_store_n(&current->size_including_header_, reinterpret_cast<uintptr_t>(next) - reinterpret_cast<uintptr_t>(current), __ATOMIC_RELAXED);
                     current->previous_block_.store(unpack_predecessor(current_tag), memory_order_relaxed);
