@@ -8,6 +8,8 @@
 #include <__memory_resource/single_block_resource.h>
 #include <stdint.h>
 
+#include "../shared/process_isolation.h"
+
 namespace
 {
 #pragma GCC diagnostic push
@@ -91,4 +93,42 @@ TEST(MonotonicBufferResourceTests, TestRelease)
     // single_block_resource doesn't reclaim memory technically on deallocate,
     // but the monotonic release should have properly forwarded deallocate to it 
     // (We mainly test that it doesn't crash here)
+}
+
+TEST(MonotonicBufferResourceTests, ZeroInitialSizeDoesNotHang)
+{
+    //  next_buffer_size_ started at 0, and doubling 0 never reaches the required size.
+    CHECK(minstd::pmr::test::runs_to_completion([]
+                                                {
+                                                    alignas(16) static char upstream_buf[4096];
+                                                    minstd::pmr::single_block_resource upstream(upstream_buf, sizeof(upstream_buf));
+                                                    minstd::pmr::monotonic_buffer_resource r(0, &upstream);
+                                                    if (r.allocate(16, 8) == nullptr) _exit(1); })); //  before: child killed by the watchdog
+}
+
+TEST(MonotonicBufferResourceTests, HugeRequestFailsInsteadOfHanging)
+{
+    //  Doubling the block size for a request near SIZE_MAX wrapped to 0 and looped forever.
+    CHECK(minstd::pmr::test::runs_to_completion([]
+                                                {
+                                                    alignas(16) static char upstream_buf[4096];
+                                                    minstd::pmr::single_block_resource upstream(upstream_buf, sizeof(upstream_buf));
+                                                    minstd::pmr::monotonic_buffer_resource r(64, &upstream);
+                                                    if (r.allocate(SIZE_MAX - 64, 8) != nullptr) _exit(1); }));
+}
+
+TEST(MonotonicBufferResourceTests, ReleaseRestoresInitialBuffer)
+{
+    alignas(16) char stack_buf[64];
+    alignas(16) char upstream_buf[4096];
+    minstd::pmr::single_block_resource upstream(upstream_buf, sizeof(upstream_buf));
+    minstd::pmr::monotonic_buffer_resource r(stack_buf, sizeof(stack_buf), &upstream);
+
+    void *first = r.allocate(32, 8);
+    CHECK((uintptr_t)first >= (uintptr_t)stack_buf && (uintptr_t)first < (uintptr_t)stack_buf + sizeof(stack_buf));
+
+    r.release();
+    void *second = r.allocate(32, 8);
+
+    CHECK_EQUAL(first, second); //  before: second comes from upstream
 }
