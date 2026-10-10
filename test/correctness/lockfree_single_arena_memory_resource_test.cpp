@@ -1180,7 +1180,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
     //      instructions wide, so this does not reliably fail without the fix (see MetaFrontier.tla).
 
     constexpr size_t NUM_THREADS = 16;
-    constexpr size_t ARENA_SIZE = 256 * 1024;
+    constexpr size_t ARENA_SIZE = 1024 * 1024; //  room for the metadata managers (256 KiB of records each); 256 KiB has none
+                                               //      and every allocation fails
     constexpr size_t ROUNDS = 300;
     constexpr size_t MAX_HELD = 512;
 
@@ -1192,6 +1193,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
         minstd::atomic<uint32_t> ready;
         minstd::atomic<uint32_t> round;
         minstd::atomic<uint32_t> corruptions;
+        minstd::atomic<uint64_t> allocations;
+        minstd::atomic<uint32_t> rounds_filled; //  rounds in which the arena ran out (the frontier met the metadata)
     };
 
     struct args_type
@@ -1204,6 +1207,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
     shared.ready.store(0);
     shared.round.store(0);
     shared.corruptions.store(0);
+    shared.allocations.store(0);
+    shared.rounds_filled.store(0);
 
     auto fn = [](void *arg) -> void *
     {
@@ -1231,6 +1236,13 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
                 held[count] = ptr;
                 held_size[count] = size;
                 ++count;
+            }
+
+            a->shared->allocations.fetch_add(count, minstd::memory_order_relaxed);
+
+            if ((count < MAX_HELD) && (a->thread_id == 1))
+            {
+                a->shared->rounds_filled.fetch_add(1, minstd::memory_order_relaxed);
             }
 
             for (size_t i = 0; i < count; ++i)
@@ -1279,4 +1291,54 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
     }
 
     CHECK_EQUAL(0u, shared.corruptions.load());
+
+    //  The test means something only if blocks were handed out and the arena was filled to the boundary.
+    CHECK(shared.allocations.load() > ROUNDS * 1000);
+    CHECK(shared.rounds_filled.load() > ROUNDS / 2);
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, MetadataStaysInsideAnArenaWhoseEndIsNotAligned)
+{
+    //  The metadata region started at the arena end rounded UP to 64 bytes, so when the end was not 64-byte aligned
+    //      the top metadata record lay up to 63 bytes past the arena.  (ASan reported it as a global-buffer-overflow
+    //      in SkiplistTests, whose 2 MiB arena happened to end 32 bytes past a 64-byte boundary.)
+
+    struct guarded_arena
+    {
+        alignas(64) unsigned char arena[1024 * 1024 + 32]; //  ends 32 bytes past a 64-byte boundary; large enough for
+                                                           //  the metadata managers (256 KiB of records each)
+        unsigned char canary[64];
+    };
+
+    static guarded_arena storage;
+
+    memset(storage.canary, 0xA5, sizeof(storage.canary));
+
+    //  Fill the arena on a thread of its own: the test CPU-id provider keeps a per-thread call count, and thousands
+    //      of calls on the main thread would shift when later tests see their CPU id refresh.
+    static size_t allocations;
+    allocations = 0;
+
+    auto fill = [](void *) -> void *
+    {
+        lockfree_single_arena_resource_without_stats resource(storage.arena, sizeof(storage.arena), 2);
+
+        while ((resource.allocate(64) != nullptr) && (allocations < 100000))
+        {
+            allocations++;
+        }
+
+        return nullptr;
+    };
+
+    pthread_t thread;
+    CHECK_EQUAL(0, pthread_create(&thread, nullptr, fill, nullptr));
+    pthread_join(thread, nullptr);
+
+    CHECK(allocations > 1000); //  the frontier must reach the metadata region
+
+    for (size_t i = 0; i < sizeof(storage.canary); i++)
+    {
+        CHECK_EQUAL(0xA5, storage.canary[i]); //  before: the top metadata record overwrote the first 32 bytes
+    }
 }

@@ -193,7 +193,7 @@ namespace MINIMAL_STD_NAMESPACE
                                                          size_t cpu_shards = DEFAULT_CPU_SHARDS)
                 : block_(block),
                   block_size_(block_size),
-                  metadata_start_(static_cast<block_metadata *>(internal::align_pointer((char *)block + block_size, 64)) - 1),
+                  metadata_start_(reinterpret_cast<block_metadata *>(((uintptr_t)block + block_size) & ~(uintptr_t)(ALLOCATION_METADATA_SIZE - 1)) - 1), //  round the end DOWN: the top record must lie inside the arena
                   next_empty_memory_block_(0), // Will be set after allocating per-CPU arrays
                   current_metadata_record_count_(0),
                   block_managers_(nullptr),
