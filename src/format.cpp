@@ -338,8 +338,28 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t opening_brace = strcspn(fmt + i, "{");
 
-            buffer.append(fmt + i, opening_brace);
+            //  Literal text; '}}' is an escaped '}'
+
+            for (size_t j = 0; j < opening_brace; j++)
+            {
+                buffer.push_back(fmt[i + j]);
+
+                if ((fmt[i + j] == '}') && (j + 1 < opening_brace) && (fmt[i + j + 1] == '}'))
+                {
+                    j++;
+                }
+            }
+
             i += opening_brace + 1;
+
+            //  '{{' is an escaped '{'
+
+            if ((i < format_string_length) && (fmt[i] == '{'))
+            {
+                buffer.push_back('{');
+                i++;
+                continue;
+            }
 
             if (i >= format_string_length)
             {

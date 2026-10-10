@@ -325,4 +325,14 @@ namespace
         STRCMP_EQUAL("3", minstd::format(buffer, "{:.0}", 3.0).c_str());                     //  before: "3."
         STRCMP_EQUAL("12.75", minstd::format(buffer, "{:.2}", 12.75).c_str());
     }
+
+    TEST(FormatTests, EscapedBraces)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("{literal}", minstd::format(buffer, "{{literal}}").c_str());
+        STRCMP_EQUAL("{7}", minstd::format(buffer, "{{{}}}", (int32_t)7).c_str());
+        STRCMP_EQUAL("a{b}c 1 }", minstd::format(buffer, "a{{b}}c {} }}", (int32_t)1).c_str());
+        STRCMP_EQUAL("end{", minstd::format(buffer, "end{{").c_str());
+    }
 }
