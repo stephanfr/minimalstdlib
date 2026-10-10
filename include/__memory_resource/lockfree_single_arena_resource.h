@@ -668,6 +668,68 @@ namespace MINIMAL_STD_NAMESPACE
                 platform_provider_type::back_off(retries);
             }
 
+            //  True if a frontier at `next` leaves less than one record of slack below the metadata region.  The
+            //      same test is used before and after the frontier CAS.
+            bool frontier_overlaps_metadata(const block_header *next) const
+            {
+                return (uintptr_t)next >= (uintptr_t)metadata_start_ - ((current_metadata_record_count_.load(memory_order_acquire) + 1) * ALLOCATION_METADATA_SIZE);
+            }
+
+            enum class metadata_growth_result
+            {
+                GROWN,   //  current_count is the new record's index
+                RETRY,   //  the count moved; current_count holds its new value
+                NO_ROOM  //  the new record would reach the frontier
+            };
+
+            //  Adds record `current_count` to the metadata region.  The caller holds an active slot on the record's
+            //      manager, so a trim cannot shrink the count below our record.  No lock: like the frontier side, a
+            //      conflict is resolved by the top record undoing its CAS, so a signal or interrupt handler that grows
+            //      the metadata while the code it interrupted is mid-way through this never waits on that code.
+            metadata_growth_result grow_metadata_region(size_t &current_count)
+            {
+                const uintptr_t new_metadata_end = (uintptr_t)metadata_start_ - ((current_count + 1) * ALLOCATION_METADATA_SIZE);
+
+                block_header *frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
+
+                if ((frontier != nullptr) && (new_metadata_end <= (uintptr_t)frontier))
+                {
+                    return metadata_growth_result::NO_ROOM;
+                }
+
+                if (!current_metadata_record_count_.compare_exchange_strong(current_count, current_count + 1, memory_order_acq_rel, memory_order_acquire))
+                {
+                    return metadata_growth_result::RETRY;
+                }
+
+                //  A frontier allocation may have checked the old count and advanced into our record.  Re-check now
+                //      that our growth is visible; pairs with the fence in get_next_empty_memory_block().
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                size_t retries = 0;
+
+                while (true)
+                {
+                    frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
+
+                    if ((frontier == nullptr) || (new_metadata_end > (uintptr_t)frontier))
+                    {
+                        return metadata_growth_result::GROWN;
+                    }
+
+                    //  Overlap: give the record back, but only from the top.  A record above ours overlaps too and is
+                    //      backing off the same way; the frontier allocation that overlaps us undoes its block, and
+                    //      then the overlap is gone and we keep the record.
+                    size_t grown = current_count + 1;
+                    if (current_metadata_record_count_.compare_exchange_strong(grown, current_count, memory_order_acq_rel, memory_order_acquire))
+                    {
+                        return metadata_growth_result::NO_ROOM;
+                    }
+
+                    back_off(retries);
+                }
+            }
+
             void recycle_metadata(block_metadata &metadata)
             {
                 //  Clear pointer and move metadata back to METADATA_AVAILABLE.
@@ -1431,6 +1493,36 @@ namespace MINIMAL_STD_NAMESPACE
 
                         if (next_empty_memory_block_.compare_exchange_strong(current_tag, new_tag, memory_order_acq_rel, memory_order_acquire))
                         {
+                            //  The count we checked may be stale: metadata can have grown between our check and our CAS.
+                            //      Re-check now that our advance is visible.  Pairs with the fence in
+                            //      grow_metadata_region(): (store; seq_cst fence; load) on both sides means at least
+                            //      one of the two sees the other and backs off.
+                            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                            if (!frontier_overlaps_metadata(next))
+                            {
+                                break;
+                            }
+
+                            //  Overlap: give the block back.  We can only roll the frontier back while our block is
+                            //      on top; a block above ours overlaps too and is backing off the same way.  A trim
+                            //      that shrinks the metadata region can remove the overlap, and then we keep the block.
+                            while (true)
+                            {
+                                uint64_t expected = new_tag;
+                                if (next_empty_memory_block_.compare_exchange_strong(expected, current_tag, memory_order_acq_rel, memory_order_acquire))
+                                {
+                                    return nullptr;
+                                }
+
+                                if (!frontier_overlaps_metadata(next))
+                                {
+                                    break;
+                                }
+
+                                back_off(retries);
+                            }
+
                             break;
                         }
 
@@ -1509,22 +1601,20 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     // Ensure the new metadata record doesnt overwrite a dynamically allocated block
-                    uintptr_t new_metadata_end_ptr = (uintptr_t)metadata_start_ - ((current_count + 1) * ALLOCATION_METADATA_SIZE);
-                    uint64_t current_empty_block_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    block_header *empty_block = unpack_frontier(current_empty_block_tag);
+                    const metadata_growth_result grown = grow_metadata_region(current_count);
 
-                    if (empty_block != nullptr && new_metadata_end_ptr <= (uintptr_t)empty_block)
-                    {
-                        manager.release_active_slot();
-                        return NULL_INDEX;
-                    }
-
-                    if (current_metadata_record_count_.compare_exchange_weak(current_count, current_count + 1, memory_order_acq_rel, memory_order_acquire))
+                    if (grown == metadata_growth_result::GROWN)
                     {
                         break;
                     }
 
                     manager.release_active_slot();
+
+                    if (grown == metadata_growth_result::NO_ROOM)
+                    {
+                        return NULL_INDEX;
+                    }
+
                     if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
                     {
                         this->record_metadata_cas_retry();

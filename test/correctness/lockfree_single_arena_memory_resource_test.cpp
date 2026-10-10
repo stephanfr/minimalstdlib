@@ -13,6 +13,7 @@
 
 #include <array>
 #include <pthread.h>
+#include <sched.h>
 #include <random>
 #include <time.h>
 #include <stdio.h>
@@ -1167,4 +1168,115 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentChurnFullBlockIntegrity)
     }
 
     CHECK_EQUAL(0u, corruptions.load()); //  before (expected, probabilistic): > 0 on a multi-core host
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderConcurrentFill)
+{
+    //  K16: the block region grows up from the frontier and the metadata region grows down; each side checked
+    //      the other and then CASed its own word without re-checking.  Many threads filling an empty arena at
+    //      once make metadata growth and frontier advances race all the way to the meeting point.  A block that
+    //      overlaps a metadata record is corrupted by the allocator (or corrupts the record): every block is
+    //      patterned and checked.  Regression coverage for the boundary protocol: the race window is a few
+    //      instructions wide, so this does not reliably fail without the fix (see MetaFrontier.tla).
+
+    constexpr size_t NUM_THREADS = 16;
+    constexpr size_t ARENA_SIZE = 256 * 1024;
+    constexpr size_t ROUNDS = 300;
+    constexpr size_t MAX_HELD = 512;
+
+    alignas(64) static char arena[ARENA_SIZE];
+
+    struct shared_state
+    {
+        minstd::pmr::memory_resource *resource;
+        minstd::atomic<uint32_t> ready;
+        minstd::atomic<uint32_t> round;
+        minstd::atomic<uint32_t> corruptions;
+    };
+
+    struct args_type
+    {
+        shared_state *shared;
+        uint32_t thread_id;
+    };
+
+    static shared_state shared;
+    shared.ready.store(0);
+    shared.round.store(0);
+    shared.corruptions.store(0);
+
+    auto fn = [](void *arg) -> void *
+    {
+        auto *a = static_cast<args_type *>(arg);
+        static thread_local void *held[MAX_HELD];
+        static thread_local size_t held_size[MAX_HELD];
+
+        for (uint32_t round = 1; round <= ROUNDS; ++round)
+        {
+            while (a->shared->round.load(minstd::memory_order_acquire) < round) { sched_yield(); }
+
+            const unsigned char pattern = static_cast<unsigned char>((a->thread_id << 4) ^ round);
+            size_t count = 0;
+
+            //  Fill: small blocks, so nearly every allocation also takes a fresh metadata record.
+            while (count < MAX_HELD)
+            {
+                const size_t size = 64 + ((count * 37 + a->thread_id * 11) % 128);
+                void *ptr = a->shared->resource->allocate(size);
+                if (ptr == nullptr)
+                {
+                    break;
+                }
+                memset(ptr, pattern, size);
+                held[count] = ptr;
+                held_size[count] = size;
+                ++count;
+            }
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                const unsigned char *bytes = static_cast<const unsigned char *>(held[i]);
+                for (size_t b = 0; b < held_size[i]; ++b)
+                {
+                    if (bytes[b] != pattern)
+                    {
+                        a->shared->corruptions.fetch_add(1);
+                        break;
+                    }
+                }
+            }
+
+            //  Blocks are not freed: the next round starts from a fresh resource on the same buffer.
+            a->shared->ready.fetch_add(1, minstd::memory_order_acq_rel);
+        }
+
+        return nullptr;
+    };
+
+    args_type args[NUM_THREADS];
+    pthread_t threads[NUM_THREADS];
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        args[t] = {&shared, static_cast<uint32_t>(t + 1)};
+        CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, fn, &args[t]));
+    }
+
+    for (uint32_t round = 1; round <= ROUNDS; ++round)
+    {
+        memset(arena, 0, sizeof(arena));
+        lockfree_single_arena_resource_without_stats resource(arena, sizeof(arena), 4);
+        shared.resource = &resource;
+        shared.ready.store(0, minstd::memory_order_release);
+        shared.round.store(round, minstd::memory_order_release);
+
+        while (shared.ready.load(minstd::memory_order_acquire) < NUM_THREADS) { sched_yield(); }
+    }
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        pthread_join(threads[t], nullptr);
+    }
+
+    CHECK_EQUAL(0u, shared.corruptions.load());
 }
