@@ -167,11 +167,11 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if (best_fit) {
                     if (best_fit_prev) {
-                        best_fit_prev->next = best_fit->next;
+                        stack_type::store_link(*best_fit_prev, best_fit->next);
                     } else {
                         stolen_list = best_fit->next;
                     }
-                    best_fit->next = nullptr;
+                    stack_type::store_link(*best_fit, nullptr);
                 }
 
                 // Put remainder back into the same bin
@@ -196,7 +196,6 @@ namespace MINIMAL_STD_NAMESPACE
 
                 free_block_node* node = static_cast<free_block_node*>(p);
                 node->size = rounded_bytes;
-                node->next = nullptr;
 
                 adapter_type adapter;
                 backoff_type backoff;
