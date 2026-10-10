@@ -176,6 +176,6 @@ namespace MINIMAL_STD_NAMESPACE
     template <typename T, typename... TValues>
     constexpr auto make_array(TValues &&...values) -> minstd::array<T, sizeof...(TValues)>
     {
-        return {minstd::forward<T>(values)...};
+        return {static_cast<T>(minstd::forward<TValues>(values))...};
     }
 }
