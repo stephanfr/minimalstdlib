@@ -198,17 +198,14 @@ namespace MINIMAL_STD_NAMESPACE
         {
             map_entry_iterator entry_iter = cache_entry_map_.find(key);
 
-            //  The entry exists, so move it to the front of the entry list, update the map and return a reference to the entry
+            //  The entry exists, so move it to the front of the entry list and return a reference to the entry
 
             if (entry_iter != cache_entry_map_.end())
             {
                 T &entry = get<1>(*entry_iter)->value_;
 
+                //  move_front() relinks the same list node, so the iterator stored in the map stays valid.
                 cache_entries_.move_front(get<1>(*entry_iter));
-
-                cache_entry_map_.erase(entry_iter);
-
-                cache_entry_map_.insert(key, cache_entries_.begin());
 
                 cache_hits_++;
 
