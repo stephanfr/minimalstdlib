@@ -288,4 +288,16 @@ namespace
         STRCMP_EQUAL("-128", minstd::format(formatted_string, "{}", (int8_t)INT8_MIN).c_str());
     }
 
-} // namespace
+    TEST(FormatTests, ClosingBraceFollowedByAlignmentCharacter)
+    {
+        //  Any '}' followed by '<', '>' or '^' was rejected as a fill character, so "<{}>" could not be formatted.
+        minstd::fixed_string<256> formatted_string;
+
+        STRCMP_EQUAL("<abc>", minstd::format(formatted_string, "<{}>", "abc").c_str()); //  before: <{Invalid format string: '}>'}
+        STRCMP_EQUAL("x=1>0", minstd::format(formatted_string, "x={}>0", (int32_t)1).c_str());
+        STRCMP_EQUAL("[  7]^", minstd::format(formatted_string, "[{:>3}]^", (int32_t)7).c_str());
+
+        //  A '}' in the fill position is still rejected (an invalid placeholder consumes no argument)
+        STRCMP_EQUAL("{Invalid format string: ':}<'}6} a", minstd::format(formatted_string, "{:}<6} {}", "a", "x").c_str());
+    }
+}

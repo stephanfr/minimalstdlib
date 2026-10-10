@@ -359,11 +359,14 @@ namespace MINIMAL_STD_NAMESPACE
                 break;
             }
 
-            //   Insure the closing brace is not where the fill character is expected
+            //   Insure the closing brace is not where the fill character is expected: a '}' directly after the ':'
+            //      and followed by an alignment character.  A '}' that ends a placeholder may be followed by anything.
 
-            if ((fmt[i + closing_brace + 1] == '<') ||
-                (fmt[i + closing_brace + 1] == '>') ||
-                (fmt[i + closing_brace + 1] == '^'))
+            if ((closing_brace > 0) &&
+                (fmt[i + closing_brace - 1] == ':') &&
+                ((fmt[i + closing_brace + 1] == '<') ||
+                 (fmt[i + closing_brace + 1] == '>') ||
+                 (fmt[i + closing_brace + 1] == '^')))
             {
                 buffer += "{Invalid format string: '";
                 buffer.append(fmt + i, closing_brace + 2);
