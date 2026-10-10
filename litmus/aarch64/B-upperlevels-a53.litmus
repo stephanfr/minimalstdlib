@@ -1,0 +1,12 @@
+AArch64 B-upperlevels-a53
+{
+0:X0=remaining; 0:X1=ownlink;
+1:X0=remaining; 1:X1=ownlink;
+}
+P0                         | P1                         ;
+LDAXR W7,[X0]              | MOV W9,#1                  ;
+ADD W8,W7,#1               | LDAXR W2,[X1]              ;
+STLXR W6,W8,[X0]           | STLXR W5,W9,[X1]           ;
+DMB ISH                    | DMB ISH                    ;
+LDAR W4,[X1]               | LDAR W4,[X0]               ;
+exists (0:X6=0 /\ 1:X2=0 /\ 1:X5=0 /\ 0:X4=0 /\ 1:X4=0)

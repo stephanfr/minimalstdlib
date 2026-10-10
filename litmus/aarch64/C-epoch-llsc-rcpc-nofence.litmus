@@ -1,0 +1,14 @@
+AArch64 C-epoch-llsc-rcpc-nofence
+{
+link=1;
+0:X0=depth; 0:X1=link; 0:X2=epoch;
+1:X0=depth; 1:X1=link;
+}
+P0                         | P1                         ;
+LDAXR W7,[X0]              | MOV W9,#2                  ;
+ADD W8,W7,#1               | LDAXR W2,[X1]              ;
+STLXR W6,W8,[X0]           | STLXR W5,W9,[X1]           ;
+MOV W3,#5                  | LDAPR W4,[X0]               ;
+STLR W3,[X2]               |                            ;
+LDAPR W4,[X1]               |                            ;
+exists (0:X6=0 /\ 1:X2=1 /\ 1:X5=0 /\ 0:X4=1 /\ 1:X4=0)
