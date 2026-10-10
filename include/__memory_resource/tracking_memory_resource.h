@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 
+#include "atomic"
 #include "memory_resource.h"
 
 namespace MINIMAL_STD_NAMESPACE
@@ -24,6 +25,9 @@ namespace MINIMAL_STD_NAMESPACE
         //  When wrapping a monotonic_buffer_resource the upstream never
         //  reclaims, but the tracking counters still reflect the logical
         //  allocate/deallocate balance issued by the container under test.
+        //
+        //  The counters are atomic (relaxed), so the resource can be shared by
+        //  threads if its upstream can.
         //
 
         class tracking_memory_resource : public memory_resource
@@ -43,10 +47,10 @@ namespace MINIMAL_STD_NAMESPACE
             tracking_memory_resource(const tracking_memory_resource &) = delete;
             tracking_memory_resource &operator=(const tracking_memory_resource &) = delete;
 
-            size_t bytes_in_use() const noexcept { return bytes_in_use_; }
-            size_t total_bytes_allocated() const noexcept { return total_bytes_allocated_; }
-            size_t allocation_count() const noexcept { return allocation_count_; }
-            size_t deallocation_count() const noexcept { return deallocation_count_; }
+            size_t bytes_in_use() const noexcept { return bytes_in_use_.load(memory_order_relaxed); }
+            size_t total_bytes_allocated() const noexcept { return total_bytes_allocated_.load(memory_order_relaxed); }
+            size_t allocation_count() const noexcept { return allocation_count_.load(memory_order_relaxed); }
+            size_t deallocation_count() const noexcept { return deallocation_count_.load(memory_order_relaxed); }
 
             memory_resource *upstream_resource() const noexcept { return upstream_; }
 
@@ -56,9 +60,9 @@ namespace MINIMAL_STD_NAMESPACE
                 void *p = upstream_->allocate(bytes, alignment);
                 if (p != nullptr)
                 {
-                    bytes_in_use_ += bytes;
-                    total_bytes_allocated_ += bytes;
-                    ++allocation_count_;
+                    bytes_in_use_.fetch_add(bytes, memory_order_relaxed);
+                    total_bytes_allocated_.fetch_add(bytes, memory_order_relaxed);
+                    allocation_count_.fetch_add(1, memory_order_relaxed);
                 }
                 return p;
             }
@@ -66,8 +70,8 @@ namespace MINIMAL_STD_NAMESPACE
             void do_deallocate(void *p, size_t bytes, size_t alignment) override
             {
                 upstream_->deallocate(p, bytes, alignment);
-                bytes_in_use_ -= bytes;
-                ++deallocation_count_;
+                bytes_in_use_.fetch_sub(bytes, memory_order_relaxed);
+                deallocation_count_.fetch_add(1, memory_order_relaxed);
             }
 
             bool do_is_equal(const memory_resource &other) const noexcept override
@@ -76,10 +80,10 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
             memory_resource *upstream_;
-            size_t bytes_in_use_;
-            size_t total_bytes_allocated_;
-            size_t allocation_count_;
-            size_t deallocation_count_;
+            atomic<size_t> bytes_in_use_;
+            atomic<size_t> total_bytes_allocated_;
+            atomic<size_t> allocation_count_;
+            atomic<size_t> deallocation_count_;
         };
     }
 }
