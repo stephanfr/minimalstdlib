@@ -354,4 +354,36 @@ namespace
         CHECK(test_string.size() == 20);
         CHECK(test_string == "0123456789abcdefghij");
     }
+
+    TEST(FixedStringTests, OutOfRangeWriteDoesNotPersist)
+    {
+        //  Out of range, operator[] returned the const EMPTY_CHARACTER member through a const_cast, so a stray
+        //      write changed what every later out-of-range read and back() of an empty string returned.
+        minstd::fixed_string<16> str("abc");
+
+        str[10] = 'Z'; //  out of range
+
+        CHECK_EQUAL(0, str[20]); //  before: 'Z'
+        CHECK_EQUAL(0, static_cast<const minstd::fixed_string<16> &>(str)[20]);
+
+        str.clear();
+        CHECK_EQUAL(0, str.back()); //  before: 'Z'
+        STRCMP_EQUAL("", str.c_str());
+    }
+
+    TEST(FixedStringTests, AppendFillsToMaxSize)
+    {
+        //  The loop stopped at max_size - 1 characters.
+        minstd::fixed_string<8> str;
+        str.append("abcdefghij", 10);
+
+        CHECK_EQUAL(8u, str.length()); //  before: 7
+        STRCMP_EQUAL("abcdefgh", str.c_str());
+
+        minstd::fixed_string<8> partial("abc");
+        partial.append("defghij", 3);
+
+        CHECK_EQUAL(6u, partial.length());
+        STRCMP_EQUAL("abcdef", partial.c_str());
+    }
 }

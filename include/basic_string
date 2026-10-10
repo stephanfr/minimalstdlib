@@ -94,7 +94,9 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (pos >= length_)
             {
-                return const_cast<T &>(EMPTY_CHARACTER);
+                //  A scratch character reset on every call: a stray write through it cannot leak into later reads.
+                out_of_range_scratch_ = 0;
+                return out_of_range_scratch_;
             }
 
             return buffer_[pos];
@@ -173,7 +175,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t chars_copied = 0;
 
-            while (value[chars_copied] != 0 && chars_copied < length && length_ < max_size_ - 1 && length_ < chars_that_fit())
+            while (value[chars_copied] != 0 && chars_copied < length && length_ < chars_that_fit())
             {
                 buffer_[length_++] = value[chars_copied++];
             }
@@ -343,6 +345,7 @@ namespace MINIMAL_STD_NAMESPACE
         size_t length_;
 
         const T EMPTY_CHARACTER = 0x00;
+        T out_of_range_scratch_ = 0x00;
 
         explicit basic_string(T *buffer, size_t buffer_size, size_t max_size)
             : buffer_(buffer),
