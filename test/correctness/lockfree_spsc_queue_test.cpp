@@ -137,4 +137,70 @@ namespace
             CHECK(queue.empty());
         }
     }
+
+    TEST(SingleProducerSingleConsumerLockfreeQueueTests, PopFrontOnEmptyQueueIsANoOp)
+    {
+        minstd::pmr::monotonic_buffer_resource heap_allocator_resource(buffer, TEST_BUFFER_SIZE, nullptr);
+        queue_static_heap_allocator heap_allocator(&heap_allocator_resource);
+
+        test_element_queue queue(heap_allocator, 4);
+
+        queue.popFront(); //  nothing to drop
+
+        CHECK_TRUE(queue.empty()); //  before: false - read_index_ ran past write_index_
+        CHECK_EQUAL(0u, queue.size_estimate());
+        CHECK_TRUE(queue.push_back(7u));
+
+        test_element element(0);
+        CHECK_TRUE(queue.pop_front(element));
+        CHECK_EQUAL(7u, element.value());
+        CHECK_TRUE(queue.empty());
+    }
+
+    struct counted_element
+    {
+        static inline int destroyed = 0;
+
+        int value = 0;
+
+        counted_element() = default;
+        counted_element(int v) : value(v) {}
+        counted_element(const counted_element &) = default;
+        counted_element &operator=(const counted_element &) = default;
+        ~counted_element() { destroyed++; }
+    };
+
+    TEST(SingleProducerSingleConsumerLockfreeQueueTests, DestructorDestroysQueuedElements)
+    {
+        minstd::pmr::monotonic_buffer_resource heap_allocator_resource(buffer, TEST_BUFFER_SIZE, nullptr);
+        minstd::pmr::polymorphic_allocator<counted_element> allocator(&heap_allocator_resource);
+
+        {
+            minstd::spsc_queue<counted_element> queue(allocator, 4);
+
+            CHECK_TRUE(queue.push_back(1));
+            CHECK_TRUE(queue.push_back(2));
+            CHECK_TRUE(queue.push_back(3));
+
+            counted_element front;
+            CHECK_TRUE(queue.pop_front(front)); //  wrap the read index past the start on the way out
+            CHECK_TRUE(queue.push_back(4));
+
+            counted_element::destroyed = 0;
+        }
+
+        CHECK_EQUAL(3 + 1, counted_element::destroyed); //  three queued elements and `front`; before: 1
+    }
+
+    TEST(SingleProducerSingleConsumerLockfreeQueueTests, ZeroCapacityQueueHoldsNothing)
+    {
+        minstd::pmr::monotonic_buffer_resource heap_allocator_resource(buffer, TEST_BUFFER_SIZE, nullptr);
+        queue_static_heap_allocator heap_allocator(&heap_allocator_resource);
+
+        test_element_queue queue(heap_allocator, 0);
+
+        CHECK_EQUAL(0u, queue.capacity()); //  before: SIZE_MAX
+        CHECK_FALSE(queue.push_back(1u));  //  before: constructs into a 0-element buffer
+        CHECK_TRUE(queue.empty());
+    }
 }
