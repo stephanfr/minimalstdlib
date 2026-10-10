@@ -129,6 +129,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             static inline atomic<slot_block *> unlinked_blocks_{nullptr};
 
+            //  Live skip_lists of this type.  A retired block can be freed only after every reader that could hold
+            //      it has gone; readers of every live list share these blocks but each list's epoch sees only its
+            //      own readers.  So blocks retire (and are freed) only while one list is live.
+            static inline atomic<size_t> live_lists_{0};
+
             //  Memory resource used for slot_block allocation/deallocation.  Slot blocks are static per
             //      instantiation, so every live skip_list of one type (including its Tag) shares this resource: the
             //      first instance sets it and the last one clears it.
@@ -207,6 +212,14 @@ namespace MINIMAL_STD_NAMESPACE
                 //  Never retire the block the fresh-slot cursor is filling: a small list would otherwise free and
                 //      reallocate a whole block on every insert/remove.
                 if (block_idx == slot_to_block_index(next_free_slot_.load(memory_order_acquire)))
+                {
+                    return;
+                }
+
+                //  While several lists of this type are live, keep the empty block installed: its slots are reused,
+                //      and no reader of another list can be left holding freed memory.  (tlaplus/lockfree_skiplist/
+                //      slot_blocks)
+                if (live_lists_.load(memory_order_acquire) > 1)
                 {
                     return;
                 }
@@ -622,7 +635,17 @@ namespace MINIMAL_STD_NAMESPACE
                     return nullptr;
                 }
 
-                return block->slot_table_[offset].load(memory_order_acquire);
+                T *ptr = block->slot_table_[offset].load(memory_order_acquire);
+
+                //  The slot may have been freed and republished between the generation check and the table load;
+                //      publish_slot() stores the new generation before the new pointer, so re-checking it after the
+                //      (acquire) table load rejects the new life's pointer.  (tlaplus/lockfree_skiplist/handles)
+                if (block->slot_generation_[offset].load(memory_order_acquire) != handle_generation)
+                {
+                    return nullptr;
+                }
+
+                return ptr;
             }
 
             static constexpr bool is_tombstoned_val(uint64_t v)
@@ -1219,7 +1242,13 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 //  Slot blocks are shared by every live skip_list of this type (see Tag): the first instance sets
                 //      their memory resource, and the last one to be destroyed clears it.
-                if (active_instance_count_.fetch_add(1, memory_order_acq_rel) == 0)
+                const bool first_list = (forward_link_type::live_lists_.fetch_add(1, memory_order_acq_rel) == 0);
+
+                //  Pairs with the fence in sole_live_instance(): a list that retired a block and then sees one live
+                //      list (store-buffering) must not miss this one, whose readers may load the block from blocks_.
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                if (first_list)
                 {
                     forward_link_type::set_block_memory_resource(memory_resource_);
                 }
@@ -1260,7 +1289,9 @@ namespace MINIMAL_STD_NAMESPACE
                     current_node = next_node;
                 }
 
-                reclaim_all_retired_nodes();
+                //  The shared retired-block list is drained only by the sole (or last) live list: another live list's
+                //      readers may still hold those blocks (see advance_and_reclaim()).
+                reclaim_all_retired_nodes(sole_live_instance());
 
                 destroy_skip_node(head_);
                 destroy_skip_node(NIL_);
@@ -1268,15 +1299,15 @@ namespace MINIMAL_STD_NAMESPACE
                 //  head_ and NIL_ destructions may have retired their slot_blocks.
                 //  Drain again so all blocks are freed before the memory resource
                 //  that allocated them can be destroyed.
-                reclaim_all_retired_nodes();
+                reclaim_all_retired_nodes(sole_live_instance());
 
                 // Last live instance of this template specialization performs a full
                 // static slot-state reset so no block ownership leaks across tests.
-                if (active_instance_count_.fetch_sub(1, memory_order_acq_rel) == 1)
+                if (forward_link_type::live_lists_.fetch_sub(1, memory_order_acq_rel) == 1)
                 {
                     using slot_block = typename forward_link_type::slot_block;
 
-                    reclaim_all_retired_nodes();
+                    reclaim_all_retired_nodes(true);
 
                     for (size_t i = 0; i < forward_link_type::MAX_BLOCKS; ++i)
                     {
@@ -1948,7 +1979,14 @@ namespace MINIMAL_STD_NAMESPACE
             using skip_node_test_allocator_traits_type = minstd::allocator_traits<skip_node_test_allocator_type>;
 #endif
 
-            static inline atomic<size_t> active_instance_count_{0};
+            //  True while this is the only live list of its type (the caller is one of them).  The fence pairs with the
+            //      one in the constructor: blocks retired before this check are invisible to any list constructed after
+            //      it, and a list constructed before it is counted.
+            static bool sole_live_instance()
+            {
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                return forward_link_type::live_lists_.load(memory_order_acquire) == 1;
+            }
 
             skip_node *head_ = nullptr;
             skip_node *NIL_ = nullptr;
@@ -2016,6 +2054,11 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
+                //  The final unlink (sequenced before this) must be ordered before the epoch read: a reader that
+                //      enters in a later epoch has to see the node unlinked, or it could still hold the node once the
+                //      reclaim epoch passes this stamp.  On AArch64 the acq_rel CAS above happens to order it; C++ only
+                //      promises it with the fence.  (litmus/aarch64 D-retire-epoch)
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
                 node->retired_epoch_ = epoch_reclaimer_.current_epoch();
 
                 // Push to per-CPU retired list. Using a CAS loop for correctness on
@@ -2100,9 +2143,20 @@ namespace MINIMAL_STD_NAMESPACE
             pair<uint32_t, bool> advance_and_reclaim(size_t cpu_slot)
             {
                 using slot_block = typename forward_link_type::slot_block;
-                slot_block *unlinked = forward_link_type::extract_unlinked_blocks();
+
+                //  Retired slot blocks are shared by every live list of this type.  Once retire_block() has nulled a
+                //      block's table entry no new reader can reach it, so only readers active at that moment can still
+                //      hold it - but they can belong to any list of the type, and this list's epoch tracks only its
+                //      own readers.  So take the shared list only while this is the sole live list: lists destroyed
+                //      since had no readers left, and lists created since cannot hold the block.  With several live
+                //      lists, retired blocks wait (still allocated) until one remains.  (tlaplus/lockfree_skiplist/
+                //      slot_blocks)
+                slot_block *unlinked = sole_live_instance() ? forward_link_type::extract_unlinked_blocks() : nullptr;
                 if (unlinked != nullptr)
                 {
+                    //  As in retire_node(): the blocks_ nulling (which happens before the extract) must be ordered
+                    //      before the epoch stamp.  (litmus/aarch64 J-block-stamp)
+                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
                     uint64_t current_epoch = epoch_reclaimer_.current_epoch();
 
                     slot_block *tail = unlinked;
@@ -2172,7 +2226,10 @@ namespace MINIMAL_STD_NAMESPACE
                 return result;
             }
 
-            void reclaim_all_retired_nodes()
+            //  Frees this list's retired nodes and blocks at once: only for a list with no operation in flight.
+            //      include_shared_blocks: also free the type's shared retired-block list, which is safe only when no
+            //      other list of the type is live (see advance_and_reclaim()).
+            void reclaim_all_retired_nodes(bool include_shared_blocks)
             {
                 using slot_block = typename forward_link_type::slot_block;
 
@@ -2180,7 +2237,7 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     bool drained_any = false;
 
-                    slot_block *unlinked = forward_link_type::extract_unlinked_blocks();
+                    slot_block *unlinked = include_shared_blocks ? forward_link_type::extract_unlinked_blocks() : nullptr;
                     while (unlinked != nullptr)
                     {
                         drained_any = true;

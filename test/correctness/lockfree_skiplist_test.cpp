@@ -1160,4 +1160,143 @@ namespace
         CHECK_EQUAL(0u, second_resource.outstanding());
     }
 
+    struct shared_slot_blocks_tag
+    {
+    };
+
+    TEST(SkiplistTests, SharedSlotBlocksSurviveOtherInstancesReclaimAndDestruction)
+    {
+        //  Slot blocks are static per type and Tag and shared by every live list of that type.  A block retired by
+        //      one list was freed by whichever list next reclaimed (after only that list's readers had moved on),
+        //      or at once by any list's destructor, while a reader of another list could still be resolving a
+        //      handle into it.  4 slots per block, so blocks retire constantly.  Under ASan a freed block read by
+        //      unpack_ptr() aborts the child.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+            using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 8, 2,
+                                                minstd::skiplist_extensions::null_skiplist_statistics, shared_slot_blocks_tag>;
+
+            static list_type list_a;
+            static list_type list_b;
+            static minstd::atomic<bool> stop{false};
+
+            constexpr uint32_t KEYS = 64;
+
+            auto reader = [](void *) -> void *
+            {
+                uint32_t sum = 0;
+                while (!stop.load(minstd::memory_order_acquire))
+                {
+                    for (uint32_t key = 0; key < KEYS; ++key)
+                    {
+                        sum += (list_a.find(key) != list_a.end()) ? 1u : 0u;
+                    }
+                    for (auto itr = list_a.begin(); itr != list_a.end(); ++itr)
+                    {
+                        sum += 1;
+                    }
+                }
+                return reinterpret_cast<void *>(static_cast<uintptr_t>(sum));
+            };
+
+            auto churn = [](void *arg) -> void *
+            {
+                list_type &list = *static_cast<list_type *>(arg);
+                uint32_t key = 0;
+                while (!stop.load(minstd::memory_order_acquire))
+                {
+                    key = (key * 1103515245u + 12345u);
+                    const uint32_t k = (key >> 8) % KEYS;
+                    if (!list.insert(k, k))
+                    {
+                        list.remove(k);
+                    }
+                }
+                return nullptr;
+            };
+
+            auto destroyer = [](void *) -> void *
+            {
+                while (!stop.load(minstd::memory_order_acquire))
+                {
+                    list_type temporary; //  its destructor drains the shared retired-block list
+                    temporary.insert(1, 1);
+                    temporary.remove(1);
+                }
+                return nullptr;
+            };
+
+            pthread_t threads[5];
+            pthread_create(&threads[0], nullptr, reader, nullptr);
+            pthread_create(&threads[1], nullptr, reader, nullptr);
+            pthread_create(&threads[2], nullptr, churn, &list_a);
+            pthread_create(&threads[3], nullptr, churn, &list_b);
+            pthread_create(&threads[4], nullptr, destroyer, nullptr);
+
+            struct timespec duration = {3, 0};
+            nanosleep(&duration, nullptr);
+            stop.store(true, minstd::memory_order_release);
+
+            for (auto &thread : threads)
+            {
+                pthread_join(thread, nullptr); } }, 30)); //  before: ASan heap-use-after-free in unpack_ptr / pin_block
+    }
+
+    struct sole_instance_block_reclaim_tag
+    {
+    };
+
+    TEST(SkiplistTests, SlotBlocksAreNotRetiredWhileSeveralListsOfTheTypeAreLive)
+    {
+        //  Slot blocks are shared by every live list of a type.  Only readers active when a block was retired can
+        //      still hold it, but they can belong to any live list, while a list's epoch tracks only its own readers.
+        //      So while several lists are live an empty block stays installed (its slots are reused) instead of
+        //      retiring.  Before the fix, list A freed shared blocks after only A's readers had moved on.
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 8, 2,
+                                            minstd::skiplist_extensions::skiplist_statistics, sole_instance_block_reclaim_tag>;
+
+        //  Reclamation runs from remove(), throttled: churn one key and advance the epoch.
+        auto churn = [](list_type &list)
+        {
+            for (uint32_t i = 0; i < 200; ++i)
+            {
+                list.insert(100000, 0);
+                list.remove(100000);
+                list.try_advance_epoch(0);
+            }
+        };
+
+        {
+            list_type list_a;
+            uint32_t blocks_in_use = 0;
+
+            {
+                list_type list_b;
+
+                for (uint32_t key = 1; key <= 200; ++key)
+                {
+                    CHECK_TRUE(list_a.insert(key, key));
+                }
+
+                blocks_in_use = list_type::active_blocks();
+                CHECK_TRUE(blocks_in_use >= 50); //  4 slots per block
+
+                for (uint32_t key = 1; key <= 200; ++key)
+                {
+                    CHECK_TRUE(list_a.remove(key));
+                }
+
+                churn(list_a);
+                churn(list_b);
+
+                CHECK_EQUAL(blocks_in_use, list_type::active_blocks()); //  before: most freed while B was live
+            }
+
+            churn(list_a); //  A is now the only list of its type
+
+            CHECK_TRUE(list_type::active_blocks() <= blocks_in_use); //  emptied blocks are reused: no growth
+        }
+
+        CHECK_EQUAL(0u, list_type::active_blocks()); //  the last list frees every block
+    }
 }

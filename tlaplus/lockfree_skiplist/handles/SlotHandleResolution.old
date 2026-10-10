@@ -1,0 +1,50 @@
+------------------------ MODULE SlotHandleResolution ------------------------
+(***************************************************************************)
+(* include/lockfree/skiplist atomic_forward_link::unpack_ptr() against     *)
+(* free_slot() and publish_slot() on the same slot.                        *)
+(*                                                                         *)
+(*   publish_slot: generation.store(gen + 1); slot_table.store(node)       *)
+(*   free_slot:    slot_table.store(nullptr)                               *)
+(*   unpack_ptr:   g = generation.load(); if g != handle.gen return null;  *)
+(*                 p = slot_table.load();                                  *)
+(*                 [Recheck: if generation.load() != handle.gen return     *)
+(*                  null]; return p                                        *)
+(*                                                                         *)
+(* The node published in generation k is node k.  Readers hold handles of *)
+(* every generation up to MaxGen, so some are current and some stale.      *)
+(* Invariant: unpack_ptr returns null or the handle's own node.            *)
+(***************************************************************************)
+EXTENDS Integers, TLC
+
+CONSTANTS MaxGen, Readers, Recheck
+
+(* --algorithm SlotHandleResolution {
+variables gen = 1, table = 1;
+
+fair process (W = 0)
+{
+ W_loop:
+    while (gen < MaxGen) {
+ W_free:    table := 0;
+ W_gen:     gen := gen + 1;
+ W_table:   table := gen;
+    };
+}
+
+fair process (R \in Readers)
+variables h \in 1..MaxGen, g = 0, p = 0, res = -1;
+{
+ R_gen:     g := gen;
+            if (g # h) { res := 0; goto R_done; };
+ R_table:   p := table;
+            if (Recheck) {
+ R_recheck:     if (gen # h) { res := 0; goto R_done; };
+            };
+ R_ret:     res := p;
+ R_done:    assert res \in {0, h};
+}
+} *)
+
+\* BEGIN TRANSLATION
+\* END TRANSLATION
+=============================================================================
