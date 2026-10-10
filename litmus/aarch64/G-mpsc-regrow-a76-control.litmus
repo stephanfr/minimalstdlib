@@ -1,0 +1,12 @@
+AArch64 G-mpsc-regrow-a76-control
+"consumer regrow / producer claim"
+{
+0:X0=pos; 0:X1=buffer;
+1:X0=pos; 1:X1=buffer;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | MOV W11,#1                         ;
+STR W11,[X1]                       | LDADDA W11,W12,[X0]                ;
+MOV W12,#1                         | LDR W13,[X1]                       ;
+STR W12,[X0]                       |                                    ;
+exists (1:X12=1 /\ 1:X13=0)

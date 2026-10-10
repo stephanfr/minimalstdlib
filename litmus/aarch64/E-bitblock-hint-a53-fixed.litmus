@@ -1,0 +1,18 @@
+AArch64 E-bitblock-hint-a53-fixed
+"block construction / hint publication"
+{
+0:X0=hint; 0:X1=field; 0:X2=first; 0:X3=bitmap;
+1:X0=hint; 1:X1=field;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDAR W11,[X0]                      ;
+STR W11,[X1]                       | LDR W12,[X1]                       ;
+MOV W12,#1                         |                                    ;
+LDAXR W13,[X2]                     |                                    ;
+STLXR W14,W12,[X2]                 |                                    ;
+MOV W15,#1                         |                                    ;
+LDAXR W16,[X3]                     |                                    ;
+STLXR W17,W15,[X3]                 |                                    ;
+MOV W18,#1                         |                                    ;
+STLR W18,[X0]                      |                                    ;
+exists (0:X13=0 /\ 0:X14=0 /\ 0:X16=0 /\ 0:X17=0 /\ 1:X11=1 /\ 1:X12=0)

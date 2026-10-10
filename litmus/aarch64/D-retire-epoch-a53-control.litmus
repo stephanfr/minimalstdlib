@@ -1,0 +1,14 @@
+AArch64 D-retire-epoch-a53-control
+"unlinker / epoch advancer / reader"
+{
+link=1; epoch=1;
+0:X0=link; 0:X1=flag; 0:X2=epoch;
+1:X2=epoch;
+2:X0=link; 2:X2=epoch;
+}
+P0                                 | P1                                 | P2                                 ;
+MOV W11,#2                         | DMB ISH                            | LDAR W11,[X2]                      ;
+LDAXR W12,[X0]                     | MOV W11,#2                         | DMB ISH                            ;
+STLXR W13,W11,[X0]                 | LDAXR W12,[X2]                     | LDAR W12,[X0]                      ;
+LDAR W14,[X2]                      | STLXR W13,W11,[X2]                 |                                    ;
+exists (0:X12=1 /\ 0:X13=0 /\ 1:X12=1 /\ 1:X13=0 /\ 0:X14=1 /\ 2:X11=2 /\ 2:X12=1)
