@@ -13,6 +13,8 @@
 #include <__memory_resource/tracking_memory_resource.h>
 #include <list>
 
+#include "../shared/process_isolation.h"
+
 #define TEST_BUFFER_SIZE 65536
 #define MAX_HEAP_ELEMENTS 4096
 
@@ -676,4 +678,56 @@ namespace
         CHECK_EQUAL(3u, allocator.deallocations());
     }
 
+    //  Hands out `budget` nodes, then fails.
+    class limited_list_allocator : public list_allocator
+    {
+    public:
+        explicit limited_list_allocator(size_t budget)
+            : budget_(budget)
+        {
+        }
+
+        size_t max_size() const noexcept override
+        {
+            return 4;
+        }
+
+        test_element_list::node_type *allocate(size_t num_elements) override
+        {
+            if ((num_elements != 1) || (used_ >= budget_))
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<test_element_list::node_type *>(&slots_[used_++][0]);
+        }
+
+        void deallocate(test_element_list::node_type *, size_t) override
+        {
+        }
+
+    private:
+        alignas(test_element_list::node_type) unsigned char slots_[4][sizeof(test_element_list::node_type)] = {{0}};
+        size_t budget_;
+        size_t used_ = 0;
+    };
+
+    TEST(ListTests, FailedAllocationLeavesListUnchanged)
+    {
+        //  Under the default (LEGACY) allocation-failure policy, a failed node allocation used to fall through
+        //      and construct the element at address 0.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        limited_list_allocator allocator(1);
+                                                        test_element_list list(allocator);
+
+                                                        list.push_back(test_element(1));
+                                                        list.push_back(test_element(2));
+                                                        list.push_front(test_element(3));
+                                                        if (list.insert_after(list.begin(), test_element(4)) != list.end()) _exit(1);
+                                                        if (list.emplace_after(list.begin(), 5u) != list.end()) _exit(2);
+
+                                                        if (list.size() != 1) _exit(3);
+                                                        if (list.front().value() != 1) _exit(4); })); //  before: child segfaults
+    }
 }

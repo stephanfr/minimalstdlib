@@ -40,7 +40,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             grow_buffer_for_string(value);
 
-            length_ = minstd::min(strlcpy(buffer_, value, buffer_size_), max_size_);
+            length_ = minstd::min(strlcpy(buffer_, value, buffer_size_), chars_that_fit());
 
             return *this;
         }
@@ -49,7 +49,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             grow_buffer(string_to_copy.length_);
 
-            length_ = minstd::min(strlcpy(buffer_, string_to_copy.buffer_, buffer_size_), max_size_);
+            length_ = minstd::min(strlcpy(buffer_, string_to_copy.buffer_, buffer_size_), chars_that_fit());
 
             return *this;
         }
@@ -157,7 +157,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             grow_buffer_for_string(value);
 
-            basic_string<T>::length_ += minstd::min(strlcpy(basic_string<T>::buffer_ + basic_string<T>::length_, value, basic_string<T>::buffer_size_ - basic_string<T>::length_), basic_string<T>::max_size_ - basic_string<T>::length_);
+            basic_string<T>::length_ += minstd::min(strlcpy(basic_string<T>::buffer_ + basic_string<T>::length_, value, basic_string<T>::buffer_size_ - basic_string<T>::length_), chars_that_fit() - basic_string<T>::length_);
 
             return *this;
         }
@@ -173,7 +173,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t chars_copied = 0;
 
-            while (value[chars_copied] != 0 && chars_copied < length && length_ < max_size_ - 1)
+            while (value[chars_copied] != 0 && chars_copied < length && length_ < max_size_ - 1 && length_ < chars_that_fit())
             {
                 buffer_[length_++] = value[chars_copied++];
             }
@@ -206,6 +206,11 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
             grow_buffer(1);
+
+            if (basic_string<T>::length_ >= chars_that_fit())
+            {
+                return false; //  the buffer could not grow
+            }
 
             basic_string<T>::buffer_[basic_string<T>::length_++] = character;
             basic_string<T>::buffer_[basic_string<T>::length_] = 0;
@@ -356,6 +361,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         virtual void grow_buffer_for_string(const T *str) = 0;
         virtual void grow_buffer(size_t chars_needed) = 0;
+
+        //  Characters the current buffer can hold, leaving room for the terminator.  Smaller than max_size_ when
+        //      a dynamic string could not grow its buffer.
+        constexpr size_t chars_that_fit() const
+        {
+            return minstd::min(max_size_, buffer_size_ - 1);
+        }
     };
 
     using string = basic_string<char>;

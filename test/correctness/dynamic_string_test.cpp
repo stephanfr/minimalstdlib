@@ -10,6 +10,8 @@
 #include <__memory_resource/polymorphic_allocator.h>
 #include <__memory_resource/tracking_memory_resource.h>
 
+#include "../shared/process_isolation.h"
+
 #define TEST_BUFFER_SIZE 65536
 
 namespace
@@ -411,5 +413,59 @@ namespace
 
         CHECK(test_string.size() == 5);
         CHECK(test_string == "01234");
+    }
+
+    //  Hands out `budget` buffers of up to 64 characters, then fails.
+    class limited_char_allocator : public minstd::allocator<char>
+    {
+    public:
+        explicit limited_char_allocator(size_t budget)
+            : budget_(budget)
+        {
+        }
+
+        size_t max_size() const noexcept override
+        {
+            return 64;
+        }
+
+        char *allocate(size_t num_elements) override
+        {
+            if ((num_elements > 64) || (used_ >= budget_))
+            {
+                return nullptr;
+            }
+
+            return slots_[used_++];
+        }
+
+        void deallocate(char *, size_t) override
+        {
+        }
+
+    private:
+        char slots_[2][64] = {{0}};
+        size_t budget_;
+        size_t used_ = 0;
+    };
+
+    TEST(DynamicStringTests, FailedGrowthKeepsAValidTruncatedString)
+    {
+        //  Under the default (LEGACY) allocation-failure policy, a failed grow_buffer() used to copy into
+        //      nullptr, and operator= freed the old buffer before trying to allocate the new one.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        limited_char_allocator allocator(1);
+                                                        minstd::dynamic_string<> str("abc", allocator); //  5-character buffer
+
+                                                        str.append("defghij", 7);
+                                                        if ((strncmp(str.c_str(), "abcd", 16) != 0) || (str.length() != 4)) _exit(1);
+
+                                                        if (str.push_back('x')) _exit(2);
+                                                        str += "yz";
+                                                        if ((strncmp(str.c_str(), "abcd", 16) != 0) || (str.length() != 4)) _exit(3);
+
+                                                        str = "0123456789";
+                                                        if ((strncmp(str.c_str(), "0123", 16) != 0) || (str.length() != 4)) _exit(4); })); //  before: child segfaults at the first append
     }
 }

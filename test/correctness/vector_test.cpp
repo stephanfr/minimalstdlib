@@ -13,6 +13,8 @@
 #include <__memory_resource/monotonic_buffer_resource.h>
 #include <__memory_resource/polymorphic_allocator.h>
 
+#include "../shared/process_isolation.h"
+
 #define TEST_BUFFER_SIZE 65536
 
 namespace
@@ -437,5 +439,72 @@ namespace
     TEST(VectorTests, VectorIsNotShallowCopyable)
     {
         CHECK_FALSE((__is_constructible(uint32t_vector, const uint32t_vector &)));
+    }
+
+    //  Hands out `budget` blocks of up to 8 elements, then fails.
+    class limited_uint32_vector_allocator : public uint32t_vectorAllocator
+    {
+    public:
+        explicit limited_uint32_vector_allocator(size_t budget)
+            : budget_(budget)
+        {
+        }
+
+        size_t max_size() const noexcept override
+        {
+            return 8;
+        }
+
+        uint32_t *allocate(size_t num_elements) override
+        {
+            if ((num_elements > 8) || (used_ >= budget_))
+            {
+                return nullptr;
+            }
+
+            return slots_[used_++];
+        }
+
+        void deallocate(uint32_t *, size_t) override
+        {
+        }
+
+    private:
+        uint32_t slots_[2][8] = {{0}};
+        size_t budget_;
+        size_t used_ = 0;
+    };
+
+    TEST(VectorTests, FailedAllocationLeavesAnEmptyFullVector)
+    {
+        //  Under the default (LEGACY) allocation-failure policy, a failed allocation used to leave the requested
+        //      capacity with a null buffer, so the next push_back wrote through nullptr.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        limited_uint32_vector_allocator allocator(0);
+
+                                                        uint32t_vector v(allocator, 4);
+                                                        v.push_back(1u);
+                                                        if ((v.size() != 0) || (v.capacity() != 0)) _exit(1);
+
+                                                        uint32t_vector w({1u, 2u, 3u}, allocator, 4);
+                                                        if (w.size() != 0) _exit(2); })); //  before: child segfaults
+    }
+
+    TEST(VectorTests, AssignmentWithFailedAllocationKeepsTheOldBuffer)
+    {
+        //  operator= freed the old buffer before allocating the larger one; on failure it wrote through nullptr.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        limited_uint32_vector_allocator allocator(2);
+
+                                                        uint32t_vector source(allocator, 6);
+                                                        for (uint32_t i = 1; i <= 5; i++) source.push_back(i);
+
+                                                        uint32t_vector destination(allocator, 2);
+                                                        destination = source; //  needs a third block: fails
+
+                                                        if (destination.size() != 2) _exit(1); //  what fits in the old buffer
+                                                        if ((destination[0] != 1) || (destination[1] != 2)) _exit(2); })); //  before: child segfaults
     }
 }

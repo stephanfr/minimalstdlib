@@ -48,7 +48,10 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (current_allocated_size_ != 0 && begin_ == nullptr)
             {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+                //  An empty, full vector: push_back() is a no-op and emplace_back() traps.
+                const size_t requested = current_allocated_size_;
+                current_allocated_size_ = 0;
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * requested, alignof(T));
             }
         }
 
@@ -62,17 +65,20 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (current_allocated_size_ != 0 && begin_ == nullptr)
             {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+                //  An empty, full vector: push_back() is a no-op and emplace_back() traps.
+                const size_t requested = current_allocated_size_;
+                current_allocated_size_ = 0;
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * requested, alignof(T));
             }
 
             for (const T& element : initial_values)
             {
-                emplace_back(element);
-
-                if(size() == current_allocated_size_)
+                if(size() >= current_allocated_size_)
                 {
                     break;
                 }
+
+                emplace_back(element);
             }
         }
 
@@ -104,25 +110,32 @@ namespace MINIMAL_STD_NAMESPACE
             if ((current_allocated_size_ < other.size()) &&
                (current_allocated_size_ < MAX_SIZE))
             {
-                allocator_traits_type::deallocate(allocator_, begin_, current_allocated_size_);
+                const size_t new_allocated_size = minstd::min( other.size(), MAX_SIZE);
+                T *new_begin = allocator_traits_type::allocate(allocator_, new_allocated_size);
 
-                begin_ = allocator_traits_type::allocate(allocator_, minstd::min( other.size(), MAX_SIZE));
-                current_allocated_size_ = minstd::min( other.size(), MAX_SIZE);
-
-                if (current_allocated_size_ != 0 && begin_ == nullptr)
+                if (new_begin != nullptr)
                 {
-                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * current_allocated_size_, alignof(T));
+                    allocator_traits_type::deallocate(allocator_, begin_, current_allocated_size_);
+
+                    begin_ = new_begin;
+                    end_ = begin_;
+                    current_allocated_size_ = new_allocated_size;
+                }
+                else
+                {
+                    //  Keep the old buffer: the copy below takes what fits.
+                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * new_allocated_size, alignof(T));
                 }
             }
 
             for (const T& element : other)
             {
-                emplace_back(element);
-
-                if(size() == current_allocated_size_)
+                if(size() >= current_allocated_size_)
                 {
                     break;
                 }
+
+                emplace_back(element);
             }
 
             return *this;

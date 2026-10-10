@@ -108,7 +108,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (new_node_storage == nullptr)
             {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type), return);
             }
 
             allocator_traits_type::construct(allocator_, new_node_storage, front_, value);
@@ -122,7 +122,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (new_node_storage == nullptr)
             {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type), __builtin_trap());
             }
 
             allocator_traits_type::construct(allocator_, new_node_storage, front_, minstd::forward<Args>(args)...);
@@ -317,7 +317,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         if (new_node_storage == nullptr)
         {
-            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type), return end());
         }
 
         allocator_traits_type::construct(allocator_, new_node_storage, pos.node_->next_, value);
@@ -338,7 +338,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         if (new_node_storage == nullptr)
         {
-            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type));
+            MINIMAL_STD_OUT_OF_MEMORY(sizeof(node_type), alignof(node_type), return end());
         }
 
         allocator_traits_type::construct(allocator_, new_node_storage, pos.node_->next_, minstd::forward<Args>(args)...);
