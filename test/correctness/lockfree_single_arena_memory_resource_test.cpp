@@ -1195,6 +1195,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
         minstd::atomic<uint32_t> corruptions;
         minstd::atomic<uint64_t> allocations;
         minstd::atomic<uint32_t> rounds_filled; //  rounds in which the arena ran out (the frontier met the metadata)
+        minstd::atomic<uint32_t> last_filled_round;
     };
 
     struct args_type
@@ -1209,6 +1210,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
     shared.corruptions.store(0);
     shared.allocations.store(0);
     shared.rounds_filled.store(0);
+    shared.last_filled_round.store(0);
 
     auto fn = [](void *arg) -> void *
     {
@@ -1240,7 +1242,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderC
 
             a->shared->allocations.fetch_add(count, minstd::memory_order_relaxed);
 
-            if ((count < MAX_HELD) && (a->thread_id == 1))
+            //  Any thread that ran out of space means the arena filled this round; count the round once.
+            if ((count < MAX_HELD) && (a->shared->last_filled_round.exchange(round, minstd::memory_order_relaxed) != round))
             {
                 a->shared->rounds_filled.fetch_add(1, minstd::memory_order_relaxed);
             }
