@@ -309,11 +309,29 @@ namespace MINIMAL_STD_NAMESPACE
             return npos;
         }
 
-        void substr(basic_string &substring, size_t pos = 0, size_t count = npos - 2) const
+        void substr(basic_string &substring, size_t pos = 0, size_t count = npos) const
         {
-            substring.grow_buffer(count);
+            const size_t start = minstd::min(pos, length_);
+            const size_t chars_to_copy = minstd::min(minstd::min(count, length_ - start), substring.max_size_);
 
-            substring.length_ = minstd::min(strlcpy(substring.buffer_, buffer_ + minstd::min(pos, length_), minstd::min(count + 1, substring.buffer_size_)), minstd::min(count, substring.max_size_));
+            //  The destination's old contents are replaced: grow for the copy alone, not on top of them.  The copy
+            //      runs front to back, so a string can take a substring of itself.
+            if (&substring != this)
+            {
+                substring.clear();
+            }
+
+            substring.grow_buffer(chars_to_copy);
+
+            const size_t copy_limit = minstd::min(chars_to_copy, substring.chars_that_fit());
+
+            for (size_t i = 0; i < copy_limit; i++)
+            {
+                substring.buffer_[i] = buffer_[start + i];
+            }
+
+            substring.buffer_[copy_limit] = 0;
+            substring.length_ = copy_limit;
         }
 
     protected:

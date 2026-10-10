@@ -468,4 +468,37 @@ namespace
                                                         str = "0123456789";
                                                         if ((strncmp(str.c_str(), "0123", 16) != 0) || (str.length() != 4)) _exit(4); })); //  before: child segfaults at the first append
     }
+
+    TEST(DynamicStringTests, SubstrIntoNonEmptyDynamicString)
+    {
+        //  substr() grew the destination for `count` characters on top of its current length, then reported
+        //      the full count as the new length even though only what fit was copied.
+        const char *source_text = "0123456789012345678901234567890123456789012345678901234567890123456789"
+                                  "012345678901234567890123456789"; //  100 characters
+
+        dynamic_string source(source_text, heap_allocator);
+        dynamic_string destination("ab", heap_allocator);
+
+        source.substr(destination, 0);
+
+        CHECK_EQUAL(100u, destination.length());
+        CHECK_EQUAL(destination.length(), strnlen(destination.c_str(), 1024)); //  before: the string is 3 characters
+        CHECK(destination == source_text);
+
+        source.substr(destination, 95, 3);
+
+        CHECK(destination == "567");
+        CHECK_EQUAL(3u, destination.length());
+
+        source.substr(destination, 200, 3); //  past the end: empty
+
+        CHECK_EQUAL(0u, destination.length());
+        CHECK(destination == "");
+
+        destination = "0123456789";
+        destination.substr(destination, 4, 3); //  into itself
+
+        CHECK(destination == "456");
+        CHECK_EQUAL(3u, destination.length());
+    }
 }
