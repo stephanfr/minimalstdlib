@@ -14,6 +14,7 @@
 #include <single_block_memory_heap>
 
 #include <../shared/poisoning_memory_resource.h>
+#include "../shared/process_isolation.h"
 
 #include <memory>
 
@@ -423,5 +424,20 @@ namespace
             CHECK_FALSE(cache.find(2).has_value());
             CHECK_TRUE(cache.find(3).has_value());
         }
+    }
+
+    TEST(LRUCacheTests, ZeroCapacityCacheRejectsAdds)
+    {
+        //  With max_size 0, add() made room by evicting back() of the empty list.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        using cache_type = minstd::lru_cache<uint32_t, uint32_t>;
+                                                        minstd::pmr::polymorphic_allocator<cache_type::list_entry_type> entries(&test_heap_resource);
+                                                        minstd::pmr::polymorphic_allocator<cache_type::map_entry_type> map(&test_heap_resource);
+                                                        cache_type cache(0, entries, map);
+                                                        if (cache.add(1, 1)) _exit(1);
+                                                        uint32_t value = 2;
+                                                        if (cache.add(2, minstd::move(value))) _exit(2);
+                                                        if (cache.find(1).has_value()) _exit(3); })); //  before: child crashes in insure_space_exists()
     }
 }

@@ -154,6 +154,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         bool add(const Key &key, const T &value)
         {
+            //  A zero-capacity cache holds nothing (there would be nothing to evict to make room)
+
+            if (max_cache_size_ == 0)
+            {
+                return false;
+            }
+
             //  Do not overwrite existing entries
 
             if (cache_entry_map_.find(key) != cache_entry_map_.end())
@@ -175,6 +182,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         bool add(const Key &key, T &&value)
         {
+            //  A zero-capacity cache holds nothing (there would be nothing to evict to make room)
+
+            if (max_cache_size_ == 0)
+            {
+                return false;
+            }
+
             //  Do not overwrite existing entries
 
             if (cache_entry_map_.find(key) != cache_entry_map_.end())
