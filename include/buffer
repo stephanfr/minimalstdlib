@@ -99,13 +99,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t append(const T *block_to_append, size_t elements_to_append) override
         {
-            size_t bytes_appended = min(buffer_size_ - size_, elements_to_append);
+            size_t elements_appended = min(buffer_size_ - size_, elements_to_append);
 
-            memcpy(buffer_ + size_, block_to_append, bytes_appended);
+            memcpy(buffer_ + size_, block_to_append, elements_appended * sizeof(T));
 
-            size_ += bytes_appended;
+            size_ += elements_appended;
 
-            return bytes_appended;
+            return elements_appended;
         }
 
         void pop_back()
@@ -132,8 +132,17 @@ namespace MINIMAL_STD_NAMESPACE
             : resource_(resource),
               buffer_size_(size),
               size_(0),
-              buffer_(static_cast<T *>(resource_.allocate(sizeof(T) * size, alignof(T))))
+              buffer_(size <= (SIZE_MAX / sizeof(T)) ? static_cast<T *>(resource_.allocate(sizeof(T) * size, alignof(T))) : nullptr)
         {
+            if (buffer_ == nullptr)
+            {
+                buffer_size_ = 0; //  behaves as an empty, full buffer: append() copies nothing
+
+                if (size != 0)
+                {
+                    MINIMAL_STD_OUT_OF_MEMORY((size <= (SIZE_MAX / sizeof(T))) ? sizeof(T) * size : SIZE_MAX, alignof(T));
+                }
+            }
         }
 
         //  Moving transfers ownership of the block.  The source is left empty, and the
