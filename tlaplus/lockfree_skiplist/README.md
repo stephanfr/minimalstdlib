@@ -30,6 +30,32 @@ Abstracted/simplified:
 - random level distribution (bounded by `MaxLevels`)
 - `SkipNode` allocation: the model uses keys as stand-ins for node instances; a key in `retired` can coexist with a fresh node for the same key in `present` or `tomb` (correct, since they are different allocations in C++)
 
+Not modelled here (each covered elsewhere):
+- **Upper-level publication vs. removal** (`upper_levels_remaining_`, `upper_levels_drained()`). This model treats a node's upper levels as cleared before its level-0 unlink. In the code an inserter can still be publishing upper levels while a remover tombstones the node, so the remover leaves level 0 linked until the count drains. That protocol is modelled in `upper_levels/` (below).
+- **The slot allocator** behind the forward links (tagged free list, cursor-block pinning, generation seeding). It is covered by the unit tests in `test/correctness/lockfree_skiplist_test.cpp`.
+- **Memory ordering.** TLA+ steps are sequentially consistent; the seq_cst fences in `upper_levels_drained()` and the epoch reclaimer are what make the modelled behaviour hold on AArch64.
+
+## upper_levels/
+
+`SkiplistUpperLevels.tla` follows one node from the moment its level-0 link is published:
+- an inserter publishing upper levels: reserve (`upper_levels_remaining_ += 1`), re-aim its own link (abandon if tombstoned), CAS the predecessor (retry or skip on failure);
+- a remover: tombstone its own links top-down, then level 0; its traversal unlinks the upper links it sees; it unlinks level 0 and retires only if `upper_levels_drained()`;
+- helping traversals: unlink tombstoned upper links (`-1` each), and retire the node once it is drained.
+
+`DrainGate = FALSE` models the code before 68ab76f (no count; the remover always unlinks level 0 and retires).
+
+| Config | Expected | Result |
+|--------|----------|--------|
+| `SkiplistUpperLevels_bug.cfg` (height 3, 1 helper, gate off) | `RetiredUnreachable` violated | violated: the inserter passes its own-link check, the remover marks and unlinks what it sees, the inserter's CAS publishes level 1, the remover retires a node still linked at level 1 |
+| `SkiplistUpperLevels.cfg` (height 3, 2 helpers) | no error; `Termination`, `EventuallyRetired` | no error, 10,160 distinct states |
+| `SkiplistUpperLevels_tall.cfg` (height 4, 3 helpers, 2 CAS failures per level) | no error; `Termination`, `EventuallyRetired` | no error, 579,519 distinct states |
+
+```bash
+cd upper_levels
+java -cp ../../tla2tools.jar pcal.trans -nocfg SkiplistUpperLevels.tla
+java -cp ../../tla2tools.jar tlc2.TLC -config SkiplistUpperLevels.cfg -workers auto SkiplistUpperLevels.tla
+```
+
 ## Files
 
 - `LockfreeSkiplist.tla` — specification
