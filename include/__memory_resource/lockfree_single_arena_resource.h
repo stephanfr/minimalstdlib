@@ -919,11 +919,7 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 interrupt_guard_type guard;
 
-                uint64_t stolen_head = pending_shards_[target_shard].head_.exchange(
-                    metadata_tag::make(nullptr),
-                    memory_order_acq_rel);
-
-                return metadata_tag::unpack_ptr(stolen_head);
+                return free_block_stack::steal_all(pending_shards_[target_shard].head_);
             }
 
             void reduce_pending_deallocation_count(size_t target_shard, size_t stolen_count)

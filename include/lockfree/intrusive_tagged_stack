@@ -104,9 +104,21 @@ namespace MINIMAL_STD_NAMESPACE
                 return nullptr;
             }
 
+            //  Takes the whole list.  The counter advances like any other head change: resetting it (make(nullptr))
+            //      would let a popper that loaded the head before the steal see the same (pointer, counter) again
+            //      after a few pushes, and its CAS would install a stale link (ABA).  tlaplus/lockfree_tagged_stack
             static node_type *steal_all(atomic<storage_type> &head)
             {
-                storage_type stolen = head.exchange(tagged_ptr_type::make(nullptr), memory_order_acq_rel);
+                storage_type stolen = head.load(memory_order_acquire);
+
+                while (!head.compare_exchange_weak(
+                    stolen,
+                    tagged_ptr_type::pack(nullptr, static_cast<counter_type>(tagged_ptr_type::unpack_counter(stolen) + 1)),
+                    memory_order_acq_rel,
+                    memory_order_acquire))
+                {
+                }
+
                 return tagged_ptr_type::unpack_ptr(stolen);
             }
         };
