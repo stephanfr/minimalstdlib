@@ -5,6 +5,7 @@
 #include <CppUTest/TestHarness.h>
 
 #include <single_block_memory_heap>
+#include <__memory_resource/memory_heap_resource_adapter.h>
 
 #define TEST_BUFFER_SIZE 65536
 
@@ -360,5 +361,31 @@ namespace
         CHECK(test_heap_aligned_8.actual_block_size(second_block) == 40);
 
         CHECK(test_heap_aligned_8.validate_pointer(second_block));
+    }
+
+    TEST(StaticHeapTests, HeapAdapterNeverReturnsMisalignedMemory)
+    {
+        //  The heap aligns blocks only to its own block alignment (16 here); the adapter passed larger alignments
+        //      through as an element size and returned whatever address came back.
+        minstd::single_block_memory_heap heap(&buffer_aligned16, TEST_BUFFER_SIZE, 16);
+        minstd::pmr::memory_heap_resource_adapter resource(heap);
+
+        size_t misaligned = 0;
+
+        for (int i = 0; i < 8; i++)
+        {
+            void *ptr = resource.allocate(24, 64);
+
+            if ((ptr != nullptr) && ((reinterpret_cast<uintptr_t>(ptr) % 64) != 0))
+            {
+                misaligned++;
+            }
+        }
+
+        CHECK_EQUAL(0u, misaligned); //  before: most of the 8 are misaligned
+
+        void *ptr = resource.allocate(24, 8); //  alignments the heap provides still work
+        CHECK(ptr != nullptr);
+        CHECK_EQUAL(0u, reinterpret_cast<uintptr_t>(ptr) % 8);
     }
 }
