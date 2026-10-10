@@ -76,13 +76,36 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         /**
+         * @brief Decodes an AArch64 MPIDR_EL1 value into a CPU id: the core within its cluster, with the cluster
+         *        above it.
+         *
+         * MPIDR_EL1.MT (bit 24) says whether Aff0 is a hardware thread.  When it is set (Cortex-A55/A65/A75 and
+         * later, Neoverse), Aff0 is the thread within the core - 0 on every core of a single-threaded part - so
+         * the core is Aff1 and the cluster Aff2.  Otherwise the core is Aff0 and the cluster Aff1.  Taking Aff0
+         * alone gave every core the same id on the MT parts.  Each field is 8 bits, so the result is unique per
+         * core.  Separate from get_cpu_id() so the decoding can be tested on any host.
+         */
+        constexpr uint32_t cpu_id_from_mpidr(uint64_t mpidr)
+        {
+            const bool multithreaded = ((mpidr >> 24) & 0x1) != 0;
+            const uint32_t aff0 = static_cast<uint32_t>(mpidr & 0xFF);
+            const uint32_t aff1 = static_cast<uint32_t>((mpidr >> 8) & 0xFF);
+            const uint32_t aff2 = static_cast<uint32_t>((mpidr >> 16) & 0xFF);
+
+            const uint32_t core = multithreaded ? aff1 : aff0;
+            const uint32_t cluster = multithreaded ? aff2 : aff1;
+
+            return core | (cluster << 8);
+        }
+
+        /**
          * @brief Returns the current CPU/core ID.
          *
          * This function returns an identifier for the current CPU core. This can be
          * used for per-CPU sharding to reduce contention in multi-core systems.
          *
          * On x64: Uses CPUID instruction with leaf 0x1 (returns initial APIC ID)
-         * On ARM64: Uses MPIDR_EL1 (Multiprocessor Affinity Register)
+         * On ARM64: Uses MPIDR_EL1 (Multiprocessor Affinity Register), see cpu_id_from_mpidr()
          *
          * Note: The returned value may not be contiguous (0, 1, 2, ...) but is
          * guaranteed to be unique per CPU core.
@@ -114,9 +137,8 @@ namespace MINIMAL_STD_NAMESPACE
 #elif defined(__aarch64__)
             uint64_t mpidr;
             __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-            // Extract Aff0 (bits 7:0) which typically represents the core ID within a cluster
-            // For more complex topologies, you may need Aff1, Aff2, Aff3 as well
-            return static_cast<uint32_t>(mpidr & 0xFF);
+
+            return cpu_id_from_mpidr(mpidr);
 
 #else
 #error "Unsupported architecture for get_cpu_id()"
