@@ -294,6 +294,10 @@ namespace MINIMAL_STD_NAMESPACE
             allocator_traits_type::deallocate(allocator_, seg.buffer_, seg.original_capacity_);
         }
 
+        //  Far below the 2^32 carry into the capacity field, far above any real number of concurrently failing
+        //      producers.
+        static constexpr size_t POSITION_CLAMP_DISTANCE = size_t{1} << 30;
+
         template <class... Args>
         bool try_claim_and_publish(segment &seg, Args &&...args)
         {
@@ -306,6 +310,24 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (idx >= capacity_at_claim)
             {
+                //  Full.  Our increment was wasted; keep wasted increments from ever carrying into the capacity
+                //      field (after 2^32 of them, idx < capacity would pass again) by pulling the position back to
+                //      capacity once it is far past it.  Only failing producers run this, so the claim fast path is
+                //      unchanged.  Any state with this capacity and a position this far past it is full, so the
+                //      clamp keeps it full; a consumer regrow changes the word and stops the loop.
+                if ((idx - capacity_at_claim) >= POSITION_CLAMP_DISTANCE)
+                {
+                    tagged_enqueue_state::storage_type current = seg.enqueue_pos_.load(memory_order_relaxed);
+                    const tagged_enqueue_state::storage_type clamped = tagged_enqueue_state::pack(capacity_at_claim, capacity_at_claim);
+
+                    while ((tagged_enqueue_state::unpack_capacity(current) == capacity_at_claim) &&
+                           (tagged_enqueue_state::unpack_pos(current) >= capacity_at_claim) &&
+                           ((tagged_enqueue_state::unpack_pos(current) - capacity_at_claim) >= POSITION_CLAMP_DISTANCE) &&
+                           !seg.enqueue_pos_.compare_exchange_weak(current, clamped, memory_order_relaxed, memory_order_relaxed))
+                    {
+                    }
+                }
+
                 return false;
             }
 
