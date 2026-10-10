@@ -69,6 +69,9 @@ namespace MINIMAL_STD_NAMESPACE
         {
             static_assert(!numeric_limits<U>::is_signed, "unsigned only");
 
+            if ((base < 2) || (base > 36))
+                return {first, errc::invalid_argument};
+
             if (first == last)
                 return {first, errc::invalid_argument};
 
@@ -89,7 +92,12 @@ namespace MINIMAL_STD_NAMESPACE
 
                 // overflow check: val * base + ud > max_val
                 if (val > max_div || (val == max_div && ud > max_mod))
-                    return {first, errc::value_too_large};
+                {
+                    //  As std: on overflow, ptr points past all the digits that match the pattern.
+                    while ((p != last) && (digit_value(*p, base) >= 0))
+                        ++p;
+                    return {p, errc::value_too_large};
+                }
 
                 val = val * static_cast<U>(base) + ud;
                 any = true;
@@ -111,6 +119,9 @@ namespace MINIMAL_STD_NAMESPACE
             static_assert(numeric_limits<S>::is_signed, "signed only");
 
             using U = typename make_unsigned<S>::type;
+
+            if ((base < 2) || (base > 36))
+                return {first, errc::invalid_argument};
 
             if (first == last)
                 return {first, errc::invalid_argument};
@@ -141,7 +152,12 @@ namespace MINIMAL_STD_NAMESPACE
                 U ud = static_cast<U>(d);
 
                 if (val > max_div || (val == max_div && ud > max_mod))
-                    return {first, errc::value_too_large};
+                {
+                    //  As std: on overflow, ptr points past all the digits that match the pattern.
+                    while ((p != last) && (digit_value(*p, base) >= 0))
+                        ++p;
+                    return {p, errc::value_too_large};
+                }
 
                 val = val * base_u + ud;
                 any = true;
