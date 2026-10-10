@@ -81,6 +81,8 @@ Deadlock checking is on, which is how an interrupt handler that can never finish
 | `fixed_batch2.cfg` | all fixed; 2 CPUs × 2 ops, threshold and batch size 2 | no error | no error; 1,358,141 distinct states |
 | `fixed_irq.cfg` | all fixed; 1 CPU (3 ops) + interrupt handler (2 ops) | no error, no deadlock | no error; 1,513,359 distinct states |
 | `fixed_stale.cfg` | all fixed; 2 CPUs, 1+3 ops, `StaleBacklinkAt5` | no error | no error; 977,131 distinct states |
+| `fixed_small_live.cfg` | all fixed; 2 CPUs (2 + 1 ops), `SpecIFair` (weak fairness per process) | no error; `Termination` (no livelock in the spin/undo loops) | no error, `Termination` holds; 99,093 distinct states |
+| `fixed_irq_live.cfg` | as `fixed_irq.cfg`, `SpecIFair` | no error; `Termination` | no error, `Termination` holds; 1,513,359 distinct states |
 | `fixed_irq2.cfg` | all fixed; 2 CPUs × 1 op, each with an interrupt handler (1 op) | no error, no deadlock | no error in 13,254,117 distinct states (stopped after 50 min with TSan sharing the CPUs, not exhaustive; 811,561 states left on the queue) |
 | `bug_precas.cfg` | `pre_cas_backlink`, no serialisation | assertion in `FB_pre`: back-link written inside a live block | assertion in `FB_pre` fails |
 | `bug_n3only_stale.cfg` | `post_cas_hint` (N3 only), no serialisation, `StaleBacklinkAt5` | assertion in `TR_meta`: reclaimer reads a header inside a live block (the TSan report behind N4) | assertion in `TR_meta` fails |

@@ -3301,6 +3301,10 @@ NextI == (\E self \in ProcSet : CanRun(self) /\ StepOf(self)) \/ Terminating
 
 SpecI == Init /\ [][NextI]_vars
 
+\* Weak fairness for every process that can run: no spin or undo loop (FB_undo, GM_bundo, GM_breserve, the
+\*   reclaim and trim retries) may keep a process from finishing.  Checked with PROPERTY Termination.
+SpecIFair == SpecI /\ \A p \in ProcSet : WF_vars(CanRun(p) /\ StepOf(p))
+
 -----------------------------------------------------------------------------
 (* Invariants                                                                *)
 
