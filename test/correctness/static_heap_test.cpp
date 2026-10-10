@@ -5,6 +5,7 @@
 #include <CppUTest/TestHarness.h>
 
 #include <single_block_memory_heap>
+#include <__memory_resource/memory_heap_resource_adapter.h>
 
 #define TEST_BUFFER_SIZE 65536
 
@@ -299,7 +300,7 @@ namespace
         CHECK(static_test_heap.blocks_allocated_but_unused() == 0);
         CHECK(test_heap.blocks_reserved() == 194);
         CHECK(test_heap.blocks_in_use() == test_heap.blocks_reserved());
-        CHECK_EQUAL(65424, test_heap.bytes_in_use()); //  65424 is a measured value, there is some space left unused in re-used, allocated blocks
+        CHECK_EQUAL(test_heap.bytes_reserved(), test_heap.bytes_in_use()); //  every block is in use (was a measured 65424: the unsplit-reuse accounting drift)
 
         //  Validate good pointers
 
@@ -360,5 +361,50 @@ namespace
         CHECK(test_heap_aligned_8.actual_block_size(second_block) == 40);
 
         CHECK(test_heap_aligned_8.validate_pointer(second_block));
+    }
+
+    TEST(StaticHeapTests, HeapAdapterNeverReturnsMisalignedMemory)
+    {
+        //  The heap aligns blocks only to its own block alignment (16 here); the adapter passed larger alignments
+        //      through as an element size and returned whatever address came back.
+        minstd::single_block_memory_heap heap(&buffer_aligned16, TEST_BUFFER_SIZE, 16);
+        minstd::pmr::memory_heap_resource_adapter resource(heap);
+
+        size_t misaligned = 0;
+
+        for (int i = 0; i < 8; i++)
+        {
+            void *ptr = resource.allocate(24, 64);
+
+            if ((ptr != nullptr) && ((reinterpret_cast<uintptr_t>(ptr) % 64) != 0))
+            {
+                misaligned++;
+            }
+        }
+
+        CHECK_EQUAL(0u, misaligned); //  before: most of the 8 are misaligned
+
+        void *ptr = resource.allocate(24, 8); //  alignments the heap provides still work
+        CHECK(ptr != nullptr);
+        CHECK_EQUAL(0u, reinterpret_cast<uintptr_t>(ptr) % 8);
+    }
+
+    TEST(StaticHeapTests, AccountingAfterUnsplitReuse)
+    {
+        //  Reusing a free block without splitting it subtracted the requested size from the unused total, but
+        //      deallocation adds back the block's actual size, so bytes_in_use() drifted and then underflowed.
+        alignas(16) static char heap_buffer[88];
+        minstd::single_block_memory_heap heap(heap_buffer, sizeof(heap_buffer));
+
+        char *first = heap.allocate_block<char>(40); //  a 64-byte block including the header
+        CHECK(first != nullptr);
+        heap.deallocate_block(first, 40);
+
+        char *second = heap.allocate_block<char>(32); //  reuses the 64-byte block without splitting it
+        CHECK_EQUAL(first, second);
+        CHECK_EQUAL(heap.bytes_reserved(), heap.bytes_in_use()); //  before: 8 short
+
+        heap.deallocate_block(second, 32);
+        CHECK_EQUAL(0u, heap.bytes_in_use()); //  before: 18446744073709551608
     }
 }

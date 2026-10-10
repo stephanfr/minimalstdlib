@@ -37,6 +37,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             T* allocate(size_t num_elements) override
             {
+                if (num_elements > max_size())
+                {
+                    MINIMAL_STD_OUT_OF_MEMORY(SIZE_MAX, alignof(T), return nullptr);
+                }
+
                 size_t alloc_bytes = num_elements * sizeof(T);
                 return static_cast<T*>(resource_->allocate(alloc_bytes, alignof(T)));
             }

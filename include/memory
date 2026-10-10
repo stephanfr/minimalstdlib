@@ -14,9 +14,20 @@
 #include "utility"
 
 #include "__memory_resource/memory_resource.h"
+#include "__type_traits/is_convertible.h"
 
 namespace MINIMAL_STD_NAMESPACE
 {
+
+    //
+    //  unique_ptr owns an object allocated from a pmr::memory_resource.
+    //
+    //  The pointer may be converted to a base class (unique_ptr<Derived> -> unique_ptr<Base>).  To make that
+    //      safe, the original allocation's address, size, alignment and destructor are captured when the
+    //      unique_ptr is created and travel with every move.  Destruction and deallocation always use them,
+    //      so the most-derived destructor runs (virtual or not), and the resource is handed back exactly the
+    //      pointer, size and alignment it gave out - even when the base is not the first base class.
+    //
 
     template <typename T>
     class unique_ptr
@@ -28,26 +39,28 @@ namespace MINIMAL_STD_NAMESPACE
 
         explicit unique_ptr(T *pointer_to_wrap, minstd::pmr::memory_resource &resource)
             : wrapped_pointer_(pointer_to_wrap),
-              resource_(&resource)
+              resource_(&resource),
+              allocation_((void *)pointer_to_wrap),
+              allocation_size_(sizeof(T)),
+              allocation_alignment_(alignof(T)),
+              destroy_(&destroy_as<T>)
         {
         }
 
-                unique_ptr(const unique_ptr &pointer_to_copy) = delete;
+        unique_ptr(const unique_ptr &pointer_to_copy) = delete;
 
-        unique_ptr(unique_ptr &&pointer_to_copy)
-            : wrapped_pointer_(pointer_to_copy.wrapped_pointer_),
-              resource_(pointer_to_copy.resource_)
+        unique_ptr(unique_ptr &&pointer_to_move)
         {
-            pointer_to_copy.wrapped_pointer_ = nullptr;
+            take_from(pointer_to_move);
         }
 
-        //  Implicit U*→T* conversion; compile error if U is not derived from T.
+        //  Converting move: U* -> T*, only where U* converts implicitly to T* (e.g. U derived from T).
+
         template <typename U>
+            requires is_convertible_v<U *, T *>
         unique_ptr(unique_ptr<U> &&other)
-            : wrapped_pointer_(other.wrapped_pointer_),
-              resource_(other.resource_)
         {
-            other.wrapped_pointer_ = nullptr;
+            take_from(other);
         }
 
         ~unique_ptr()
@@ -59,24 +72,23 @@ namespace MINIMAL_STD_NAMESPACE
 
         unique_ptr &operator=(unique_ptr &&pointer_to_move)
         {
-            destroy_wrapped_pointer();
-
-            wrapped_pointer_ = pointer_to_move.wrapped_pointer_;
-            resource_ = pointer_to_move.resource_;
-            pointer_to_move.wrapped_pointer_ = nullptr;
+            if (this != &pointer_to_move)
+            {
+                destroy_wrapped_pointer();
+                take_from(pointer_to_move);
+            }
 
             return *this;
         }
 
-        //  Implicit U*→T* conversion; compile error if U is not derived from T.
+        //  Converting move assignment: U* -> T*.  Cannot alias *this, since unique_ptr<U> is a different type.
+
         template <typename U>
+            requires is_convertible_v<U *, T *>
         unique_ptr &operator=(unique_ptr<U> &&other)
         {
             destroy_wrapped_pointer();
-
-            wrapped_pointer_ = other.wrapped_pointer_;
-            resource_ = other.resource_;
-            other.wrapped_pointer_ = nullptr;
+            take_from(other);
 
             return *this;
         }
@@ -106,11 +118,14 @@ namespace MINIMAL_STD_NAMESPACE
             return wrapped_pointer_;
         }
 
+        //  The caller takes ownership of the object; it must be destroyed and freed as the allocated type.
+
         T *release() noexcept
         {
             T *return_value = wrapped_pointer_;
 
             wrapped_pointer_ = nullptr;
+            allocation_ = nullptr;
 
             return return_value;
         }
@@ -121,6 +136,33 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
     private:
+        template <typename U>
+        friend class unique_ptr;
+
+        //  Runs the destructor of the type that was actually allocated
+
+        template <typename V>
+        static void destroy_as(void *allocation)
+        {
+            static_cast<V *>(allocation)->~V();
+        }
+
+        //  Takes ownership from another unique_ptr (same type or convertible), leaving it empty
+
+        template <typename U>
+        void take_from(unique_ptr<U> &other)
+        {
+            wrapped_pointer_ = other.wrapped_pointer_; //  implicit U* -> T*, adjusts for base-class offset
+            resource_ = other.resource_;
+            allocation_ = other.allocation_;
+            allocation_size_ = other.allocation_size_;
+            allocation_alignment_ = other.allocation_alignment_;
+            destroy_ = other.destroy_;
+
+            other.wrapped_pointer_ = nullptr;
+            other.allocation_ = nullptr;
+        }
+
         void destroy_wrapped_pointer()
         {
             if (wrapped_pointer_ == nullptr)
@@ -128,20 +170,22 @@ namespace MINIMAL_STD_NAMESPACE
                 return;
             }
 
-            wrapped_pointer_->~T();
+            destroy_(allocation_);
 
             if (resource_ != nullptr)
             {
-                resource_->deallocate(wrapped_pointer_, sizeof(T), alignof(T));
+                resource_->deallocate(allocation_, allocation_size_, allocation_alignment_);
             }
 
             wrapped_pointer_ = nullptr;
+            allocation_ = nullptr;
         }
 
-        T *wrapped_pointer_ = nullptr;
+        T *wrapped_pointer_ = nullptr;                      //  the pointer handed to callers (may be a base subobject)
         minstd::pmr::memory_resource *resource_ = nullptr;
-
-        template <typename U>
-        friend class unique_ptr;
+        void *allocation_ = nullptr;                        //  the address the resource actually returned
+        size_t allocation_size_ = 0;                        //  sizeof the allocated (most-derived) type
+        size_t allocation_alignment_ = 0;                   //  alignof the allocated type
+        void (*destroy_)(void *) = nullptr;                 //  destructor of the allocated type
     };
 }   //  namespace MINSTD

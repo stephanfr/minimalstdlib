@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 #include "../shared/lockfree_skiplist_test_helpers.h"
+#include "../shared/process_isolation.h"
 
 namespace
 {
@@ -244,8 +245,9 @@ namespace
 
     TEST(SkiplistTests, DefaultConstructorFallbackMatchesResourceConstructorBehavior)
     {
-        //  The two lists must NOT coexist: atomic_forward_link::block_memory_resource_
-        //  is a static shared across all instances of the same template instantiation.
+        //  The two lists must NOT coexist: they are the same type (same Tag), so they share one slot-block
+        //      memory resource, and the default list's is nullptr.  Lists that need different resources at the
+        //      same time use different Tags (see TaggedListsUseIndependentMemoryResources).
         //  Run them in non-overlapping scopes and record results for cross-comparison.
 
         using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS>;
@@ -751,4 +753,411 @@ namespace
         }
         CHECK_EQUAL(7, count);
     }
+
+    TEST(SkiplistTests, ConcurrentInsertRemoveOfSameKeysReclaimsEveryNode)
+    {
+        //  Threads insert and remove the same few keys.  Once the list is emptied and every level has been
+        //      helped, every node that was successfully inserted must have been reclaimed.  A node that
+        //      insert() published at an upper level after remove() retired it, or that was skipped by a stale
+        //      upper-level successor, is never unlinked at level 0 and is missing from nodes_reclaimed().
+
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14, minstd::skiplist_extensions::skiplist_statistics>;
+
+        constexpr uint32_t NUM_THREADS = 8;
+        constexpr uint32_t NUM_KEYS = 16;
+        constexpr uint32_t OPS_PER_THREAD = 100000;
+
+        list_type list;
+        list.reset_statistics();
+
+        struct args_type
+        {
+            list_type *list;
+            minstd::atomic<bool> *go;
+            minstd::atomic<uint32_t> *inserted;
+            uint64_t seed;
+        };
+
+        auto worker = [](void *arg) -> void *
+        {
+            auto *a = static_cast<args_type *>(arg);
+
+            while (!a->go->load(minstd::memory_order_acquire))
+            {
+            }
+
+            uint64_t rng = a->seed;
+
+            for (uint32_t i = 0; i < OPS_PER_THREAD; ++i)
+            {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                const uint32_t key = static_cast<uint32_t>((rng >> 33) % NUM_KEYS) + 1;
+
+                if (((rng >> 62) & 1) != 0)
+                {
+                    if (a->list->insert(key, key))
+                    {
+                        a->inserted->fetch_add(1);
+                    }
+                }
+                else
+                {
+                    a->list->remove(key);
+                }
+            }
+
+            return nullptr;
+        };
+
+        minstd::atomic<bool> go{false};
+        minstd::atomic<uint32_t> inserted{0};
+        args_type args[NUM_THREADS];
+        pthread_t threads[NUM_THREADS];
+
+        for (uint32_t t = 0; t < NUM_THREADS; ++t)
+        {
+            args[t] = {&list, &go, &inserted, 0x9E3779B97F4A7C15ULL * (t + 1)};
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, &args[t]));
+        }
+
+        go.store(true, minstd::memory_order_release);
+
+        for (uint32_t t = 0; t < NUM_THREADS; ++t)
+        {
+            pthread_join(threads[t], nullptr);
+        }
+
+        for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+        {
+            list.remove(key);
+        }
+
+        //  Help every level unlink, and let every CPU slot reclaim what it retired.
+        for (uint32_t round = 0; round < 64; ++round)
+        {
+            for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+            {
+                list.find(key);
+            }
+
+            for (size_t slot = 0; slot < SKIPLIST_STRESS_MAX_THREADS; ++slot)
+            {
+                list.advance_and_reclaim(slot);
+            }
+        }
+
+        CHECK_EQUAL(0u, list.size());
+        CHECK_EQUAL(inserted.load(), list.nodes_reclaimed()); //  before: fewer (stranded nodes)
+    }
+
+    TEST(SkiplistTests, SharedSlotReclaimThrottleIsRaceFree)
+    {
+        //  Several threads drive the throttle of ONE slot, as threads on one CPU (or an interrupt handler and
+        //      the code it interrupted) do through skip_list::remove().
+        using state_type = minstd::cpu_slot_policy_state<int, 16, 4>;
+
+        static state_type state;
+        state.initialize(0, 1);
+
+        constexpr size_t NUM_THREADS = 4;
+        constexpr size_t ITERATIONS = 100000;
+
+        auto worker = [](void *arg) -> void *
+        {
+            const bool freeing = (reinterpret_cast<uintptr_t>(arg) & 1) != 0;
+
+            for (size_t i = 0; i < ITERATIONS; ++i)
+            {
+                state.increment_reclaim_throttle();
+
+                if (state.reclaim_throttle_triggered())
+                {
+                    state.adapt_reclaim_throttle(freeing ? 1 : 0, freeing); //  before: TSan data race on the period
+                }
+            }
+
+            return nullptr;
+        };
+
+        pthread_t threads[NUM_THREADS];
+        for (uintptr_t t = 0; t < NUM_THREADS; ++t)
+        {
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, reinterpret_cast<void *>(t)));
+        }
+        for (auto &thread : threads)
+        {
+            pthread_join(thread, nullptr);
+        }
+
+        const uint32_t period = state.reclaim_throttle_period();
+        CHECK(period >= 4 && period <= 16);
+    }
+
+    //  ---- Slot allocator tests (K2/K3) ----
+
+    namespace
+    {
+        //  atomic_forward_link reads these two fields from the pointer it is given.  Each test uses its own node
+        //      type because the slot tables are static per instantiation.
+        struct aba_node
+        {
+            uint32_t internal_slot_ = 0;
+            uint32_t internal_generation_ = 0;
+        };
+
+        struct churn_node
+        {
+            uint32_t internal_slot_ = 0;
+            uint32_t internal_generation_ = 0;
+        };
+
+        struct exhaust_node
+        {
+            uint32_t internal_slot_ = 0;
+            uint32_t internal_generation_ = 0;
+        };
+
+        struct oom_node
+        {
+            uint32_t internal_slot_ = 0;
+            uint32_t internal_generation_ = 0;
+        };
+
+        class failing_block_resource : public minstd::pmr::memory_resource
+        {
+            void *do_allocate(size_t, size_t) override { return nullptr; }
+            void do_deallocate(void *, size_t, size_t) override {}
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override { return this == &other; }
+        };
+
+        template <typename link_type>
+        void release_all_slot_blocks()
+        {
+            for (auto &entry : link_type::blocks_)
+            {
+                link_type::delete_block(entry.exchange(nullptr)); //  delete_block(nullptr) is a no-op
+            }
+
+            for (auto *block = link_type::extract_unlinked_blocks(); block != nullptr;)
+            {
+                auto *next = block->retired_next;
+                link_type::delete_block(block);
+                block = next;
+            }
+        }
+    }
+
+    TEST(SkiplistTests, SlotAllocatorNeverHandsOutTheSameSlotTwice)
+    {
+        using link_type = minstd::skiplist_internal::atomic_forward_link<aba_node>;
+
+        constexpr size_t NUM_THREADS = 8;
+        constexpr size_t ITERATIONS = 200000;
+        constexpr size_t TRACKED_SLOTS = 1u << 14; //  block 0
+
+        static aba_node nodes[NUM_THREADS];
+        static minstd::atomic<uint32_t> holders[TRACKED_SLOTS];
+
+        struct args_type
+        {
+            aba_node *node;
+            minstd::atomic<bool> *go;
+            minstd::atomic<uint32_t> *violations;
+        };
+
+        auto worker = [](void *arg) -> void *
+        {
+            auto *a = static_cast<args_type *>(arg);
+
+            //  Keep one slot for the whole run so the block never drains and retires.
+            const auto pin = link_type::allocate_slot(a->node);
+
+            while (!a->go->load(minstd::memory_order_acquire))
+            {
+            }
+
+            for (size_t i = 0; i < ITERATIONS; ++i)
+            {
+                const auto handle = link_type::allocate_slot(a->node);
+
+                if ((handle.slot == 0) || (handle.slot >= TRACKED_SLOTS))
+                {
+                    continue;
+                }
+
+                if (holders[handle.slot].fetch_add(1) != 0) //  someone else holds this slot too
+                {
+                    a->violations->fetch_add(1);
+                }
+
+                holders[handle.slot].fetch_sub(1);
+                link_type::free_slot(handle.slot);
+            }
+
+            link_type::free_slot(pin.slot);
+            return nullptr;
+        };
+
+        minstd::atomic<bool> go{false};
+        minstd::atomic<uint32_t> violations{0};
+        args_type args[NUM_THREADS];
+        pthread_t threads[NUM_THREADS];
+
+        for (size_t t = 0; t < NUM_THREADS; ++t)
+        {
+            args[t] = {&nodes[t], &go, &violations};
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, &args[t]));
+        }
+
+        go.store(true, minstd::memory_order_release);
+
+        for (size_t t = 0; t < NUM_THREADS; ++t)
+        {
+            pthread_join(threads[t], nullptr);
+        }
+
+        release_all_slot_blocks<link_type>();
+
+        CHECK_EQUAL(0u, violations.load()); //  before: > 0 (probabilistic)
+    }
+
+    TEST(SkiplistTests, SlotAllocateFreeCycleReusesOneSlotAndOneBlock)
+    {
+        using link_type = minstd::skiplist_internal::atomic_forward_link<churn_node, 14, minstd::skiplist_extensions::skiplist_slot_statistics>;
+
+        churn_node node;
+
+        for (int i = 0; i < 100; ++i)
+        {
+            const auto handle = link_type::allocate_slot(&node);
+            CHECK(handle.slot != 0);
+            link_type::free_slot(handle.slot);
+        }
+
+        CHECK(link_type::slot_high_water_mark() <= 1);              //  before: 100
+        CHECK_EQUAL(1u, link_type::slot_stats_.blocks_allocated()); //  before: 100
+
+        release_all_slot_blocks<link_type>();
+    }
+
+    TEST(SkiplistTests, SlotRangesAreReusedOnceTheCursorIsExhausted)
+    {
+        using link_type = minstd::skiplist_internal::atomic_forward_link<exhaust_node, 6>; //  64 slots per block
+
+        static exhaust_node node;
+        static uint32_t slots[link_type::MAX_SLOTS];
+        size_t allocated = 0;
+
+        //  Walk the cursor through the whole slot space (slot 0 is the null handle).
+        while (true)
+        {
+            const auto handle = link_type::allocate_slot(&node);
+            if (handle.slot == 0)
+            {
+                break;
+            }
+            slots[allocated++] = handle.slot;
+        }
+
+        CHECK_EQUAL(link_type::MAX_SLOTS - 1, allocated);
+
+        for (size_t i = 0; i < allocated; ++i) //  every block drains and retires
+        {
+            link_type::free_slot(slots[i]);
+        }
+
+        const auto handle = link_type::allocate_slot(&node);
+        CHECK(handle.slot != 0); //  before: 0 forever - retired ranges were never reused
+
+        link_type::free_slot(handle.slot);
+        release_all_slot_blocks<link_type>();
+    }
+
+    TEST(SkiplistTests, FailedSlotBlockAllocationReturnsNoSlot)
+    {
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        using link_type = minstd::skiplist_internal::atomic_forward_link<oom_node>;
+                                                        failing_block_resource resource;
+                                                        link_type::set_block_memory_resource(&resource);
+                                                        oom_node node;
+                                                        const auto handle = link_type::allocate_slot(&node);
+                                                        if (handle.slot != 0) _exit(1); })); //  before: the child segfaults
+    }
+
+
+    namespace
+    {
+        //  Counts allocations; honours alignment (skip_node and slot_block are alignas(64)).
+        class aligned_counting_resource : public minstd::pmr::memory_resource
+        {
+        public:
+            size_t allocations() const { return allocations_; }
+            size_t outstanding() const { return allocations_ - deallocations_; }
+
+        private:
+            size_t allocations_ = 0;
+            size_t deallocations_ = 0;
+
+            void *do_allocate(size_t bytes, size_t alignment) override
+            {
+                allocations_++;
+                return aligned_alloc(alignment, (bytes + alignment - 1) / alignment * alignment);
+            }
+
+            void do_deallocate(void *ptr, size_t, size_t) override
+            {
+                deallocations_++;
+                free(ptr);
+            }
+
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override { return this == &other; }
+        };
+
+        struct first_list_tag {};
+        struct second_list_tag {};
+    }
+
+    TEST(SkiplistTests, TaggedListsUseIndependentMemoryResources)
+    {
+        //  Same key, value and parameters, different tags: each list has its own slot tables, so the two can be
+        //      alive at the same time on different memory resources.
+        using first_list_type = minstd::skip_list<uint32_t, uint32_t, 4, 16, 6, minstd::skiplist_extensions::null_skiplist_statistics, first_list_tag>;
+        using second_list_type = minstd::skip_list<uint32_t, uint32_t, 4, 16, 6, minstd::skiplist_extensions::null_skiplist_statistics, second_list_tag>;
+
+        aligned_counting_resource first_resource;
+        aligned_counting_resource second_resource;
+
+        {
+            first_list_type first(&first_resource);
+            second_list_type second(&second_resource);
+
+            const size_t second_allocations = second_resource.allocations();
+
+            for (uint32_t key = 1; key <= 200; ++key) //  more than one 64-slot block
+            {
+                CHECK_TRUE(first.insert(key, key * 10));
+            }
+
+            CHECK_EQUAL(second_allocations, second_resource.allocations()); //  nothing of first's came from second's resource
+
+            for (uint32_t key = 1; key <= 100; ++key)
+            {
+                CHECK_TRUE(second.insert(key, key * 20));
+            }
+
+            CHECK_EQUAL(200u, first.size());
+            CHECK_EQUAL(100u, second.size());
+
+            for (uint32_t key = 1; key <= 100; ++key)
+            {
+                CHECK_EQUAL(key * 10, first.find(key)->second);
+                CHECK_EQUAL(key * 20, second.find(key)->second);
+            }
+        } //  second is destroyed first: it must not redirect first's teardown to second's resource
+
+        CHECK_EQUAL(0u, first_resource.outstanding());
+        CHECK_EQUAL(0u, second_resource.outstanding());
+    }
+
 }

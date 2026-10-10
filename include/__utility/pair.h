@@ -52,6 +52,8 @@ namespace MINIMAL_STD_NAMESPACE
 
         inline void swap(pair &other) noexcept(nothrow_swappable)
         {
+            using MINIMAL_STD_NAMESPACE::swap; //  the member swap otherwise hides the free functions
+
             swap(first, other.first);
             swap(second, other.second);
         }

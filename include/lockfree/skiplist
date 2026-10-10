@@ -42,7 +42,13 @@ namespace MINIMAL_STD_NAMESPACE
 
             value_type *allocate(size_t num_elements)
             {
-                return static_cast<value_type *>(malloc(sizeof(value_type) * num_elements));
+                //  skip_node and slot_block are alignas(64); malloc only guarantees alignof(max_align_t).
+                //      aligned_alloc requires the size to be a multiple of the alignment.
+
+                constexpr size_t alignment = alignof(value_type) > alignof(max_align_t) ? alignof(value_type) : alignof(max_align_t);
+                const size_t bytes = ((sizeof(value_type) * num_elements + alignment - 1) / alignment) * alignment;
+
+                return static_cast<value_type *>(aligned_alloc(alignment, bytes));
             }
 
             void deallocate(value_type *ptr, size_t /*num_elements*/)
@@ -85,7 +91,7 @@ namespace MINIMAL_STD_NAMESPACE
                 array<atomic<T *>, SLOTS_PER_BLOCK> slot_table_{};
                 array<atomic<uint32_t>, SLOTS_PER_BLOCK> free_next_slot_{};
                 array<atomic<uint32_t>, SLOTS_PER_BLOCK> slot_generation_{};
-                atomic<uint32_t> free_list_head_{0};
+                atomic<uint64_t> free_list_head_{0}; //  [change counter:32][slot:32]
                 atomic<uint32_t> active_slots_{0};
 
                 slot_block *retired_next{nullptr};
@@ -113,17 +119,30 @@ namespace MINIMAL_STD_NAMESPACE
             static inline atomic<uint32_t> high_water_slot_{0};
             static inline atomic<uint32_t> high_water_block_{0};
             static inline array<atomic<slot_block *>, MAX_BLOCKS> blocks_{};
-            static inline atomic<uint64_t> partially_free_blocks_{0};
+            //  One bit per block that may have free slots (a single 64-bit word aliased blocks >= 64).
+            static constexpr uint32_t PARTIALLY_FREE_WORDS = (MAX_BLOCKS + 63) / 64;
+            static inline array<atomic<uint64_t>, PARTIALLY_FREE_WORDS> partially_free_blocks_{};
+
+            //  Bumped every time a block is installed at an index, so a new block's generations never repeat
+            //      those of an earlier block at the same index (a stale handle must not resolve to a new node).
+            static inline array<atomic<uint32_t>, MAX_BLOCKS> block_incarnation_{};
+
             static inline atomic<slot_block *> unlinked_blocks_{nullptr};
 
-            //  Memory resource used for slot_block allocation/deallocation.
-            //  Set once per template instantiation by skip_list constructor.
+            //  Memory resource used for slot_block allocation/deallocation.  Slot blocks are static per
+            //      instantiation, so every live skip_list of one type (including its Tag) shares this resource: the
+            //      first instance sets it and the last one clears it.
             //  When null (test-only default constructor path), falls back to malloc/free.
             static inline pmr::memory_resource* block_memory_resource_ = nullptr;
 
             static void set_block_memory_resource(pmr::memory_resource* mr)
             {
                 block_memory_resource_ = mr;
+            }
+
+            static pmr::memory_resource *block_memory_resource()
+            {
+                return block_memory_resource_;
             }
 
             static slot_block* new_block()
@@ -185,10 +204,17 @@ namespace MINIMAL_STD_NAMESPACE
 
             static void retire_block(slot_block *block, uint32_t block_idx)
             {
+                //  Never retire the block the fresh-slot cursor is filling: a small list would otherwise free and
+                //      reallocate a whole block on every insert/remove.
+                if (block_idx == slot_to_block_index(next_free_slot_.load(memory_order_acquire)))
+                {
+                    return;
+                }
+
                 uint32_t expected = 0;
                 if (block->active_slots_.compare_exchange_strong(expected, UINT32_MAX, memory_order_acq_rel, memory_order_acquire))
                 {
-                    partially_free_blocks_.fetch_and(~(1ULL << (block_idx & 63)), memory_order_release);
+                    partially_free_blocks_[block_idx / 64].fetch_and(~(1ULL << (block_idx % 64)), memory_order_acq_rel);
 
                     slot_block *expected_block = block;
                     if (blocks_[block_idx].compare_exchange_strong(expected_block, nullptr, memory_order_acq_rel, memory_order_acquire))
@@ -199,6 +225,66 @@ namespace MINIMAL_STD_NAMESPACE
                             block->retired_next = old_unlinked;
                         } while (!unlinked_blocks_.compare_exchange_weak(old_unlinked, block, memory_order_release, memory_order_relaxed));
                     }
+                }
+            }
+
+            static void mark_partially_free(uint32_t block_idx)
+            {
+                partially_free_blocks_[block_idx / 64].fetch_or(1ULL << (block_idx % 64), memory_order_release);
+            }
+
+            static void clear_partially_free(slot_block *block, uint32_t block_idx)
+            {
+                partially_free_blocks_[block_idx / 64].fetch_and(~(1ULL << (block_idx % 64)), memory_order_acq_rel);
+
+                //  A free_slot() that pushed before our clear set the bit before it: re-mark if the list is not empty.
+                if (static_cast<uint32_t>(block->free_list_head_.load(memory_order_acquire)) != 0)
+                {
+                    mark_partially_free(block_idx);
+                }
+            }
+
+            //  Free-list head: [change counter:32][slot:32].  Every push/pop bumps the counter, so a pop that read a
+            //      stale head cannot succeed after the same slot came back (ABA).
+            static uint64_t pack_free_head(uint64_t previous, uint32_t slot)
+            {
+                return (((previous >> 32) + 1) << 32) | slot;
+            }
+
+            //  Take a reference on a block so it cannot retire.  Fails if the block is retiring.
+            static bool pin_block(slot_block *block)
+            {
+                uint32_t active = block->active_slots_.load(memory_order_acquire);
+
+                while (active != UINT32_MAX)
+                {
+                    if (block->active_slots_.compare_exchange_weak(active, active + 1, memory_order_acquire, memory_order_acquire))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            static void unpin_block(slot_block *block, uint32_t block_idx)
+            {
+                if (block->active_slots_.fetch_sub(1, memory_order_release) == 1)
+                {
+                    retire_block(block, block_idx);
+                }
+            }
+
+            //  Give every slot of a block about to be installed at block_idx a generation above any used by an
+            //      earlier block at that index.
+            static void seed_block_generations(slot_block *block, uint32_t block_idx)
+            {
+                const uint32_t incarnation = block_incarnation_[block_idx].fetch_add(1, memory_order_relaxed) + 1;
+                const uint32_t seed = (incarnation << 16) & GENERATION_MASK;
+
+                for (uint32_t offset = 0; offset < SLOTS_PER_BLOCK; ++offset)
+                {
+                    block->slot_generation_[offset].store(seed, memory_order_relaxed);
                 }
             }
 
@@ -245,6 +331,8 @@ namespace MINIMAL_STD_NAMESPACE
                     return nullptr;
                 }
 
+                seed_block_generations(new_block_ptr, block_index);
+
                 if (blocks_[block_index].compare_exchange_strong(current_block, new_block_ptr, memory_order_release, memory_order_acquire))
                 {
                     uint32_t observed_hw = high_water_block_.load(memory_order_relaxed);
@@ -261,96 +349,173 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             }
 
-            static slot_handle allocate_slot(T *ptr)
+            static slot_handle publish_slot(slot_block *block, uint32_t slot, T *ptr)
             {
-                uint64_t available_blocks = partially_free_blocks_.load(memory_order_acquire);
+                const uint32_t offset = slot_to_block_offset(slot);
 
-                while (available_blocks != 0)
+                update_high_water_slot(slot);
+
+                uint32_t generation = (block->slot_generation_[offset].load(memory_order_relaxed) + 1u) & GENERATION_MASK;
+                if (generation == 0)
                 {
-                    uint32_t block_idx = __builtin_ctzll(available_blocks);
+                    generation = 1;
+                }
 
-                    slot_block *block = blocks_[block_idx].load(memory_order_acquire);
-                    if (block != nullptr)
+                block->slot_generation_[offset].store(generation, memory_order_release);
+                block->slot_table_[offset].store(ptr, memory_order_release);
+
+                return {slot, generation};
+            }
+
+            static slot_handle allocate_from_partially_free_blocks(T *ptr)
+            {
+                for (uint32_t word = 0; word < PARTIALLY_FREE_WORDS; ++word)
+                {
+                    uint64_t available = partially_free_blocks_[word].load(memory_order_acquire);
+
+                    while (available != 0)
                     {
-                        uint32_t active = block->active_slots_.load(memory_order_acquire);
-                        while (active != UINT32_MAX)
-                        {
-                            if (block->active_slots_.compare_exchange_weak(active, active + 1, memory_order_acquire))
-                            {
-                                break;
-                            }
-                        }
+                        const uint32_t block_idx = word * 64 + static_cast<uint32_t>(__builtin_ctzll(available));
+                        available &= available - 1;
 
-                        if (active == UINT32_MAX)
+                        slot_block *block = blocks_[block_idx].load(memory_order_acquire);
+                        if (block == nullptr)
                         {
-                            partially_free_blocks_.fetch_and(~(1ULL << (block_idx & 63)), memory_order_release);
-                            available_blocks &= ~(1ULL << (block_idx & 63));
+                            partially_free_blocks_[word].fetch_and(~(1ULL << (block_idx % 64)), memory_order_acq_rel);
                             continue;
                         }
 
-                        uint32_t head = block->free_list_head_.load(memory_order_acquire);
-                        while (head != 0)
+                        if (!pin_block(block)) //  retiring
                         {
-                            uint32_t offset = slot_to_block_offset(head);
-                            const uint32_t next = block->free_next_slot_[offset].load(memory_order_acquire);
+                            continue;
+                        }
 
-                            if (block->free_list_head_.compare_exchange_weak(head, next, memory_order_acq_rel))
+                        uint64_t head = block->free_list_head_.load(memory_order_acquire);
+                        while (static_cast<uint32_t>(head) != 0)
+                        {
+                            const uint32_t slot = static_cast<uint32_t>(head);
+                            const uint32_t next = block->free_next_slot_[slot_to_block_offset(slot)].load(memory_order_acquire);
+
+                            if (block->free_list_head_.compare_exchange_weak(head, pack_free_head(head, next), memory_order_acq_rel, memory_order_acquire))
                             {
                                 if (next == 0)
                                 {
-                                    partially_free_blocks_.fetch_and(~(1ULL << (block_idx & 63)), memory_order_release);
+                                    clear_partially_free(block, block_idx);
                                 }
 
-                                update_high_water_slot(head);
-
-                                uint32_t generation = block->slot_generation_[offset].load(memory_order_relaxed);
-                                generation = (generation + 1u) & GENERATION_MASK;
-                                if (generation == 0)
-                                {
-                                    generation = 1;
-                                }
-
-                                block->slot_generation_[offset].store(generation, memory_order_release);
-                                block->slot_table_[offset].store(ptr, memory_order_release);
-                                return {head, generation};
+                                return publish_slot(block, slot, ptr); //  the pin is now this slot's reference
                             }
                         }
 
-                        if (block->active_slots_.fetch_sub(1, memory_order_release) == 1)
-                        {
-                            retire_block(block, block_idx);
-                        }
-
-                        partially_free_blocks_.fetch_and(~(1ULL << (block_idx & 63)), memory_order_release);
+                        //  The list emptied under us: drop the bit and the pin.
+                        clear_partially_free(block, block_idx);
+                        unpin_block(block, block_idx);
                     }
-                    else
-                    {
-                        partially_free_blocks_.fetch_and(~(1ULL << (block_idx & 63)), memory_order_release);
-                    }
-
-                    available_blocks = partially_free_blocks_.load(memory_order_acquire);
-                }
-
-                uint32_t idx = next_free_slot_.fetch_add(1, memory_order_acq_rel);
-                if (idx < MAX_SLOTS)
-                {
-                    uint32_t block_idx = slot_to_block_index(idx);
-                    uint32_t offset = slot_to_block_offset(idx);
-
-                    slot_block *block = ensure_block_installed(block_idx);
-
-                    block->active_slots_.fetch_add(1, memory_order_relaxed);
-
-                    update_high_water_slot(idx);
-
-                    const uint32_t generation = 1;
-                    block->slot_generation_[offset].store(generation, memory_order_release);
-                    block->slot_table_[offset].store(ptr, memory_order_release);
-                    block->free_next_slot_[offset].store(0, memory_order_relaxed);
-                    return {idx, generation};
                 }
 
                 return {0, 0};
+            }
+
+            static slot_handle allocate_fresh_slot(T *ptr)
+            {
+                while (true)
+                {
+                    uint32_t idx = next_free_slot_.load(memory_order_acquire);
+
+                    if (idx >= MAX_SLOTS)
+                    {
+                        return {0, 0}; //  exhausted: the cursor never runs on (and wraps onto live slots)
+                    }
+
+                    const uint32_t block_idx = slot_to_block_index(idx);
+
+                    slot_block *block = ensure_block_installed(block_idx);
+                    if (block == nullptr)
+                    {
+                        return {0, 0}; //  block allocation failed (was a null dereference)
+                    }
+
+                    //  Pin before claiming, so the block cannot retire between the claim and the publish.
+                    if (!pin_block(block))
+                    {
+                        continue; //  retired under us; the next pass installs a fresh block
+                    }
+
+                    if (!next_free_slot_.compare_exchange_strong(idx, idx + 1, memory_order_acq_rel, memory_order_acquire))
+                    {
+                        unpin_block(block, block_idx);
+                        continue;
+                    }
+
+                    block->free_next_slot_[slot_to_block_offset(idx)].store(0, memory_order_relaxed);
+
+                    return publish_slot(block, idx, ptr);
+                }
+            }
+
+            //  Once the fresh-slot cursor is exhausted, rebuild a retired block's range with every slot free.
+            static bool reinstall_retired_block()
+            {
+                for (uint32_t block_idx = 0; block_idx < MAX_BLOCKS; ++block_idx)
+                {
+                    if (blocks_[block_idx].load(memory_order_acquire) != nullptr)
+                    {
+                        continue;
+                    }
+
+                    slot_block *block = new_block();
+                    if (block == nullptr)
+                    {
+                        return false;
+                    }
+
+                    seed_block_generations(block, block_idx);
+
+                    const uint32_t first_offset = (block_idx == 0) ? 1 : 0; //  slot 0 is the null handle
+
+                    uint32_t head = 0;
+                    for (uint32_t offset = SLOTS_PER_BLOCK; offset-- > first_offset;)
+                    {
+                        block->free_next_slot_[offset].store(head, memory_order_relaxed);
+                        head = (block_idx << SLOTS_PER_BLOCK_SHIFT) | offset;
+                    }
+
+                    block->free_list_head_.store(head, memory_order_relaxed);
+
+                    slot_block *expected = nullptr;
+                    if (blocks_[block_idx].compare_exchange_strong(expected, block, memory_order_acq_rel, memory_order_acquire))
+                    {
+                        mark_partially_free(block_idx);
+                        return true;
+                    }
+
+                    delete_block(block); //  another thread reinstalled it first
+                }
+
+                return false;
+            }
+
+            static slot_handle allocate_slot(T *ptr)
+            {
+                while (true)
+                {
+                    slot_handle handle = allocate_from_partially_free_blocks(ptr);
+                    if (handle.slot != 0)
+                    {
+                        return handle;
+                    }
+
+                    handle = allocate_fresh_slot(ptr);
+                    if (handle.slot != 0)
+                    {
+                        return handle;
+                    }
+
+                    if ((next_free_slot_.load(memory_order_acquire) < MAX_SLOTS) || !reinstall_retired_block())
+                    {
+                        return {0, 0};
+                    }
+                }
             }
 
             static void free_slot(uint32_t slot)
@@ -358,30 +523,24 @@ namespace MINIMAL_STD_NAMESPACE
                 if ((slot == 0) || (slot >= MAX_SLOTS))
                     return;
 
-                uint32_t block_idx = slot_to_block_index(slot);
-                uint32_t offset = slot_to_block_offset(slot);
+                const uint32_t block_idx = slot_to_block_index(slot);
+                const uint32_t offset = slot_to_block_offset(slot);
                 slot_block *block = blocks_[block_idx].load(memory_order_acquire);
                 if (block == nullptr)
                     return; // Should not happen for a valid allocated slot
 
-                uint32_t head = block->free_list_head_.load(memory_order_acquire);
-                while (true)
-                {
-                    // Never store freelist metadata in slot_table_. Readers of
-                    // unpack_ptr() must only ever observe real node pointers or nullptr.
-                    block->slot_table_[offset].store(nullptr, memory_order_release);
-                    block->free_next_slot_[offset].store(head, memory_order_release);
+                // Never store freelist metadata in slot_table_. Readers of
+                // unpack_ptr() must only ever observe real node pointers or nullptr.
+                block->slot_table_[offset].store(nullptr, memory_order_release);
 
-                    if (block->free_list_head_.compare_exchange_weak(head, slot, memory_order_acq_rel))
-                    {
-                        partially_free_blocks_.fetch_or(1ULL << (block_idx & 63), memory_order_release);
-                        if (block->active_slots_.fetch_sub(1, memory_order_release) == 1)
-                        {
-                            retire_block(block, block_idx);
-                        }
-                        break;
-                    }
-                }
+                uint64_t head = block->free_list_head_.load(memory_order_acquire);
+                do
+                {
+                    block->free_next_slot_[offset].store(static_cast<uint32_t>(head), memory_order_release);
+                } while (!block->free_list_head_.compare_exchange_weak(head, pack_free_head(head, slot), memory_order_acq_rel, memory_order_acquire));
+
+                mark_partially_free(block_idx);
+                unpin_block(block, block_idx);
             }
 
         private:
@@ -577,7 +736,18 @@ namespace MINIMAL_STD_NAMESPACE
             atomic<uint64_t> packed_;
         };
 
-        template <typename KeyType, typename ValueType, size_t NumCPUs, int32_t MAX_LEVELS = DEFAULT_MAX_LEVELS, uint32_t SlotsPerBlockShift = 14, typename Statistics = skiplist_extensions::null_skiplist_statistics> //  NumCPUs: CPU slot array size (mandatory — sizes cpu_slots_); MAX_LEVELS must be signed as we iterate down to and include index 0
+        //  NumCPUs: CPU slot array size (mandatory - sizes cpu_slots_).
+        //  MAX_LEVELS must be signed as we iterate down to and include index 0.
+        //  Tag: any type, used only to make a distinct instantiation.  The slot tables that resolve node handles are
+        //      static per instantiation, so all live lists of one type share them and must allocate slot blocks
+        //      from the same memory resource.  Lists that need different memory resources use different tags:
+        //
+        //          struct cache_tag {};
+        //          struct index_tag {};
+        //          skip_list<uint32_t, uint32_t, 4, 16, 14, null_skiplist_statistics, cache_tag> cache(&cache_resource);
+        //          skip_list<uint32_t, uint32_t, 4, 16, 14, null_skiplist_statistics, index_tag> index(&index_resource);
+
+        template <typename KeyType, typename ValueType, size_t NumCPUs, int32_t MAX_LEVELS = DEFAULT_MAX_LEVELS, uint32_t SlotsPerBlockShift = 14, typename Statistics = skiplist_extensions::null_skiplist_statistics, typename Tag = void>
         class skip_list : public Statistics
         {
         private:
@@ -1047,8 +1217,16 @@ namespace MINIMAL_STD_NAMESPACE
             explicit skip_list(pmr::memory_resource *memory_resource)
                 : memory_resource_(memory_resource), epoch_reclaimer_(slot_policy_)
             {
-                active_instance_count_.fetch_add(1, memory_order_relaxed);
-                forward_link_type::set_block_memory_resource(memory_resource_);
+                //  Slot blocks are shared by every live skip_list of this type (see Tag): the first instance sets
+                //      their memory resource, and the last one to be destroyed clears it.
+                if (active_instance_count_.fetch_add(1, memory_order_acq_rel) == 0)
+                {
+                    forward_link_type::set_block_memory_resource(memory_resource_);
+                }
+                else
+                {
+                    MINIMAL_STD_ASSERT(forward_link_type::block_memory_resource() == memory_resource_); //  use a different Tag
+                }
 
                 NIL_ = allocate_skip_node(numeric_limits<KeyType>::max(), MAX_LEVELS + 1, nullptr);
 
@@ -1068,9 +1246,6 @@ namespace MINIMAL_STD_NAMESPACE
 
             ~skip_list()
             {
-                // Ensure any block frees during teardown route to this instance's allocator.
-                forward_link_type::set_block_memory_resource(memory_resource_);
-
                 skip_node *current_node = (head_ != nullptr) ? head_->next_node[0].get_reference() : nullptr;
 
                 while (current_node != nullptr && current_node != NIL_)
@@ -1120,7 +1295,10 @@ namespace MINIMAL_STD_NAMESPACE
                         unlinked = next;
                     }
 
-                    forward_link_type::partially_free_blocks_.store(0, memory_order_release);
+                    for (auto &word : forward_link_type::partially_free_blocks_)
+                    {
+                        word.store(0, memory_order_release);
+                    }
                     forward_link_type::high_water_slot_.store(0, memory_order_relaxed);
                     forward_link_type::high_water_block_.store(0, memory_order_relaxed);
                     forward_link_type::next_free_slot_.store(1, memory_order_release);
@@ -1172,7 +1350,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {
@@ -1240,7 +1418,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {
@@ -1387,7 +1565,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                                     succ = curr->next_node[0].get(is_tombstoned);
 
-                                    if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                    if (upper_levels_drained(tombstoned_node))
                                     {
                                         if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                         {
@@ -1440,12 +1618,30 @@ namespace MINIMAL_STD_NAMESPACE
                                 pred = preds[level];
                                 succ = succs[level];
 
+                                //  Reserve the link before it can become visible, so a remover that reads the counter
+                                //      after this point leaves level 0 linked.  See upper_levels_drained().
+                                new_node->upper_levels_remaining_.fetch_add(1, memory_order_seq_cst);
+                                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                                //  Re-aim our own link at the current successor (it was set once, before the level-0
+                                //      link, and is stale after a retry).  This CAS fails if a remover has tombstoned the
+                                //      link: then the node is being removed and must not be published any higher.
+                                bool own_link_tombstoned = false;
+                                skip_node *own_next = new_node->next_node[level].get(own_link_tombstoned);
+
+                                if (own_link_tombstoned || ((own_next != succ) && !new_node->next_node[level].compare_exchange_strong(own_next, succ)))
+                                {
+                                    new_node->upper_levels_remaining_.fetch_sub(1, memory_order_acq_rel);
+                                    return true; //  inserted at level 0; a concurrent remove() owns it now
+                                }
+
                                 if (pred->next_node[level].compare_exchange_strong(succ, new_node))
                                 {
-                                    new_node->upper_levels_remaining_.fetch_add(1, memory_order_release);
                                     insert_upper_level_backoff = 0;
                                     break;
                                 }
+
+                                new_node->upper_levels_remaining_.fetch_sub(1, memory_order_acq_rel);
 
                                 ++upper_level_retry_count;
 
@@ -1530,7 +1726,7 @@ namespace MINIMAL_STD_NAMESPACE
                             {
                                 // this thread soft deleted the node
 
-                                if (node_to_remove->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(node_to_remove))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(node_to_remove, succ))
                                     {
@@ -1575,6 +1771,11 @@ namespace MINIMAL_STD_NAMESPACE
 
                             while (true)
                             {
+                                if (curr == nullptr)
+                                {
+                                    goto RETRY_REMOVE; //  stale handle: restart from a fresh search, as insert() does
+                                }
+
                                 succ = curr->next_node[0].get(is_tombstoned);
 
                                 while (is_tombstoned)
@@ -1585,9 +1786,15 @@ namespace MINIMAL_STD_NAMESPACE
                                         soft_deleted = true;
                                     }
                                     curr = succ;
+
+                                    if (curr == nullptr)
+                                    {
+                                        goto RETRY_REMOVE;
+                                    }
+
                                     succ = curr->next_node[0].get(is_tombstoned);
 
-                                    if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                    if (upper_levels_drained(tombstoned_node))
                                     {
                                         if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                         {
@@ -1639,7 +1846,7 @@ namespace MINIMAL_STD_NAMESPACE
                 uint32_t size = 0;
                 bool node_is_tombstoned = false;
 
-                while (current_node->key != numeric_limits<KeyType>::max())
+                while ((current_node != nullptr) && (current_node->key != numeric_limits<KeyType>::max()))
                 {
                     current_node->next_node[0].get(node_is_tombstoned);
 
@@ -1792,6 +1999,12 @@ namespace MINIMAL_STD_NAMESPACE
                 size_t retries = backoff_state;
                 platform::default_platform_provider::back_off(retries);
                 backoff_state = static_cast<uint32_t>((retries < BACKOFF_MAX_RELAX_SPINS) ? retries : BACKOFF_MAX_RELAX_SPINS);
+            }
+
+            static bool upper_levels_drained(skip_node *node)
+            {
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                return node->upper_levels_remaining_.load(memory_order_acquire) <= 0;
             }
 
             void retire_node(skip_node *node, size_t cpu_slot)
@@ -2179,7 +2392,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                             else
                             {
-                                if (tombstoned_node->upper_levels_remaining_.load(memory_order_acquire) <= 0)
+                                if (upper_levels_drained(tombstoned_node))
                                 {
                                     if (pred->next_node[0].compare_exchange_strong(tombstoned_node, curr))
                                     {

@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "__type_traits/is_trivially_copyable.h"
+
 namespace MINIMAL_STD_NAMESPACE
 {
     namespace lockfree
@@ -44,6 +46,8 @@ namespace MINIMAL_STD_NAMESPACE
         public:
             static_assert(Capacity > 0, "sp_mc_value_stack: Capacity must be > 0");
             static_assert(Capacity <= 0xFFFFFFFFu, "sp_mc_value_stack: Capacity must fit in 32 bits");
+            static_assert(is_trivially_copyable_v<T>, "sp_mc_value_stack: T must be trivially copyable");
+            static_assert(atomic<T>::is_always_lock_free, "sp_mc_value_stack: T must fit a lock-free atomic (<= 8 bytes)");
 
             using value_type = T;
 
@@ -57,6 +61,7 @@ namespace MINIMAL_STD_NAMESPACE
             sp_mc_value_stack &operator=(sp_mc_value_stack &&) = delete;
 
             //  Single-producer push.  Returns false if the stack is full.
+
             bool push(T value) noexcept
             {
                 uint64_t old = state_.load(memory_order_acquire);
@@ -71,7 +76,7 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
-                    slots_[count] = value;
+                    slots_[count].store(value, memory_order_relaxed);
 
                     const uint64_t desired = pack(gen + 1, count + 1);
 
@@ -99,7 +104,7 @@ namespace MINIMAL_STD_NAMESPACE
                     //  Read the candidate slot before the CAS.  If the CAS
                     //  fails (another pop or push changed state_), old is
                     //  refreshed and we re-read on the next iteration.
-                    const T val = slots_[count - 1];
+                    const T val = slots_[count - 1].load(memory_order_relaxed);
 
                     //  Pop does NOT change the generation — only push does.
                     //  This means a push between our load and our CAS changes
@@ -130,6 +135,7 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
         private:
+        
             static constexpr uint64_t pack(uint32_t gen, uint32_t count) noexcept
             {
                 return (static_cast<uint64_t>(gen) << 32) | count;
@@ -138,8 +144,8 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr uint32_t lo32(uint64_t v) noexcept { return static_cast<uint32_t>(v); }
             static constexpr uint32_t hi32(uint64_t v) noexcept { return static_cast<uint32_t>(v >> 32); }
 
-            alignas(MINSTD_CACHE_LINE_SIZE) atomic<uint64_t> state_{0};
-            T slots_[Capacity];
+            alignas(MINSTD_CACHE_LINE_SIZE) atomic<uint64_t>    state_{0};
+            atomic<T>                                           slots_[Capacity];
         };
     }
 }

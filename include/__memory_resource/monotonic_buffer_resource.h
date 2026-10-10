@@ -33,13 +33,15 @@ namespace MINIMAL_STD_NAMESPACE
                 : upstream_resource_(upstream),
                   current_buffer_(nullptr),
                   current_buffer_size_(0),
-                  next_buffer_size_(initial_size),
+                  next_buffer_size_(initial_size > 0 ? initial_size : 1024), //  0 would never grow
                   allocated_blocks_head_(nullptr)
             {
             }
 
             monotonic_buffer_resource(void* buffer, size_t buffer_size, memory_resource* upstream)
                 : upstream_resource_(upstream),
+                  initial_buffer_(reinterpret_cast<char*>(buffer)),
+                  initial_buffer_size_(buffer_size),
                   current_buffer_(reinterpret_cast<char*>(buffer)),
                   current_buffer_size_(buffer_size),
                   next_buffer_size_(buffer_size > 0 ? buffer_size : 1024),
@@ -68,8 +70,10 @@ namespace MINIMAL_STD_NAMESPACE
                     current = next;
                 }
                 allocated_blocks_head_ = nullptr;
-                current_buffer_ = nullptr;
-                current_buffer_size_ = 0;
+
+                //  Like std::pmr::monotonic_buffer_resource, the buffer given at construction is used again.
+                current_buffer_ = initial_buffer_;
+                current_buffer_size_ = initial_buffer_size_;
             }
 
             memory_resource* upstream_resource() const
@@ -109,6 +113,11 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 // The next size must hold the requested bytes + alignment overhead + our block header
+                if (bytes > SIZE_MAX / 4)
+                {
+                    return nullptr; //  the doubling below would wrap around and never end
+                }
+
                 size_t required_size = bytes + sizeof(block_header) + alignment;
                 size_t next_size = next_buffer_size_;
                 while (next_size < required_size)
@@ -163,6 +172,8 @@ namespace MINIMAL_STD_NAMESPACE
             };
 
             memory_resource* upstream_resource_;
+            char* initial_buffer_ = nullptr;
+            size_t initial_buffer_size_ = 0;
             char* current_buffer_;
             size_t current_buffer_size_;
             size_t next_buffer_size_;

@@ -15,15 +15,6 @@
 #include "minstdconfig.h"
 #include <stdint.h>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <emmintrin.h>
-#elif defined(__aarch64__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wnarrowing"
-#include <arm_neon.h>
-#pragma GCC diagnostic pop
-#endif
-
 namespace MINIMAL_STD_NAMESPACE
 {
     namespace platform
@@ -85,13 +76,36 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         /**
+         * @brief Decodes an AArch64 MPIDR_EL1 value into a CPU id: the core within its cluster, with the cluster
+         *        above it.
+         *
+         * MPIDR_EL1.MT (bit 24) says whether Aff0 is a hardware thread.  When it is set (Cortex-A55/A65/A75 and
+         * later, Neoverse), Aff0 is the thread within the core - 0 on every core of a single-threaded part - so
+         * the core is Aff1 and the cluster Aff2.  Otherwise the core is Aff0 and the cluster Aff1.  Taking Aff0
+         * alone gave every core the same id on the MT parts.  Each field is 8 bits, so the result is unique per
+         * core.  Separate from get_cpu_id() so the decoding can be tested on any host.
+         */
+        constexpr uint32_t cpu_id_from_mpidr(uint64_t mpidr)
+        {
+            const bool multithreaded = ((mpidr >> 24) & 0x1) != 0;
+            const uint32_t aff0 = static_cast<uint32_t>(mpidr & 0xFF);
+            const uint32_t aff1 = static_cast<uint32_t>((mpidr >> 8) & 0xFF);
+            const uint32_t aff2 = static_cast<uint32_t>((mpidr >> 16) & 0xFF);
+
+            const uint32_t core = multithreaded ? aff1 : aff0;
+            const uint32_t cluster = multithreaded ? aff2 : aff1;
+
+            return core | (cluster << 8);
+        }
+
+        /**
          * @brief Returns the current CPU/core ID.
          *
          * This function returns an identifier for the current CPU core. This can be
          * used for per-CPU sharding to reduce contention in multi-core systems.
          *
          * On x64: Uses CPUID instruction with leaf 0x1 (returns initial APIC ID)
-         * On ARM64: Uses MPIDR_EL1 (Multiprocessor Affinity Register)
+         * On ARM64: Uses MPIDR_EL1 (Multiprocessor Affinity Register), see cpu_id_from_mpidr()
          *
          * Note: The returned value may not be contiguous (0, 1, 2, ...) but is
          * guaranteed to be unique per CPU core.
@@ -123,9 +137,8 @@ namespace MINIMAL_STD_NAMESPACE
 #elif defined(__aarch64__)
             uint64_t mpidr;
             __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-            // Extract Aff0 (bits 7:0) which typically represents the core ID within a cluster
-            // For more complex topologies, you may need Aff1, Aff2, Aff3 as well
-            return static_cast<uint32_t>(mpidr & 0xFF);
+
+            return cpu_id_from_mpidr(mpidr);
 
 #else
 #error "Unsupported architecture for get_cpu_id()"
@@ -233,34 +246,18 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         /**
-         * @brief Check if a 128-bit aligned chunk contains all ones.
+         * @brief Check whether two consecutive 64-bit words are both all ones (~0ULL).
          *
-         * This function uses SIMD instructions when available to efficiently
-         * check if two consecutive 64-bit words are both ~0ULL. Used for
-         * optimistic scanning in lock-free bitset structures.
+         * Used for optimistic scanning in lock-free bitset structures.  Plain scalar code: for
+         * two words it is as fast as SIMD (x64: two loads, AND, compare; ARM64: LDP, AND,
+         * compare), needs no intrinsics header, and has no alignment requirement.
          *
-         * On x64: Uses SSE2 instructions (_mm_load_si128, _mm_cmpeq_epi8)
-         * On ARM64: Uses NEON instructions (vld1q_u64, vceqq_u64)
-         * On other platforms: Falls back to scalar loads
-         *
-         * @param chunk_ptr Pointer to two consecutive uint64_t values (must be 16-byte aligned on x64)
+         * @param chunk_ptr Pointer to two consecutive uint64_t values
          * @return true if both words are all ones (~0ULL), false otherwise
          */
         inline bool simd_scan_128bit_is_all_ones(const uint64_t *chunk_ptr)
         {
-#if defined(__x86_64__) || defined(_M_X64)
-            __m128i data = _mm_load_si128(reinterpret_cast<const __m128i *>(chunk_ptr));
-            __m128i all_ff = _mm_set1_epi8(static_cast<char>(0xFF));
-            __m128i cmp = _mm_cmpeq_epi8(data, all_ff);
-            return _mm_movemask_epi8(cmp) == 0xFFFF;
-#elif defined(__aarch64__)
-            uint64x2_t data = vld1q_u64(chunk_ptr);
-            uint64x2_t all_ff = vdupq_n_u64(~0ULL);
-            uint64x2_t cmp = vceqq_u64(data, all_ff);
-            return (vgetq_lane_u64(cmp, 0) & vgetq_lane_u64(cmp, 1)) == ~0ULL;
-#else
-            return (chunk_ptr[0] == ~0ULL) && (chunk_ptr[1] == ~0ULL);
-#endif
+            return (chunk_ptr[0] & chunk_ptr[1]) == ~0ULL;
         }
 
         struct default_platform_provider

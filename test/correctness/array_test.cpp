@@ -182,4 +182,35 @@ namespace
         CHECK_EQUAL(test_array[3], 4);
         CHECK_EQUAL(test_array[4], 5);
     }
+
+    struct move_tracked
+    {
+        int value = 0;
+        bool moved_from = false;
+
+        move_tracked(int v = 0) : value(v) {}
+        move_tracked(const move_tracked &other) : value(other.value) {}
+        move_tracked(move_tracked &&other) : value(other.value) { other.moved_from = true; }
+        move_tracked &operator=(const move_tracked &other) = default;
+    };
+
+    TEST(ArrayTests, MakeArrayCopiesLvaluesAndMovesRvalues)
+    {
+        //  make_array forwarded every argument as T, i.e. cast lvalues to rvalues and moved from them.
+        move_tracked a(1), b(2);
+
+        auto values = minstd::make_array<move_tracked>(a, b);
+
+        CHECK_FALSE(a.moved_from); //  before: true
+        CHECK_FALSE(b.moved_from);
+        CHECK_EQUAL(1, values[0].value);
+        CHECK_EQUAL(2, values[1].value);
+
+        move_tracked c(3);
+        auto moved = minstd::make_array<move_tracked>(minstd::move(c), 4);
+
+        CHECK_TRUE(c.moved_from);
+        CHECK_EQUAL(3, moved[0].value);
+        CHECK_EQUAL(4, moved[1].value);
+    }
 }

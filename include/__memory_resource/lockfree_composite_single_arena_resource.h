@@ -13,9 +13,6 @@
 #include "lockfree_single_arena_resource.h"
 #include "memory_resource.h"
 
-using MINIMAL_STD_NAMESPACE::platform::default_interrupt_policy;
-using MINIMAL_STD_NAMESPACE::platform::default_platform_provider;
-
 namespace MINIMAL_STD_NAMESPACE
 {
     namespace pmr
@@ -46,9 +43,10 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
         private:
+
             using large_resource_type = lockfree_single_arena_resource_impl<
-                default_interrupt_policy,
-                default_platform_provider,
+                platform::default_interrupt_policy,
+                platform::default_platform_provider,
                 LARGE_RESOURCE_MAX_BIN_BYTES,
                 LARGE_RESOURCE_MAX_WASTE_PERCENT,
                 128>;
@@ -58,7 +56,9 @@ namespace MINIMAL_STD_NAMESPACE
 
             static bool should_use_small_pool(size_t bytes, size_t alignment) noexcept
             {
-                return bytes <= THRESHOLD_BYTES && alignment <= ELEMENT_SIZE_IN_BYTES;
+                //  The bitblock pool returns element_base + 16-byte header, so it only guarantees 16-byte
+                //      alignment.  Anything stricter goes to the single-arena resource, which honours it.
+                return bytes <= THRESHOLD_BYTES && alignment <= 16;
             }
 
             void *do_allocate(size_t bytes, size_t alignment) override

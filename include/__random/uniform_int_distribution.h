@@ -137,6 +137,15 @@ namespace MINIMAL_STD_NAMESPACE
                 static_cast<engine_result_type>(URBG::min());
 
             const engine_result_type range_plus_one = static_cast<engine_result_type>(range) + 1;
+
+            if (range_plus_one == 0)
+            {
+                //  The interval covers all 2^64 values: every engine output is valid (and range + 1 is not a divisor).
+                const engine_result_type raw = static_cast<engine_result_type>(g()) - static_cast<engine_result_type>(URBG::min());
+
+                return static_cast<result_type>(static_cast<unsigned_result_type>(raw));
+            }
+
             const engine_result_type threshold = (engine_range - range) % range_plus_one;
 
             engine_result_type raw;
@@ -146,7 +155,8 @@ namespace MINIMAL_STD_NAMESPACE
                       static_cast<engine_result_type>(URBG::min());
             } while (raw < threshold);
 
-            return static_cast<result_type>(raw % range_plus_one) + p.a();
+            //  Add in the unsigned type: a signed add overflows when the interval is wider than result_type's max.
+            return static_cast<result_type>(static_cast<unsigned_result_type>(raw % range_plus_one) + a);
         }
     };
 

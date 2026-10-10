@@ -6,9 +6,14 @@
 
 #include <allocator>
 #include <allocator_traits>
+#include <__memory_resource/malloc_free_wrapper_memory_resource.h>
+#include <__memory_resource/polymorphic_allocator.h>
+#include <__memory_resource/tracking_memory_resource.h>
 #include <type_traits>
 
 #include <stdint.h>
+
+#include <pthread.h>
 
 namespace
 {
@@ -191,5 +196,62 @@ namespace
         CHECK_EQUAL(1u, allocator.destroy_calls);
         CHECK_EQUAL(1, tracking_element::constructed_count());
         CHECK_EQUAL(1, tracking_element::destroyed_count());
+    }
+    TEST(AllocatorTraitsTests, PolymorphicAllocatorRejectsOverflowingCounts)
+    {
+        struct sixteen_bytes
+        {
+            char bytes[16];
+        };
+
+        class counting_resource : public minstd::pmr::memory_resource
+        {
+        public:
+            size_t calls = 0;
+
+        private:
+            alignas(16) char storage_[64];
+            void *do_allocate(size_t, size_t) override { calls++; return storage_; }
+            void do_deallocate(void *, size_t, size_t) override {}
+            bool do_is_equal(const minstd::pmr::memory_resource &o) const noexcept override { return this == &o; }
+        } resource;
+
+        minstd::pmr::polymorphic_allocator<sixteen_bytes> allocator(&resource);
+
+        const size_t count = (SIZE_MAX / sizeof(sixteen_bytes)) + 2; //  count * 16 wraps to 16
+
+        CHECK(allocator.allocate(count) == nullptr); //  before: a 16-byte block for 2^60 elements
+        CHECK_EQUAL(0u, resource.calls);
+    }
+
+    TEST(AllocatorTraitsTests, TrackingResourceCountsConcurrentAllocations)
+    {
+        //  The counters were plain size_t, so concurrent allocations lost updates.
+        static minstd::pmr::malloc_free_wrapper_memory_resource heap;
+        static minstd::pmr::tracking_memory_resource tracking(&heap);
+
+        auto worker = [](void *) -> void *
+        {
+            for (int i = 0; i < 100000; ++i)
+            {
+                tracking.deallocate(tracking.allocate(16, 16), 16, 16);
+            }
+            return nullptr;
+        };
+
+        pthread_t threads[8];
+        for (auto &thread : threads)
+        {
+            CHECK_EQUAL(0, pthread_create(&thread, nullptr, worker, nullptr));
+        }
+        for (auto &thread : threads)
+        {
+            pthread_join(thread, nullptr);
+        }
+
+        CHECK_EQUAL(800000u, tracking.allocation_count()); //  before: lost updates (and a TSan race)
+        CHECK_EQUAL(800000u, tracking.deallocation_count());
+        CHECK_EQUAL(800000u * 16, tracking.total_bytes_allocated());
+        CHECK_EQUAL(0u, tracking.bytes_in_use());
     }
 }

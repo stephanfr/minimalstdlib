@@ -13,6 +13,7 @@
 
 #include <array>
 #include <pthread.h>
+#include <sched.h>
 #include <random>
 #include <time.h>
 #include <stdio.h>
@@ -800,6 +801,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     //  Allocate exactly in order, then deallocate the tail blocks from multiple
     //  threads to stress the frontier reclaim path (try_reclaim_frontier_blocks).
 
+    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
+
     //  Use a single shard so pending maintenance is deterministic in this correctness test.
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -906,6 +909,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
         }
     }
 
+    minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
+
     CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
@@ -914,6 +919,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
 {
     //  Regression guard for packed block-state transitions when metadata is
     //  repeatedly recycled and reused across maintenance windows.
+
+    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
 
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -970,6 +977,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
                 resource.deallocate(flush_ptrs[i], flush_size);
             }
         }
+
+        minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
 
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
@@ -1075,4 +1084,261 @@ TEST(LockfreeSingleArenaMemoryResourceTests, MetadataTrimStress)
     //  Metadata count should not have grown unboundedly
     size_t final_metadata = resource.extended_metrics().metadata_count();
     CHECK(final_metadata <= NUM_BLOCKS);
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentChurnFullBlockIntegrity)
+{
+    //  Like ConcurrentAllocDeallocChurn, but every byte of every block is patterned and verified, so a
+    //      stray write anywhere inside a live allocation is caught.  Mixed sizes and LIFO-heavy frees keep
+    //      the frontier advancing and rolling back.  Probabilistic before the fix: loop it (see below).
+
+    constexpr size_t NUM_THREADS = 8;
+    constexpr size_t CYCLES_PER_THREAD = 20000;
+
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
+
+    struct args_type
+    {
+        minstd::pmr::memory_resource *resource;
+        minstd::atomic<bool> *go;
+        uint32_t thread_id;
+        minstd::atomic<uint32_t> *corruptions;
+    };
+
+    auto fn = [](void *arg) -> void *
+    {
+        auto *a = static_cast<args_type *>(arg);
+        while (!a->go->load(minstd::memory_order_acquire)) {}
+
+        uint64_t rng = a->thread_id * 0x9E3779B97F4A7C15ULL;
+        void *held[4] = {};
+        size_t held_size[4] = {};
+
+        for (size_t i = 0; i < CYCLES_PER_THREAD; ++i)
+        {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            const size_t slot = (rng >> 40) & 3;
+            const size_t size = ((rng >> 33) & 1) ? 64 + ((rng >> 20) % 192) : 1024 + ((rng >> 20) % 3072);
+            const unsigned char pattern = static_cast<unsigned char>((a->thread_id << 4) ^ i);
+
+            if (held[slot] != nullptr)
+            {
+                const unsigned char *bytes = static_cast<unsigned char *>(held[slot]);
+                const unsigned char expected = bytes[0];
+                for (size_t b = 0; b < held_size[slot]; ++b)
+                {
+                    if (bytes[b] != expected) { a->corruptions->fetch_add(1); break; }
+                }
+                a->resource->deallocate(held[slot], held_size[slot]);
+                held[slot] = nullptr;
+            }
+
+            void *ptr = a->resource->allocate(size);
+            if (ptr != nullptr)
+            {
+                memset(ptr, pattern, size);
+                held[slot] = ptr;
+                held_size[slot] = size;
+            }
+        }
+
+        for (size_t slot = 0; slot < 4; ++slot)
+        {
+            if (held[slot] != nullptr) { a->resource->deallocate(held[slot], held_size[slot]); }
+        }
+        return nullptr;
+    };
+
+    minstd::atomic<bool> go{false};
+    minstd::atomic<uint32_t> corruptions{0};
+    args_type args[NUM_THREADS];
+    pthread_t threads[NUM_THREADS];
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        args[t] = {&resource, &go, static_cast<uint32_t>(t + 1), &corruptions};
+        CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, fn, &args[t]));
+    }
+
+    go.store(true, minstd::memory_order_release);
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        pthread_join(threads[t], nullptr);
+    }
+
+    CHECK_EQUAL(0u, corruptions.load()); //  before (expected, probabilistic): > 0 on a multi-core host
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, FrontierNeverOverrunsMetadataUnderConcurrentFill)
+{
+    //  K16: the block region grows up from the frontier and the metadata region grows down; each side checked
+    //      the other and then CASed its own word without re-checking.  Many threads filling an empty arena at
+    //      once make metadata growth and frontier advances race all the way to the meeting point.  A block that
+    //      overlaps a metadata record is corrupted by the allocator (or corrupts the record): every block is
+    //      patterned and checked.  Regression coverage for the boundary protocol: the race window is a few
+    //      instructions wide, so this does not reliably fail without the fix (see MetaFrontier.tla).
+
+    constexpr size_t NUM_THREADS = 16;
+    constexpr size_t ARENA_SIZE = 1024 * 1024; //  room for the metadata managers (256 KiB of records each); 256 KiB has none
+                                               //      and every allocation fails
+    constexpr size_t ROUNDS = 300;
+    constexpr size_t MAX_HELD = 512;
+
+    alignas(64) static char arena[ARENA_SIZE];
+
+    struct shared_state
+    {
+        minstd::pmr::memory_resource *resource;
+        minstd::atomic<uint32_t> ready;
+        minstd::atomic<uint32_t> round;
+        minstd::atomic<uint32_t> corruptions;
+        minstd::atomic<uint64_t> allocations;
+        minstd::atomic<uint32_t> rounds_filled; //  rounds in which the arena ran out (the frontier met the metadata)
+    };
+
+    struct args_type
+    {
+        shared_state *shared;
+        uint32_t thread_id;
+    };
+
+    static shared_state shared;
+    shared.ready.store(0);
+    shared.round.store(0);
+    shared.corruptions.store(0);
+    shared.allocations.store(0);
+    shared.rounds_filled.store(0);
+
+    auto fn = [](void *arg) -> void *
+    {
+        auto *a = static_cast<args_type *>(arg);
+        static thread_local void *held[MAX_HELD];
+        static thread_local size_t held_size[MAX_HELD];
+
+        for (uint32_t round = 1; round <= ROUNDS; ++round)
+        {
+            while (a->shared->round.load(minstd::memory_order_acquire) < round) { sched_yield(); }
+
+            const unsigned char pattern = static_cast<unsigned char>((a->thread_id << 4) ^ round);
+            size_t count = 0;
+
+            //  Fill: small blocks, so nearly every allocation also takes a fresh metadata record.
+            while (count < MAX_HELD)
+            {
+                const size_t size = 64 + ((count * 37 + a->thread_id * 11) % 128);
+                void *ptr = a->shared->resource->allocate(size);
+                if (ptr == nullptr)
+                {
+                    break;
+                }
+                memset(ptr, pattern, size);
+                held[count] = ptr;
+                held_size[count] = size;
+                ++count;
+            }
+
+            a->shared->allocations.fetch_add(count, minstd::memory_order_relaxed);
+
+            if ((count < MAX_HELD) && (a->thread_id == 1))
+            {
+                a->shared->rounds_filled.fetch_add(1, minstd::memory_order_relaxed);
+            }
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                const unsigned char *bytes = static_cast<const unsigned char *>(held[i]);
+                for (size_t b = 0; b < held_size[i]; ++b)
+                {
+                    if (bytes[b] != pattern)
+                    {
+                        a->shared->corruptions.fetch_add(1);
+                        break;
+                    }
+                }
+            }
+
+            //  Blocks are not freed: the next round starts from a fresh resource on the same buffer.
+            a->shared->ready.fetch_add(1, minstd::memory_order_acq_rel);
+        }
+
+        return nullptr;
+    };
+
+    args_type args[NUM_THREADS];
+    pthread_t threads[NUM_THREADS];
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        args[t] = {&shared, static_cast<uint32_t>(t + 1)};
+        CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, fn, &args[t]));
+    }
+
+    for (uint32_t round = 1; round <= ROUNDS; ++round)
+    {
+        memset(arena, 0, sizeof(arena));
+        lockfree_single_arena_resource_without_stats resource(arena, sizeof(arena), 4);
+        shared.resource = &resource;
+        shared.ready.store(0, minstd::memory_order_release);
+        shared.round.store(round, minstd::memory_order_release);
+
+        while (shared.ready.load(minstd::memory_order_acquire) < NUM_THREADS) { sched_yield(); }
+    }
+
+    for (size_t t = 0; t < NUM_THREADS; ++t)
+    {
+        pthread_join(threads[t], nullptr);
+    }
+
+    CHECK_EQUAL(0u, shared.corruptions.load());
+
+    //  The test means something only if blocks were handed out and the arena was filled to the boundary.
+    CHECK(shared.allocations.load() > ROUNDS * 1000);
+    CHECK(shared.rounds_filled.load() > ROUNDS / 2);
+}
+
+TEST(LockfreeSingleArenaMemoryResourceTests, MetadataStaysInsideAnArenaWhoseEndIsNotAligned)
+{
+    //  The metadata region started at the arena end rounded UP to 64 bytes, so when the end was not 64-byte aligned
+    //      the top metadata record lay up to 63 bytes past the arena.  (ASan reported it as a global-buffer-overflow
+    //      in SkiplistTests, whose 2 MiB arena happened to end 32 bytes past a 64-byte boundary.)
+
+    struct guarded_arena
+    {
+        alignas(64) unsigned char arena[1024 * 1024 + 32]; //  ends 32 bytes past a 64-byte boundary; large enough for
+                                                           //  the metadata managers (256 KiB of records each)
+        unsigned char canary[64];
+    };
+
+    static guarded_arena storage;
+
+    memset(storage.canary, 0xA5, sizeof(storage.canary));
+
+    //  Fill the arena on a thread of its own: the test CPU-id provider keeps a per-thread call count, and thousands
+    //      of calls on the main thread would shift when later tests see their CPU id refresh.
+    static size_t allocations;
+    allocations = 0;
+
+    auto fill = [](void *) -> void *
+    {
+        lockfree_single_arena_resource_without_stats resource(storage.arena, sizeof(storage.arena), 2);
+
+        while ((resource.allocate(64) != nullptr) && (allocations < 100000))
+        {
+            allocations++;
+        }
+
+        return nullptr;
+    };
+
+    pthread_t thread;
+    CHECK_EQUAL(0, pthread_create(&thread, nullptr, fill, nullptr));
+    pthread_join(thread, nullptr);
+
+    CHECK(allocations > 1000); //  the frontier must reach the metadata region
+
+    for (size_t i = 0; i < sizeof(storage.canary); i++)
+    {
+        CHECK_EQUAL(0xA5, storage.canary[i]); //  before: the top metadata record overwrote the first 32 bytes
+    }
 }

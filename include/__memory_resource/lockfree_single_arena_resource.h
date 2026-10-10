@@ -20,8 +20,6 @@
 
 #include <stdint.h>
 
-using MINIMAL_STD_NAMESPACE::platform::default_interrupt_policy;
-using MINIMAL_STD_NAMESPACE::platform::default_platform_provider;
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -52,7 +50,7 @@ namespace MINIMAL_STD_NAMESPACE
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 
         template <typename interrupt_policy_type,
-                  typename platform_provider_type = default_platform_provider,
+                  typename platform_provider_type = platform::default_platform_provider,
                   size_t max_bin_bytes = 32 * 1024 * 1024,
                   size_t max_waste_percent = 5,
                   size_t maintenance_window_threshold = 128,
@@ -71,7 +69,7 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 size_t metadata_index_;
                 size_t size_including_header_; //  size of the block including the block_header
-                block_header *previous_block_;
+                atomic<block_header *> previous_block_;
             };
 
             static constexpr size_t ALLOCATION_HEADER_SIZE = sizeof(block_header);
@@ -195,7 +193,7 @@ namespace MINIMAL_STD_NAMESPACE
                                                          size_t cpu_shards = DEFAULT_CPU_SHARDS)
                 : block_(block),
                   block_size_(block_size),
-                  metadata_start_(static_cast<block_metadata *>(internal::align_pointer((char *)block + block_size, 64)) - 1),
+                  metadata_start_(reinterpret_cast<block_metadata *>(((uintptr_t)block + block_size) & ~(uintptr_t)(ALLOCATION_METADATA_SIZE - 1)) - 1), //  round the end DOWN: the top record must lie inside the arena
                   next_empty_memory_block_(0), // Will be set after allocating per-CPU arrays
                   current_metadata_record_count_(0),
                   block_managers_(nullptr),
@@ -211,6 +209,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 MINIMAL_STD_ASSERT(block_ != nullptr);
                 MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
+                MINIMAL_STD_ASSERT((block_size_ / DEFAULT_ALIGNMENT) < NO_PREDECESSOR); //  frontier words hold 32-bit unit offsets (256 GiB)
 
                 uint8_t *current_ptr = static_cast<uint8_t *>(internal::align_pointer(block, DEFAULT_ALIGNMENT));
 
@@ -250,11 +249,14 @@ namespace MINIMAL_STD_NAMESPACE
 
                 //  Set next_empty_memory_block_ to point after the per-CPU arrays
                 block_header *initial_frontier = reinterpret_cast<block_header *>(current_ptr);
-                initial_frontier->previous_block_ = nullptr; // Sentinel: walk terminates here
-                next_empty_memory_block_.store(block_tag::make(initial_frontier), memory_order_release);
 
-                //  Set allocation_base_ and precompute address_bin_size_ for address bin routing
+                //  Set allocation_base_ first: the frontier word is encoded relative to it
                 allocation_base_ = current_ptr;
+
+                initial_frontier->previous_block_.store(nullptr, memory_order_relaxed);
+                next_empty_memory_block_.store(pack_frontier(initial_frontier, nullptr), memory_order_release); // no predecessor: walk terminates here
+
+                //  Precompute address_bin_size_ for address bin routing
                 size_t raw_bin_size = block_size_ / NUM_ADDRESS_BINS;
                 address_bin_size_ = raw_bin_size > 0 ? raw_bin_size : 1;
 
@@ -297,7 +299,37 @@ namespace MINIMAL_STD_NAMESPACE
 
         private:
             using metadata_tag = lockfree::tagged_ptr<block_metadata, uint16_t>;
-            using block_tag = lockfree::tagged_ptr<block_header, uint16_t>;
+
+            static constexpr uint32_t NO_PREDECESSOR = 0xFFFFFFFFu;
+
+            uint32_t to_frontier_units(const block_header *block) const noexcept
+            {
+                return static_cast<uint32_t>((reinterpret_cast<uintptr_t>(block) - reinterpret_cast<uintptr_t>(allocation_base_)) / DEFAULT_ALIGNMENT);
+            }
+
+            block_header *from_frontier_units(uint32_t units) const noexcept
+            {
+                return reinterpret_cast<block_header *>(reinterpret_cast<uintptr_t>(allocation_base_) + static_cast<uintptr_t>(units) * DEFAULT_ALIGNMENT);
+            }
+
+            uint64_t pack_frontier(const block_header *frontier, const block_header *predecessor) const noexcept
+            {
+                const uint32_t predecessor_units = (predecessor == nullptr) ? NO_PREDECESSOR : to_frontier_units(predecessor);
+
+                return (static_cast<uint64_t>(predecessor_units) << 32) | to_frontier_units(frontier);
+            }
+
+            block_header *unpack_frontier(uint64_t state) const noexcept
+            {
+                return from_frontier_units(static_cast<uint32_t>(state));
+            }
+
+            block_header *unpack_predecessor(uint64_t state) const noexcept
+            {
+                const uint32_t predecessor_units = static_cast<uint32_t>(state >> 32);
+
+                return (predecessor_units == NO_PREDECESSOR) ? nullptr : from_frontier_units(predecessor_units);
+            }
 
             // Packed block offset + state + version for atomic state transitions.
             // Layout: [offset:48][state:4][version:12] = 64 bits.
@@ -487,6 +519,7 @@ namespace MINIMAL_STD_NAMESPACE
             block_metadata *const metadata_start_;
 
             alignas(64) atomic<uint64_t> next_empty_memory_block_;
+            atomic<bool> frontier_reclaim_in_progress_{false};
 
             alignas(64) atomic<size_t> current_metadata_record_count_;
             metadata_block_manager *block_managers_;
@@ -521,7 +554,7 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
                 {
-                    auto frontier = block_tag::unpack_ptr(next_empty_memory_block_.load(memory_order_acquire));
+                    auto frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
                     size_t frontier_offset = reinterpret_cast<uintptr_t>(frontier) - reinterpret_cast<uintptr_t>(block_);
 
                     size_t count = current_metadata_record_count_.load(memory_order_acquire);
@@ -635,6 +668,68 @@ namespace MINIMAL_STD_NAMESPACE
                 platform_provider_type::back_off(retries);
             }
 
+            //  True if a frontier at `next` leaves less than one record of slack below the metadata region.  The
+            //      same test is used before and after the frontier CAS.
+            bool frontier_overlaps_metadata(const block_header *next) const
+            {
+                return (uintptr_t)next >= (uintptr_t)metadata_start_ - ((current_metadata_record_count_.load(memory_order_acquire) + 1) * ALLOCATION_METADATA_SIZE);
+            }
+
+            enum class metadata_growth_result
+            {
+                GROWN,   //  current_count is the new record's index
+                RETRY,   //  the count moved; current_count holds its new value
+                NO_ROOM  //  the new record would reach the frontier
+            };
+
+            //  Adds record `current_count` to the metadata region.  The caller holds an active slot on the record's
+            //      manager, so a trim cannot shrink the count below our record.  No lock: like the frontier side, a
+            //      conflict is resolved by the top record undoing its CAS, so a signal or interrupt handler that grows
+            //      the metadata while the code it interrupted is mid-way through this never waits on that code.
+            metadata_growth_result grow_metadata_region(size_t &current_count)
+            {
+                const uintptr_t new_metadata_end = (uintptr_t)metadata_start_ - ((current_count + 1) * ALLOCATION_METADATA_SIZE);
+
+                block_header *frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
+
+                if ((frontier != nullptr) && (new_metadata_end <= (uintptr_t)frontier))
+                {
+                    return metadata_growth_result::NO_ROOM;
+                }
+
+                if (!current_metadata_record_count_.compare_exchange_strong(current_count, current_count + 1, memory_order_acq_rel, memory_order_acquire))
+                {
+                    return metadata_growth_result::RETRY;
+                }
+
+                //  A frontier allocation may have checked the old count and advanced into our record.  Re-check now
+                //      that our growth is visible; pairs with the fence in get_next_empty_memory_block().
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                size_t retries = 0;
+
+                while (true)
+                {
+                    frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
+
+                    if ((frontier == nullptr) || (new_metadata_end > (uintptr_t)frontier))
+                    {
+                        return metadata_growth_result::GROWN;
+                    }
+
+                    //  Overlap: give the record back, but only from the top.  A record above ours overlaps too and is
+                    //      backing off the same way; the frontier allocation that overlaps us undoes its block, and
+                    //      then the overlap is gone and we keep the record.
+                    size_t grown = current_count + 1;
+                    if (current_metadata_record_count_.compare_exchange_strong(grown, current_count, memory_order_acq_rel, memory_order_acquire))
+                    {
+                        return metadata_growth_result::NO_ROOM;
+                    }
+
+                    back_off(retries);
+                }
+            }
+
             void recycle_metadata(block_metadata &metadata)
             {
                 //  Clear pointer and move metadata back to METADATA_AVAILABLE.
@@ -664,6 +759,22 @@ namespace MINIMAL_STD_NAMESPACE
                 array<block_metadata *, MAINTENANCE_WINDOW_BATCH_SIZE> &batch,
                 size_t batch_size)
             {
+                bool expected = false;
+
+                if (!frontier_reclaim_in_progress_.compare_exchange_strong(expected, true, memory_order_acquire, memory_order_relaxed))
+                {
+                    return; //  busy: the caller publishes these blocks to the free bins, a later window reclaims them
+                }
+
+                reclaim_pending_frontier_batch_locked(batch, batch_size);
+
+                frontier_reclaim_in_progress_.store(false, memory_order_release);
+            }
+
+            void reclaim_pending_frontier_batch_locked(
+                array<block_metadata *, MAINTENANCE_WINDOW_BATCH_SIZE> &batch,
+                size_t batch_size)
+            {
                 //  Consume reclaimable tail blocks from the batch as a unit.
                 //  We repeatedly look for the batch entry whose end exactly matches the
                 //  current frontier and roll the frontier backward one block at a time.
@@ -671,7 +782,7 @@ namespace MINIMAL_STD_NAMESPACE
                 while (true)
                 {
                     uint64_t frontier_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    block_header *frontier_ptr = block_tag::unpack_ptr(frontier_tag);
+                    block_header *frontier_ptr = unpack_frontier(frontier_tag);
 
                     block_metadata *candidate = nullptr;
                     size_t candidate_index = 0;
@@ -723,9 +834,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     block_header *memory_block = block_state_ptr::unpack_ptr(candidate_state, block_);
-                    uint64_t new_frontier_tag = block_tag::pack(
-                        memory_block,
-                        static_cast<uint16_t>(block_tag::unpack_counter(frontier_tag) + 1));
+                    uint64_t new_frontier_tag = pack_frontier(memory_block, memory_block->previous_block_.load(memory_order_relaxed));
 
                     if (!next_empty_memory_block_.compare_exchange_strong(
                             frontier_tag, new_frontier_tag, memory_order_acq_rel, memory_order_acquire))
@@ -761,6 +870,8 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     metadata_block_manager &manager = block_managers_[tail_manager_index];
+
+                    interrupt_guard_type guard;
 
                     uint32_t expected_state = 0;
                     if (!manager.state_and_active_count_.compare_exchange_strong(
@@ -821,6 +932,8 @@ namespace MINIMAL_STD_NAMESPACE
 
                 while (true)
                 {
+                    MINIMAL_STD_ASSERT(current >= stolen_count);
+
                     size_t updated = (current > stolen_count) ? (current - stolen_count) : 0;
 
                     if (pending_shards_[target_shard].count_.compare_exchange_weak(
@@ -1096,7 +1209,7 @@ namespace MINIMAL_STD_NAMESPACE
                     };
                 }
 
-                free_block->metadata_index_ = metadata_to_index(metadata);
+                __atomic_store_n(&free_block->metadata_index_, metadata_to_index(metadata), __ATOMIC_RELAXED);
 
                 // Get current version (if recycled metadata) and increment it
                 uint16_t version = block_state_ptr::unpack_version(metadata->block_state_.load(memory_order_relaxed));
@@ -1207,10 +1320,11 @@ namespace MINIMAL_STD_NAMESPACE
 
                 {
                     interrupt_guard_type guard;
+                    
+                    pending_shards_[target_shard].count_.add_fetch(1, memory_order_acq_rel);
                     free_block_stack::push(pending_shards_[target_shard].head_, *block_to_deallocate, get_adapter(), [this](size_t &retries)
                                            { this->back_off(retries); });
                 }
-                pending_shards_[target_shard].count_.add_fetch(1, memory_order_acq_rel);
 
                 maybe_open_maintenance_window(target_shard, false);
 
@@ -1227,6 +1341,22 @@ namespace MINIMAL_STD_NAMESPACE
                 return this == &other;
             }
 
+            bool try_reclaim_frontier_blocks()
+            {
+                bool expected = false;
+
+                if (!frontier_reclaim_in_progress_.compare_exchange_strong(expected, true, memory_order_acquire, memory_order_relaxed))
+                {
+                    return false; //  another thread is rolling the frontier back; reclamation is opportunistic
+                }
+
+                const bool reclaimed_any = try_reclaim_frontier_blocks_locked();
+
+                frontier_reclaim_in_progress_.store(false, memory_order_release);
+
+                return reclaimed_any;
+            }
+
             /**
              * @brief Walks the frontier backward, reclaiming consecutive free blocks.
              *
@@ -1238,7 +1368,7 @@ namespace MINIMAL_STD_NAMESPACE
              *
              * Terminates on: nullptr sentinel, non-AVAILABLE state, CAS failure, or frontier CAS failure.
              */
-            bool try_reclaim_frontier_blocks()
+            bool try_reclaim_frontier_blocks_locked()
             {
                 bool reclaimed_any = false;
 
@@ -1246,10 +1376,9 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     //  Load the current frontier
                     uint64_t frontier_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    block_header *frontier_ptr = block_tag::unpack_ptr(frontier_tag);
 
-                    //  Follow previous_block_ to find the predecessor
-                    block_header *prev = frontier_ptr->previous_block_;
+                    //  The predecessor comes from the frontier word, so it is the block that ends at the frontier.
+                    block_header *prev = unpack_predecessor(frontier_tag);
 
                     if (prev == nullptr)
                     {
@@ -1257,7 +1386,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     //  Bounds-check metadata index before dereferencing
-                    uint32_t meta_index = prev->metadata_index_;
+                    uint32_t meta_index = static_cast<uint32_t>(__atomic_load_n(&prev->metadata_index_, __ATOMIC_RELAXED));
 
                     if (meta_index >= current_metadata_record_count_.load(memory_order_acquire))
                     {
@@ -1288,7 +1417,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     //  CAS: Move frontier backward from frontier_ptr to prev
-                    uint64_t new_frontier_tag = block_tag::pack(prev, static_cast<uint16_t>(block_tag::unpack_counter(frontier_tag) + 1));
+                    uint64_t new_frontier_tag = pack_frontier(prev, prev->previous_block_.load(memory_order_relaxed));
 
                     if (!next_empty_memory_block_.compare_exchange_strong(frontier_tag, new_frontier_tag, memory_order_acq_rel, memory_order_acquire))
                     {
@@ -1338,7 +1467,7 @@ namespace MINIMAL_STD_NAMESPACE
                     interrupt_guard_type guard;
 
                     uint64_t current_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    current = block_tag::unpack_ptr(current_tag);
+                    current = unpack_frontier(current_tag);
 
                     size_t retries = 0;
 
@@ -1346,24 +1475,53 @@ namespace MINIMAL_STD_NAMESPACE
 
                     do
                     {
-                        current = block_tag::unpack_ptr(current_tag);
+                        current = unpack_frontier(current_tag);
                         next = reinterpret_cast<block_header *>(internal::align_pointer(reinterpret_cast<uint8_t *>(current) + allocation_size, DEFAULT_ALIGNMENT));
 
                         //  If the next block intrudes into the metadata area, then we are out of memory so return null
 
-                        if ((uintptr_t)next >= (uintptr_t)metadata_start_ - ((current_metadata_record_count_.load(memory_order_acquire) + 1) * ALLOCATION_METADATA_SIZE))
+                        if (frontier_overlaps_metadata(next))
                         {
                             return nullptr;
                         }
 
-                        // Pre-publish previous_block_ before the CAS exposes next to concurrent threads.
-                        // Safe: next points to uninitialized frontier memory not yet visible to anyone.
-                        next->previous_block_ = current;
+                        //  Do NOT touch *next here.  If current_tag is stale, next can lie inside a block that
+                        //      another thread already owns; writing to it would corrupt that allocation.
 
-                        new_tag = block_tag::pack(next, static_cast<uint16_t>(block_tag::unpack_counter(current_tag) + 1));
+                        new_tag = pack_frontier(next, current);
 
                         if (next_empty_memory_block_.compare_exchange_strong(current_tag, new_tag, memory_order_acq_rel, memory_order_acquire))
                         {
+                            //  The count we checked may be stale: metadata can have grown between our check and our CAS.
+                            //      Re-check now that our advance is visible.  Pairs with the fence in
+                            //      grow_metadata_region(): (store; seq_cst fence; load) on both sides means at least
+                            //      one of the two sees the other and backs off.
+                            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+                            if (!frontier_overlaps_metadata(next))
+                            {
+                                break;
+                            }
+
+                            //  Overlap: give the block back.  We can only roll the frontier back while our block is
+                            //      on top; a block above ours overlaps too and is backing off the same way.  A trim
+                            //      that shrinks the metadata region can remove the overlap, and then we keep the block.
+                            while (true)
+                            {
+                                uint64_t expected = new_tag;
+                                if (next_empty_memory_block_.compare_exchange_strong(expected, current_tag, memory_order_acq_rel, memory_order_acquire))
+                                {
+                                    return nullptr;
+                                }
+
+                                if (!frontier_overlaps_metadata(next))
+                                {
+                                    break;
+                                }
+
+                                back_off(retries);
+                            }
+
                             break;
                         }
 
@@ -1373,8 +1531,14 @@ namespace MINIMAL_STD_NAMESPACE
                         };
                         back_off(retries);
                     } while (true);
+
+                    //  The CAS succeeded: we own [current, next) and next is the new frontier.  Record our size, then
+                    //      the back-link.  The predecessor is published in the frontier word itself; this back-link is
+                    //      read only after the block is claimed.
+
+                    __atomic_store_n(&current->size_including_header_, reinterpret_cast<uintptr_t>(next) - reinterpret_cast<uintptr_t>(current), __ATOMIC_RELAXED);
+                    current->previous_block_.store(unpack_predecessor(current_tag), memory_order_relaxed);
                 }
-                current->size_including_header_ = reinterpret_cast<uintptr_t>(next) - reinterpret_cast<uintptr_t>(current);
 
                 return current;
             }
@@ -1436,22 +1600,20 @@ namespace MINIMAL_STD_NAMESPACE
                     }
 
                     // Ensure the new metadata record doesnt overwrite a dynamically allocated block
-                    uintptr_t new_metadata_end_ptr = (uintptr_t)metadata_start_ - ((current_count + 1) * ALLOCATION_METADATA_SIZE);
-                    uint64_t current_empty_block_tag = next_empty_memory_block_.load(memory_order_acquire);
-                    block_header *empty_block = block_tag::unpack_ptr(current_empty_block_tag);
+                    const metadata_growth_result grown = grow_metadata_region(current_count);
 
-                    if (empty_block != nullptr && new_metadata_end_ptr <= (uintptr_t)empty_block)
-                    {
-                        manager.release_active_slot();
-                        return NULL_INDEX;
-                    }
-
-                    if (current_metadata_record_count_.compare_exchange_weak(current_count, current_count + 1, memory_order_acq_rel, memory_order_acquire))
+                    if (grown == metadata_growth_result::GROWN)
                     {
                         break;
                     }
 
                     manager.release_active_slot();
+
+                    if (grown == metadata_growth_result::NO_ROOM)
+                    {
+                        return NULL_INDEX;
+                    }
+
                     if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
                     {
                         this->record_metadata_cas_retry();

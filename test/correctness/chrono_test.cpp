@@ -138,4 +138,26 @@ namespace
         time_point<seconds> now4(now3);
         CHECK_EQUAL(7, now4.time_since_epoch().count());
     }
+
+    TEST(ChronoTests, DurationArithmeticWithUnrelatedPeriods)
+    {
+        //  There was no common_type specialization for duration, so durations whose periods are not multiples of
+        //      each other could not be added, subtracted or compared.
+        using thirds = minstd::chrono::duration<int64_t, minstd::ratio<1, 3>>;
+        using halves = minstd::chrono::duration<int64_t, minstd::ratio<1, 2>>;
+
+        auto sum = thirds(1) + halves(1); //  common period is 1/6
+
+        CHECK_EQUAL(5, sum.count());
+        CHECK_EQUAL(1, (decltype(sum)::period::num));
+        CHECK_EQUAL(6, (decltype(sum)::period::den));
+        CHECK_EQUAL(-1, (thirds(1) - halves(1)).count());
+        CHECK(thirds(3) == halves(2));
+        CHECK(thirds(1) < halves(1));
+
+        using millis = minstd::chrono::duration<int64_t, minstd::milli>;
+        using seconds = minstd::chrono::duration<int64_t>;
+
+        CHECK((minstd::is_same<minstd::common_type<millis, seconds>::type, millis>::value)); //  related periods unchanged
+    }
 } // namespace

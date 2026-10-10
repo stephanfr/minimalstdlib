@@ -26,43 +26,27 @@ namespace MINIMAL_STD_NAMESPACE
         using allocator_traits_type = minstd::allocator_traits<allocator_type>;
 
         explicit basic_dynamic_string(allocator_type &allocator)
-            : basic_string<T>(allocator_traits_type::allocate(allocator, minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 )), minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 ), MAX_SIZE),
+            : basic_string<T>(allocate_buffer(allocator, minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 )), minstd::min( DEFAULT_DYNAMIC_STRING_SIZE, MAX_SIZE + 1 ), MAX_SIZE),
               allocator_(allocator)
         {
-            if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-            {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-            }
         }
 
         explicit basic_dynamic_string(const T *value, allocator_type &allocator)
-                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(value)), compute_buffer_size(value), MAX_SIZE, value),
+                        : basic_string<T>(allocate_buffer(allocator, compute_buffer_size(value)), compute_buffer_size(value), MAX_SIZE, value),
               allocator_(allocator)
         {
-            if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-            {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-            }
         }
 
         explicit basic_dynamic_string(const T *value, size_t length, allocator_type &allocator)
-                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(value, length)), compute_buffer_size(value, length), MAX_SIZE, value, length),
+                        : basic_string<T>(allocate_buffer(allocator, compute_buffer_size(value, length)), compute_buffer_size(value, length), MAX_SIZE, value, length),
               allocator_(allocator)
         {
-            if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-            {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-            }
         }
 
         explicit basic_dynamic_string(const basic_string<T> &string_to_copy, allocator_type &allocator)
-                        : basic_string<T>(allocator_traits_type::allocate(allocator, compute_buffer_size(string_to_copy.length())), compute_buffer_size(string_to_copy.length()), MAX_SIZE, string_to_copy),
+                        : basic_string<T>(allocate_buffer(allocator, compute_buffer_size(string_to_copy.length())), compute_buffer_size(string_to_copy.length()), MAX_SIZE, string_to_copy),
               allocator_(allocator)
         {
-            if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-            {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-            }
         }
 
         virtual ~basic_dynamic_string()
@@ -77,20 +61,9 @@ namespace MINIMAL_STD_NAMESPACE
         {
             size_t new_length = minstd::min(strnlen(string_to_copy.data(), basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
 
-            if (new_length > basic_string<T>::buffer_size_)
-            {
-                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+            replace_buffer_if_too_small(new_length);
 
-                basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
-
-                if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-                {
-                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-                }
-            }
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::max_size_);
+            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
 
             return *this;
         }
@@ -99,20 +72,9 @@ namespace MINIMAL_STD_NAMESPACE
         {
             size_t new_length = minstd::min(strnlen(string_to_copy.data(), basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
 
-            if (new_length > basic_string<T>::buffer_size_)
-            {
-                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+            replace_buffer_if_too_small(new_length);
 
-                basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
-
-                if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-                {
-                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-                }
-            }
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::max_size_);
+            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
 
             return *this;
         }
@@ -121,26 +83,51 @@ namespace MINIMAL_STD_NAMESPACE
         {
             size_t new_length = minstd::min(strnlen(string_to_copy, basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
 
-            if (new_length > basic_string<T>::buffer_size_)
-            {
-                allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+            replace_buffer_if_too_small(new_length);
 
-                basic_string<T>::buffer_size_ = new_length;
-                basic_string<T>::buffer_ = allocator_traits_type::allocate(allocator_, basic_string<T>::buffer_size_);
-
-                if (basic_string<T>::buffer_size_ != 0 && basic_string<T>::buffer_ == nullptr)
-                {
-                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * basic_string<T>::buffer_size_, alignof(T));
-                }
-            }
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy, basic_string<T>::buffer_size_ ), basic_string<T>::max_size_);
+            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy, basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
 
             return *this;
         }
 
     private:
         allocator_type &allocator_;
+
+        //  basic_string's constructor copies into the buffer before ours runs, so a constructor cannot recover
+        //      from a failed allocation.
+        static T *allocate_buffer(allocator_type &allocator, size_t size)
+        {
+            T *buffer = allocator_traits_type::allocate(allocator, size);
+
+            if ((size != 0) && (buffer == nullptr))
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * size, alignof(T), __builtin_trap());
+            }
+
+            return buffer;
+        }
+
+        //  For assignment: the old contents are discarded, so nothing is copied.  On failure the old buffer is
+        //      kept and the caller copies what fits.
+        void replace_buffer_if_too_small(size_t new_buffer_size)
+        {
+            if (new_buffer_size <= basic_string<T>::buffer_size_)
+            {
+                return;
+            }
+
+            T *new_buffer = allocator_traits_type::allocate(allocator_, new_buffer_size);
+
+            if (new_buffer == nullptr)
+            {
+                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * new_buffer_size, alignof(T), return);
+            }
+
+            allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
+
+            basic_string<T>::buffer_ = new_buffer;
+            basic_string<T>::buffer_size_ = new_buffer_size;
+        }
 
 
         static size_t compute_buffer_size( const char* value, size_t length = DEFAULT_DYNAMIC_STRING_MAX_SIZE)
@@ -175,7 +162,8 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if (new_buffer_size != 0 && new_buffer == nullptr)
                 {
-                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * new_buffer_size, alignof(T));
+                    //  Keep the old buffer; callers write only what fits in buffer_size_.
+                    MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * new_buffer_size, alignof(T), return);
                 }
 
                 strlcpy(new_buffer, basic_string<T>::buffer_, basic_string<T>::length_ + 1);

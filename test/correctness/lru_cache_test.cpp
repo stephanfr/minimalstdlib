@@ -10,7 +10,11 @@
 
 #include <__memory_resource/memory_heap_resource_adapter.h>
 #include <__memory_resource/polymorphic_allocator.h>
+#include <__memory_resource/tracking_memory_resource.h>
 #include <single_block_memory_heap>
+
+#include <../shared/poisoning_memory_resource.h>
+#include "../shared/process_isolation.h"
 
 #include <memory>
 
@@ -354,4 +358,86 @@ namespace
         CHECK_EQUAL(6, test_cache.size());
     }
 
+    TEST(LRUCacheTests, EvictionRemovesEvictedKeyFromMap)
+    {
+        minstd::pmr::test::poisoning_memory_resource entry_resource;
+        minstd::pmr::test::poisoning_memory_resource map_resource;
+
+        lru_cache_with_elementsEntryHeapAllocator entry_allocator(&entry_resource);
+        lru_cache_with_elementsMapHeapAllocator map_allocator(&map_resource);
+
+        {
+            lru_cache_with_elements test_cache(2, entry_allocator, map_allocator);
+
+            CHECK(test_cache.add(1, test_element(10)));
+            CHECK(test_cache.add(2, test_element(20)));
+            CHECK(test_cache.add(3, test_element(30))); //  evicts key 1
+
+            CHECK_EQUAL(2, test_cache.size());
+
+            //  If eviction read a freed key, key 1 is still in the map and this add is refused
+
+            CHECK(test_cache.add(1, test_element(11)));
+            CHECK(test_cache.find(1).has_value());
+        }
+
+        CHECK(entry_resource.freed_memory_intact());
+        CHECK(map_resource.freed_memory_intact());
+        CHECK_EQUAL(0, entry_resource.bytes_in_use());
+        CHECK_EQUAL(0, map_resource.bytes_in_use());
+    }
+
+    TEST(LRUCacheTests, CacheHitDoesNotTouchTheMapAllocator)
+    {
+        //  find() erased and re-inserted the map entry on every hit, although move_front() relinks the same list
+        //      node and the stored iterator stays valid.
+        using cache_type = minstd::lru_cache<uint32_t, uint32_t>;
+
+        minstd::pmr::tracking_memory_resource map_tracking(&test_heap_resource);
+        minstd::pmr::polymorphic_allocator<cache_type::list_entry_type> entry_allocator(&test_heap_resource);
+        minstd::pmr::polymorphic_allocator<cache_type::map_entry_type> map_allocator(&map_tracking);
+
+        {
+            cache_type cache(8, entry_allocator, map_allocator);
+
+            for (uint32_t key = 1; key <= 4; ++key)
+            {
+                cache.add(key, key * 10);
+            }
+
+            const size_t allocations_before = map_tracking.allocation_count();
+
+            for (uint32_t i = 0; i < 100; ++i)
+            {
+                const uint32_t key = 1 + (i % 4);
+                auto found = cache.find(key);
+                CHECK_TRUE(found.has_value());
+                CHECK_EQUAL(key * 10, found.value().get());
+            }
+
+            CHECK_EQUAL(allocations_before, map_tracking.allocation_count()); //  before: + 100
+
+            cache.find(2);
+            CHECK_EQUAL(2u, cache.begin()->key()); //  most recently used is at the front
+
+            CHECK_TRUE(cache.remove(2)); //  the map still finds the moved entry
+            CHECK_FALSE(cache.find(2).has_value());
+            CHECK_TRUE(cache.find(3).has_value());
+        }
+    }
+
+    TEST(LRUCacheTests, ZeroCapacityCacheRejectsAdds)
+    {
+        //  With max_size 0, add() made room by evicting back() of the empty list.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        using cache_type = minstd::lru_cache<uint32_t, uint32_t>;
+                                                        minstd::pmr::polymorphic_allocator<cache_type::list_entry_type> entries(&test_heap_resource);
+                                                        minstd::pmr::polymorphic_allocator<cache_type::map_entry_type> map(&test_heap_resource);
+                                                        cache_type cache(0, entries, map);
+                                                        if (cache.add(1, 1)) _exit(1);
+                                                        uint32_t value = 2;
+                                                        if (cache.add(2, minstd::move(value))) _exit(2);
+                                                        if (cache.find(1).has_value()) _exit(3); })); //  before: child crashes in insure_space_exists()
+    }
 }

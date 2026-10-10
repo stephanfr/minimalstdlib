@@ -74,4 +74,24 @@ namespace
         constexpr bool geq2 = minstd::ratio_greater_equal<two_fourths, one_third>::value;
         CHECK_TRUE(geq2);
     }
+
+    TEST(RatioTests, ArithmeticResultsAreReduced)
+    {
+        //  The num/den members of ratio_add & co. were the unreduced products, so ratio_equal against the
+        //      reduced value failed.
+        using half = minstd::ratio<1, 2>;
+        using third = minstd::ratio<1, 3>;
+
+        CHECK_EQUAL(1, (minstd::ratio_add<half, half>::num));
+        CHECK_EQUAL(1, (minstd::ratio_add<half, half>::den)); //  before: 4
+        CHECK_EQUAL(1, (minstd::ratio_subtract<half, third>::num));
+        CHECK_EQUAL(6, (minstd::ratio_subtract<half, third>::den));
+        CHECK_EQUAL(1, (minstd::ratio_multiply<minstd::ratio<2, 3>, minstd::ratio<3, 4>>::num));
+        CHECK_EQUAL(2, (minstd::ratio_multiply<minstd::ratio<2, 3>, minstd::ratio<3, 4>>::den));
+        CHECK_EQUAL(1, (minstd::ratio_divide<half, half>::den));
+        CHECK_EQUAL(-1, (minstd::ratio_divide<half, minstd::ratio<-1, 2>>::num)); //  sign on the numerator
+        CHECK_EQUAL(1, (minstd::ratio_divide<half, minstd::ratio<-1, 2>>::den));
+
+        CHECK((minstd::ratio_equal<minstd::ratio_add<half, half>, minstd::ratio<1>>::value)); //  before: false
+    }
 }

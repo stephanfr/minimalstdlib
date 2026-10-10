@@ -278,4 +278,61 @@ namespace
         STRCMP_EQUAL("This is a test: {Invalid format string: ':}<'}6} of            \n", minstd::format(formatted_string, "This is a test: {:}<6} {:14}\n", "of", "bad alignment").c_str());
     }
 
-} // namespace
+    TEST(FormatTests, MostNegativeIntegers)
+    {
+        minstd::fixed_string<256> formatted_string;
+
+        STRCMP_EQUAL("-9223372036854775808", minstd::format(formatted_string, "{}", (int64_t)INT64_MIN).c_str());
+        STRCMP_EQUAL("-2147483648", minstd::format(formatted_string, "{}", (int32_t)INT32_MIN).c_str());
+        STRCMP_EQUAL("-32768", minstd::format(formatted_string, "{}", (int16_t)INT16_MIN).c_str());
+        STRCMP_EQUAL("-128", minstd::format(formatted_string, "{}", (int8_t)INT8_MIN).c_str());
+    }
+
+    TEST(FormatTests, ClosingBraceFollowedByAlignmentCharacter)
+    {
+        //  Any '}' followed by '<', '>' or '^' was rejected as a fill character, so "<{}>" could not be formatted.
+        minstd::fixed_string<256> formatted_string;
+
+        STRCMP_EQUAL("<abc>", minstd::format(formatted_string, "<{}>", "abc").c_str()); //  before: <{Invalid format string: '}>'}
+        STRCMP_EQUAL("x=1>0", minstd::format(formatted_string, "x={}>0", (int32_t)1).c_str());
+        STRCMP_EQUAL("[  7]^", minstd::format(formatted_string, "[{:>3}]^", (int32_t)7).c_str());
+
+        //  A '}' in the fill position is still rejected (an invalid placeholder consumes no argument)
+        STRCMP_EQUAL("{Invalid format string: ':}<'}6} a", minstd::format(formatted_string, "{:}<6} {}", "a", "x").c_str());
+    }
+
+    TEST(FormatTests, SignedLeftAndCenterAlignmentHonourWidth)
+    {
+        //  The trailing-fill pass counted the sign twice (it is already in the buffer by then).
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("-1   ", minstd::format(buffer, "{:<5}", (int32_t)-1).c_str()); //  before: "-1  "
+        STRCMP_EQUAL(" -1  ", minstd::format(buffer, "{:^5}", (int32_t)-1).c_str());
+        STRCMP_EQUAL("+7   ", minstd::format(buffer, "{:<+5}", (int32_t)7).c_str());
+        STRCMP_EQUAL("-2.50  ", minstd::format(buffer, "{:<7.2}", -2.5).c_str());
+        STRCMP_EQUAL("7    ", minstd::format(buffer, "{:<5}", (int32_t)7).c_str()); //  unsigned case unchanged
+        STRCMP_EQUAL("   -1", minstd::format(buffer, "{:>5}", (int32_t)-1).c_str());
+    }
+
+    TEST(FormatTests, FloatingPointEdgeCases)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("0.5000", minstd::format(buffer, "{}", 0.5).c_str());                   //  before: ".5000"
+        STRCMP_EQUAL("-0.2500", minstd::format(buffer, "{}", -0.25).c_str());                //  before: "-.2500"
+        STRCMP_EQUAL("0.5000000000", minstd::format(buffer, "{:.10}", 0.5).c_str());         //  before: zeros before the 5
+        STRCMP_EQUAL("1.2500000000", minstd::format(buffer, "{:.10}", 1.25).c_str());
+        STRCMP_EQUAL("3", minstd::format(buffer, "{:.0}", 3.0).c_str());                     //  before: "3."
+        STRCMP_EQUAL("12.75", minstd::format(buffer, "{:.2}", 12.75).c_str());
+    }
+
+    TEST(FormatTests, EscapedBraces)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("{literal}", minstd::format(buffer, "{{literal}}").c_str());
+        STRCMP_EQUAL("{7}", minstd::format(buffer, "{{{}}}", (int32_t)7).c_str());
+        STRCMP_EQUAL("a{b}c 1 }", minstd::format(buffer, "a{{b}}c {} }}", (int32_t)1).c_str());
+        STRCMP_EQUAL("end{", minstd::format(buffer, "end{{").c_str());
+    }
+}

@@ -89,4 +89,24 @@ namespace
         STRCMP_EQUAL(get<0>(pair4), "string is first");
         CHECK_EQUAL(get<1>(pair4).value(), 51);
     }
+
+    TEST(PairTests, MemberSwap)
+    {
+        //  The member swap() called swap(first, other.first), which found only the member itself and did not
+        //      compile.
+        minstd::pair<int, int> a{1, 2};
+        minstd::pair<int, int> b{3, 4};
+
+        a.swap(b);
+
+        CHECK_EQUAL(3, a.first);
+        CHECK_EQUAL(4, a.second);
+        CHECK_EQUAL(1, b.first);
+        CHECK_EQUAL(2, b.second);
+
+        swap(a, b); //  the free function forwards to the member
+
+        CHECK_EQUAL(1, a.first);
+        CHECK_EQUAL(3, b.first);
+    }
 }

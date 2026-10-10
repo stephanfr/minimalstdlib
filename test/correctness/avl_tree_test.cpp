@@ -18,6 +18,8 @@
 #include <__memory_resource/tracking_memory_resource.h>
 #include <single_block_memory_heap>
 
+#include <../shared/poisoning_memory_resource.h>
+
 #include <memory>
 
 #define TEST_BUFFER_SIZE 65536
@@ -100,6 +102,44 @@ namespace
         uint32_t value_ = 0;
         char empty_space_[18];
     };
+
+    struct move_clearing_key //  like a string: a move empties the source
+    {
+        int value;
+
+        move_clearing_key(int v) : value(v) {}
+        move_clearing_key(const move_clearing_key &other) = default;
+        move_clearing_key(move_clearing_key &&other) : value(other.value) { other.value = -1; }
+        move_clearing_key &operator=(const move_clearing_key &other) = default;
+        move_clearing_key &operator=(move_clearing_key &&other) { value = other.value; other.value = -1; return *this; }
+
+        bool operator<(const move_clearing_key &other) const { return value < other.value; }
+        bool operator>(const move_clearing_key &other) const { return value > other.value; }
+        bool operator==(const move_clearing_key &other) const { return value == other.value; }
+    };
+
+    struct move_to_end_key
+    {
+        static constexpr int MOVED_FROM = 0x7fffffff;
+
+        int value;
+
+        move_to_end_key(int v) : value(v) {}
+        move_to_end_key(const move_to_end_key &other) = default;
+        move_to_end_key(move_to_end_key &&other) : value(other.value) { other.value = MOVED_FROM; }
+        move_to_end_key &operator=(const move_to_end_key &other) = default;
+        move_to_end_key &operator=(move_to_end_key &&other)
+        {
+            value = other.value;
+            other.value = MOVED_FROM;
+            return *this;
+        }
+
+        bool operator<(const move_to_end_key &other) const { return value < other.value; }
+        bool operator>(const move_to_end_key &other) const { return value > other.value; }
+        bool operator==(const move_to_end_key &other) const { return value == other.value; }
+    };
+
 
     using avl_tree = minstd::avl_tree<uint32_t, test_element>;
 
@@ -868,5 +908,154 @@ namespace
 
         CHECK_EQUAL(0, heap_allocator_resource.bytes_in_use());
         CHECK_EQUAL(0, string_allocator_resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, Testavl_treeEraseLeafDoesNotWriteToFreedNode)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        {
+            avl_tree tree(allocator);
+
+            tree.insert(2, test_element(20));
+            tree.insert(1, test_element(10)); //  leaf, left child of 2
+            tree.insert(3, test_element(30)); //  leaf, right child of 2
+
+            CHECK_EQUAL(1, tree.erase(1));
+            CHECK_EQUAL(1, tree.erase(3));
+
+            CHECK(poisoning_resource.freed_memory_intact());
+        }
+
+        //  The destructor's clear() erases leaves too
+
+        CHECK(poisoning_resource.freed_memory_intact());
+        CHECK_EQUAL(0, poisoning_resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, Testavl_treeReverseIterationAfterTwoChildErase)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        avl_tree tree(allocator);
+
+        const uint32_t keys[] = {5, 3, 8, 2, 7, 9, 10};
+
+        for (uint32_t key : keys)
+        {
+            tree.insert(key, test_element(key));
+        }
+
+        //  5 has two children.  Removing its successor (7) rotates 5's right subtree.
+
+        CHECK_EQUAL(1, tree.erase(5));
+
+        const uint32_t expected[] = {10, 9, 8, 7, 3, 2};
+        size_t count = 0;
+        auto itr = tree.end();
+
+        while (count < 10)
+        {
+            --itr;
+
+            if (itr == tree.end())
+            {
+                break;
+            }
+
+            CHECK_EQUAL(expected[count], get<0>(*itr));
+            count++;
+        }
+
+        CHECK_EQUAL(6, count);
+    }
+
+    TEST(avl_treeTests, Testavl_treeEraseByIteratorReturnsLiveSuccessor)
+    {
+        minstd::pmr::test::poisoning_memory_resource poisoning_resource;
+        avl_treeStaticHeapAllocator allocator(&poisoning_resource);
+
+        avl_tree tree(allocator);
+
+        tree.insert(2, test_element(20));
+        tree.insert(1, test_element(10));
+        tree.insert(3, test_element(30));
+
+        //  2 has two children: erase moves 3's value into 2's node and frees 3's node
+
+        auto next = tree.erase(tree.find(2));
+
+        CHECK(next != tree.end());
+        CHECK_EQUAL(3, get<0>(*next));
+        CHECK_EQUAL(30, get<1>(*next).value());
+    }
+
+    TEST(avl_treeTests, TwoChildEraseWithNonTrivialKey)
+    {
+        using tree_type = minstd::avl_tree<move_clearing_key, int>;
+
+        minstd::pmr::test::poisoning_memory_resource resource;
+        minstd::pmr::polymorphic_allocator<tree_type::node_type> allocator(&resource);
+
+        {
+            tree_type tree(allocator);
+
+            for (int key = 1; key <= 7; ++key) //  balanced: 4 is the root with two children
+            {
+                tree.insert(move_clearing_key(key), key * 10);
+            }
+
+            CHECK_EQUAL(1u, tree.erase(move_clearing_key(4)));
+            CHECK_EQUAL(6u, tree.size()); //  before: 7
+
+            const int expected[] = {1, 2, 3, 5, 6, 7};
+            size_t i = 0;
+            for (auto itr = tree.begin(); itr != tree.end(); ++itr, ++i)
+            {
+                CHECK(i < 6);
+                CHECK_EQUAL(expected[i], minstd::get<0>(*itr).value); //  before: a -1 key appears
+                CHECK_EQUAL(expected[i] * 10, minstd::get<1>(*itr));
+            }
+            CHECK_EQUAL(6u, i);
+        }
+
+        CHECK_EQUAL(0u, resource.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, TwoChildEraseFindsTheSuccessorByAnIntactKey)
+    {
+        using tree_type = minstd::avl_tree<move_to_end_key, int>;
+
+        minstd::pmr::test::poisoning_memory_resource resource;
+        minstd::pmr::polymorphic_allocator<tree_type::node_type> allocator(&resource);
+
+        {
+            tree_type tree(allocator);
+
+            for (int key = 1; key <= 7; ++key) //  balanced: 4 is the root, its successor 5 is a leaf under 6
+            {
+                tree.insert(move_to_end_key(key), key * 10);
+            }
+
+            CHECK_EQUAL(1u, tree.erase(move_to_end_key(4)));
+            CHECK_EQUAL(6u, tree.size()); //  before: 7 - the successor node was not found, so not removed
+
+            const int expected[] = {1, 2, 3, 5, 6, 7};
+            size_t i = 0;
+            for (auto itr = tree.begin(); itr != tree.end(); ++itr, ++i)
+            {
+                if (i >= 6)
+                {
+                    break; //  before: a 7th element (the stale successor) is still in the tree
+                }
+                CHECK_EQUAL(expected[i], minstd::get<0>(*itr).value);
+                CHECK_EQUAL(expected[i] * 10, minstd::get<1>(*itr));
+            }
+            CHECK_EQUAL(6u, i);
+        }
+
+        CHECK_EQUAL(0u, resource.bytes_in_use());
     }
 }
