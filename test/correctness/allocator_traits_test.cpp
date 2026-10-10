@@ -6,6 +6,7 @@
 
 #include <allocator>
 #include <allocator_traits>
+#include <__memory_resource/polymorphic_allocator.h>
 #include <type_traits>
 
 #include <stdint.h>
@@ -192,4 +193,31 @@ namespace
         CHECK_EQUAL(1, tracking_element::constructed_count());
         CHECK_EQUAL(1, tracking_element::destroyed_count());
     }
+    TEST(AllocatorTraitsTests, PolymorphicAllocatorRejectsOverflowingCounts)
+    {
+        struct sixteen_bytes
+        {
+            char bytes[16];
+        };
+
+        class counting_resource : public minstd::pmr::memory_resource
+        {
+        public:
+            size_t calls = 0;
+
+        private:
+            alignas(16) char storage_[64];
+            void *do_allocate(size_t, size_t) override { calls++; return storage_; }
+            void do_deallocate(void *, size_t, size_t) override {}
+            bool do_is_equal(const minstd::pmr::memory_resource &o) const noexcept override { return this == &o; }
+        } resource;
+
+        minstd::pmr::polymorphic_allocator<sixteen_bytes> allocator(&resource);
+
+        const size_t count = (SIZE_MAX / sizeof(sixteen_bytes)) + 2; //  count * 16 wraps to 16
+
+        CHECK(allocator.allocate(count) == nullptr); //  before: a 16-byte block for 2^60 elements
+        CHECK_EQUAL(0u, resource.calls);
+    }
+
 }
