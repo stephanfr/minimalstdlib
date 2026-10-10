@@ -26,6 +26,21 @@ namespace MINIMAL_STD_NAMESPACE
     {
         template <class Rep, class Period = ratio<1>>
         class duration;
+    } // namespace chrono
+
+    //  As std: the common type of two durations has the common rep and the largest period both convert to
+    //      exactly (gcd of the numerators over lcm of the denominators).  Without it, durations whose periods
+    //      are not multiples of each other could not be added, subtracted or compared.
+    template <class Rep1, class Period1, class Rep2, class Period2>
+    struct common_type<chrono::duration<Rep1, Period1>, chrono::duration<Rep2, Period2>>
+    {
+        using type = chrono::duration<typename common_type<Rep1, Rep2>::type,
+                                      typename ratio<__static_gcd<Period1::num, Period2::num>::value,
+                                                     __static_lcm<Period1::den, Period2::den>::value>::type>;
+    };
+
+    namespace chrono
+    {
 
         template <class _Tp>
         struct __is_duration : false_type
