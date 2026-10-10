@@ -448,4 +448,36 @@ namespace
         CHECK_EQUAL(static_cast<uint64_t>(MUTEX_STRESS_NUM_THREADS * MUTEX_STRESS_ITERATIONS_PER_THREAD * 2), state.counter_);
         CHECK_EQUAL(static_cast<size_t>(0), state.violations_.load(minstd::memory_order_acquire));
     }
+
+    struct switchable_owner_policy
+    {
+        static inline uintptr_t current = 0;
+
+        static uintptr_t current_owner() noexcept
+        {
+            return current;
+        }
+    };
+
+    TEST(MutexTests, RecursiveSpinMutexOwnerIdZeroReallyLocks)
+    {
+        //  owner_ used 0 for "unowned", so a caller whose id is 0 (core 0, when the owner is the CPU id) took the
+        //      recursion branch on its first lock() and never acquired the inner mutex.
+        minstd::recursive_spin_mutex<switchable_owner_policy> mutex;
+
+        switchable_owner_policy::current = 0;
+        mutex.lock();
+
+        switchable_owner_policy::current = 1; //  a different owner must be excluded
+        CHECK_FALSE(mutex.try_lock());        //  before: succeeds - both "own" the mutex
+
+        switchable_owner_policy::current = 0;
+        CHECK_TRUE(mutex.try_lock()); //  recursion still works for owner 0
+        mutex.unlock();
+        mutex.unlock();
+
+        switchable_owner_policy::current = 1;
+        CHECK_TRUE(mutex.try_lock());
+        mutex.unlock();
+    }
 }

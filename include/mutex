@@ -96,6 +96,8 @@ namespace MINIMAL_STD_NAMESPACE
         {
             const uintptr_t caller = OwnerPolicy::current_owner();
 
+            MINIMAL_STD_ASSERT(caller != NO_OWNER);
+
             if (owner_.load(memory_order_relaxed) == caller)
             {
                 depth_++;
@@ -111,6 +113,8 @@ namespace MINIMAL_STD_NAMESPACE
         bool try_lock() noexcept
         {
             const uintptr_t caller = OwnerPolicy::current_owner();
+
+            MINIMAL_STD_ASSERT(caller != NO_OWNER);
 
             if (owner_.load(memory_order_relaxed) == caller)
             {
@@ -139,14 +143,18 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (--depth_ == 0)
             {
-                owner_.store(0, memory_order_relaxed);
+                owner_.store(NO_OWNER, memory_order_relaxed);
                 mutex_.unlock();
             }
         }
 
     private:
+        //  Owner ids are compared against this, so it must be a value no owner can have.  0 is a natural id
+        //      (core 0 when the owner is the CPU id), so it cannot be the sentinel.
+        static constexpr uintptr_t NO_OWNER = ~static_cast<uintptr_t>(0);
+
         spin_mutex mutex_;
-        atomic<uintptr_t> owner_{0};
+        atomic<uintptr_t> owner_{NO_OWNER};
         uint32_t depth_ = 0;
     };
 
