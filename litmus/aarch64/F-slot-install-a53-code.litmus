@@ -1,0 +1,13 @@
+AArch64 F-slot-install-a53-code
+"slot block seeding / install vs unpack_ptr"
+{
+0:X0=blocks; 0:X1=gen;
+1:X0=blocks; 1:X1=gen;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDAR W11,[X0]                      ;
+STR W11,[X1]                       | LDR W12,[X1]                       ;
+MOV W12,#1                         |                                    ;
+LDAXR W13,[X0]                     |                                    ;
+STLXR W14,W12,[X0]                 |                                    ;
+exists (0:X13=0 /\ 0:X14=0 /\ 1:X11=1 /\ 1:X12=0)

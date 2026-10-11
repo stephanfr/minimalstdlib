@@ -1,0 +1,12 @@
+AArch64 F-slot-install-llsc-rcpc-control
+"slot block seeding / install vs unpack_ptr"
+{
+0:X0=blocks; 0:X1=gen;
+1:X0=blocks; 1:X1=gen;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDR W11,[X0]                       ;
+STR W11,[X1]                       | LDR W12,[X1]                       ;
+MOV W12,#1                         |                                    ;
+STR W12,[X0]                       |                                    ;
+exists (1:X11=1 /\ 1:X12=0)

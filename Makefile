@@ -2,7 +2,7 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-TEST_TARGETS := test test-correctness test-performance test-performance-host-std test-soak test-coverage clean_test
+TEST_TARGETS := test test-correctness test-correctness-asan test-correctness-tsan test-failure-modes test-performance test-performance-host-std test-soak test-coverage clean_test
 NATIVE_TARGETS := native
 
 ifneq (,$(filter $(NATIVE_TARGETS), $(MAKECMDGOALS)))

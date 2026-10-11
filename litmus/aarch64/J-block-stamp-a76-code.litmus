@@ -1,0 +1,17 @@
+AArch64 J-block-stamp-a76-code
+"block retire / reclaimer stamp / epoch advancer / reader"
+{
+blocks=1; epoch=1;
+0:X0=blocks; 0:X1=list;
+1:X1=list; 1:X2=epoch;
+2:X2=epoch;
+3:X0=blocks; 3:X2=epoch;
+}
+P0                                 | P1                                 | P2                                 | P3                                 ;
+MOV W11,#0                         | MOV W11,#0                         | DMB ISH                            | LDAPR W11,[X2]                     ;
+MOV W12,#1                         | MOV W12,#1                         | MOV W11,#2                         | DMB ISH                            ;
+CASAL W12,W11,[X0]                 | CASAL W12,W11,[X1]                 | MOV W12,#1                         | LDAPR W12,[X0]                     ;
+MOV W13,#1                         | LDAPR W13,[X2]                     | CASAL W12,W11,[X2]                 |                                    ;
+MOV W14,#0                         |                                    |                                    |                                    ;
+CASAL W14,W13,[X1]                 |                                    |                                    |                                    ;
+exists (0:X12=1 /\ 0:X14=0 /\ 1:X12=1 /\ 2:X12=1 /\ 1:X13=1 /\ 3:X11=2 /\ 3:X12=1)

@@ -79,12 +79,12 @@ namespace MINIMAL_STD_NAMESPACE
 
                 expected_value = tokens_.load(memory_order::seq_cst);
 
-                if ((expected_value & (1 << token_index)) != 0)
+                if ((expected_value & (1ULL << token_index)) != 0)
                 {
                     continue;
                 }
 
-                new_value = expected_value | (1 << token_index);
+                new_value = expected_value | (1ULL << token_index);
 
                 if (tokens_.compare_exchange_strong(expected_value, new_value, memory_order::seq_cst))
                 {
@@ -95,7 +95,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         void release_token(const token &token)
         {
-            tokens_.and_fetch(~(1 << token.token_index_));
+            tokens_.and_fetch(~(1ULL << token.token_index_));
         }
 
     private:

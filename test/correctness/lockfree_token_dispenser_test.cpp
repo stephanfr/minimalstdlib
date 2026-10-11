@@ -11,6 +11,10 @@
 
 #include <stdio.h>
 
+#include <new>
+
+#include "../shared/process_isolation.h"
+
 namespace
 {
 
@@ -102,5 +106,26 @@ namespace
         //      There is no guarantee that each token will have the same count, but the total should always be the same.
 
         CHECK_EQUAL(NUM_THREADS * 1020, total);
+    }
+
+    TEST(LockfreeTokenDispenserTests, MoreThan32Tokens)
+    {
+        //  The token masks were built with int shifts: 1 << 31 sign-extends into bits 32..63, and 1 << 32 and up
+        //      is undefined, so tokens 31 and above could not be handed out.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        static minstd::token_dispenser dispenser(40);
+                                                        alignas(minstd::token_dispenser::token) static unsigned char storage[40][sizeof(minstd::token_dispenser::token)];
+
+                                                        for (size_t i = 0; i < 40; i++) //  hold all 40 at once
+                                                        {
+                                                            auto *token = new (storage[i]) minstd::token_dispenser::token(dispenser.get_token());
+                                                            if (token->value() != i) _exit(1);
+                                                        }
+
+                                                        reinterpret_cast<minstd::token_dispenser::token *>(storage[35])->~token();
+
+                                                        auto *token = new (storage[35]) minstd::token_dispenser::token(dispenser.get_token());
+                                                        if (token->value() != 35) _exit(2); })); //  before: child hangs, killed by the watchdog
     }
 }

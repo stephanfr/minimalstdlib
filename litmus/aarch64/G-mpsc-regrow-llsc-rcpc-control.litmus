@@ -1,0 +1,12 @@
+AArch64 G-mpsc-regrow-llsc-rcpc-control
+"consumer regrow / producer claim"
+{
+0:X0=pos; 0:X1=buffer;
+1:X0=pos; 1:X1=buffer;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDAXR W11,[X0]                     ;
+STR W11,[X1]                       | ADD W12,W11,#1                     ;
+MOV W12,#1                         | STXR W13,W12,[X0]                  ;
+STR W12,[X0]                       | LDR W14,[X1]                       ;
+exists (1:X11=1 /\ 1:X13=0 /\ 1:X14=0)

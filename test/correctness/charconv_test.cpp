@@ -8,6 +8,8 @@
 #include <minstdconfig.h>
 #include <charconv>
 
+#include "../shared/process_isolation.h"
+
 namespace
 {
 
@@ -65,7 +67,8 @@ namespace
         const char *s = "4294967296";  // max+1
         auto [ptr, ec] = minstd::from_chars(s, s + 10, v);
         CHECK(ec == minstd::errc::value_too_large);
-        CHECK_EQUAL(s, ptr);  // ptr unchanged on error
+        CHECK_EQUAL(s + 10, ptr);  // as std: past all the digits
+        CHECK_EQUAL(0u, v);        // value unchanged on error
     }
 
     TEST(FromCharsTests, Uint64Max)
@@ -145,7 +148,7 @@ namespace
         const char *s = "2147483648";  // max+1
         auto [ptr, ec] = minstd::from_chars(s, s + 10, v);
         CHECK(ec == minstd::errc::value_too_large);
-        CHECK_EQUAL(s, ptr);
+        CHECK_EQUAL(s + 10, ptr);
     }
 
     TEST(FromCharsTests, Int32NegativeOverflow)
@@ -154,7 +157,7 @@ namespace
         const char *s = "-2147483649";  // min-1
         auto [ptr, ec] = minstd::from_chars(s, s + 11, v);
         CHECK(ec == minstd::errc::value_too_large);
-        CHECK_EQUAL(s, ptr);
+        CHECK_EQUAL(s + 11, ptr);
     }
 
     // -----------------------------------------------------------------------
@@ -231,4 +234,28 @@ namespace
         CHECK(ec == minstd::errc{});
     }
 
+    TEST(FromCharsTests, InvalidBaseIsRejected)
+    {
+        //  base 0 divided by zero computing the overflow limits; bases above 36 have no digit set.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        const char text[] = "12";
+                                                        int32_t value = 0;
+                                                        uint32_t uvalue = 0;
+                                                        if (minstd::from_chars(text, text + 2, value, 0).ec != minstd::errc::invalid_argument) _exit(1);
+                                                        if (minstd::from_chars(text, text + 2, uvalue, 1).ec != minstd::errc::invalid_argument) _exit(2);
+                                                        if (minstd::from_chars(text, text + 2, uvalue, 37).ec != minstd::errc::invalid_argument) _exit(3); })); //  before: SIGFPE
+    }
+
+    TEST(FromCharsTests, OverflowConsumesAllDigits)
+    {
+        const char text[] = "99999999999x";
+        int32_t value = 7;
+
+        auto result = minstd::from_chars(text, text + 12, value);
+
+        CHECK(result.ec == minstd::errc::value_too_large);
+        CHECK(result.ptr == text + 11); //  before: text
+        CHECK_EQUAL(7, value);
+    }
 } // anonymous namespace

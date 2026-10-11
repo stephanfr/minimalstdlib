@@ -15,7 +15,7 @@ CC := gcc
 LD := g++
 AR := ar
 CPREPROCESSOR := cpp
-C_FLAGS := -Wall -fno-exceptions -fno-unwind-tables
+C_FLAGS := -Wall -Werror=invalid-memory-model -fno-exceptions -fno-unwind-tables
 CPP_FLAGS := $(C_FLAGS) -std=c++20 -fno-rtti
 OPTIMIZATION_FLAGS := -O2
 LDFLAGS :=
@@ -53,3 +53,14 @@ TEST_LDFLAGS :=
 COVERAGE_CFLAGS := $(TEST_CFLAGS) -fprofile-arcs -ftest-coverage -fprofile-update=atomic -fno-inline -fno-inline-functions -fno-default-inline
 COVERAGE_CPP_FLAGS := $(COVERAGE_CFLAGS)
 COVERAGE_OPTIMIZATION_FLAGS := -O0
+
+ASAN_SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
+ASAN_CPP_FLAGS := $(TEST_CFLAGS) $(ASAN_SANITIZE_FLAGS)
+ASAN_OPTIMIZATION_FLAGS := -O1 -fno-omit-frame-pointer
+ASAN_LDFLAGS := $(ASAN_SANITIZE_FLAGS)
+
+TSAN_SANITIZE_FLAGS := -fsanitize=thread
+TSAN_CPP_FLAGS := $(TEST_CFLAGS) $(TSAN_SANITIZE_FLAGS)
+TSAN_OPTIMIZATION_FLAGS := -O1 -fno-omit-frame-pointer
+# -no-pie keeps segment addresses below TSan's shadow region when mmap_rnd_bits=32
+TSAN_LDFLAGS := $(TSAN_SANITIZE_FLAGS) -no-pie

@@ -434,6 +434,14 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (old_last & last_mask)
             {
+                //  Undo only the bits this call set in the last word, then give back the first word.
+                const uint64_t newly_set_last = last_mask & ~old_last;
+
+                if (newly_set_last != 0)
+                {
+                    words_[end_word].fetch_and(~newly_set_last, minstd::memory_order_release);
+                }
+
                 words_[start_word].fetch_and(~first_mask, minstd::memory_order_release);
                 return bitblock_set_result::failed_bit_already_acquired_last_word;
             }
@@ -480,7 +488,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             if ((old_last & last_mask) != last_mask)
             {
-                //  Last word bits were not all set — roll back first word
+                //  Not all ours: restore the last-word bits we just cleared, then roll back the first word.
+                words_[end_word].fetch_or(old_last & last_mask, minstd::memory_order_release);
                 words_[start_word].fetch_or(first_mask, minstd::memory_order_release);
                 return bitblock_set_result::failed_bit_already_released_last_word;
             }

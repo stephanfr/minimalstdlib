@@ -1,0 +1,12 @@
+AArch64 H-mpsc-ready-llsc-rcpc-code
+"slot publication"
+{
+0:X0=ready; 0:X1=elem;
+1:X0=ready; 1:X1=elem;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDAPR W11,[X0]                     ;
+STR W11,[X1]                       | LDR W12,[X1]                       ;
+MOV W12,#1                         |                                    ;
+STLR W12,[X0]                      |                                    ;
+exists (1:X11=1 /\ 1:X12=0)

@@ -1,0 +1,11 @@
+AArch64 A-boundary-a76-nofence
+{
+0:X0=frontier; 0:X1=count;
+1:X0=frontier; 1:X1=count;
+}
+P0                         | P1                         ;
+MOV W2,#0                  | MOV W2,#0                  ;
+MOV W9,#1                  | MOV W9,#1                  ;
+CASAL W2,W9,[X0]           | CASAL W2,W9,[X1]           ;
+LDAPR W4,[X1]              | LDAPR W4,[X0]              ;
+exists (0:X2=0 /\ 1:X2=0 /\ 0:X4=0 /\ 1:X4=0)

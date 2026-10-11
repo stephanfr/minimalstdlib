@@ -29,6 +29,8 @@ namespace MINIMAL_STD_NAMESPACE
             const size_t slot = slot_policy_.acquire_slot();
             const uint64_t epoch = global_epoch_.load(memory_order_acquire);
             slot_policy_.slot(slot).begin_read_section(epoch);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
             return slot;
         }
 
@@ -39,6 +41,8 @@ namespace MINIMAL_STD_NAMESPACE
 
         bool try_advance_epoch(size_t exempt_slot) const
         {
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
             uint64_t epoch = global_epoch_.load(memory_order_acquire);
 
             for (size_t i = 0; i < NUM_SLOTS; ++i)
@@ -85,6 +89,8 @@ namespace MINIMAL_STD_NAMESPACE
             ExchangeRetiredListFunction exchange_retired_list_fn,
             ReclaimDetachedListFunction reclaim_detached_list_fn) const
         {
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            
             const uint64_t current_epoch = global_epoch_.load(memory_order_acquire);
 
             if (current_epoch <= EPOCH_RECLAIM_LAG)

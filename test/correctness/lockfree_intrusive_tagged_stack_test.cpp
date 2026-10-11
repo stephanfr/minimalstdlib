@@ -10,6 +10,8 @@
 #include <atomic>
 #include <stdint.h>
 
+#include <pthread.h>
+
 namespace
 {
 #pragma GCC diagnostic push
@@ -175,5 +177,83 @@ namespace
 
         CHECK_EQUAL(0, static_cast<int>(nodes[1].next_index_));
         CHECK_EQUAL(UINT32_MAX, nodes[0].next_index_);
+    }
+
+    TEST(LockfreeIntrusiveTaggedStackTests, ConcurrentPopPushKeepsExclusiveOwnership)
+    {
+        using tag_type = minstd::lockfree::tagged_ptr<indexed_node, uint16_t>;
+        using stack_type = minstd::lockfree::intrusive_tagged_stack<indexed_node, tag_type, uint32_t, &indexed_node::next_index_>;
+
+        constexpr size_t NUM_NODES = 4;
+        constexpr size_t NUM_THREADS = 4;
+        constexpr size_t ITERATIONS = 200000;
+
+        static indexed_node nodes[NUM_NODES];
+        static minstd::atomic<int> owners[NUM_NODES];
+
+        struct shared_state
+        {
+            indexed_adapter adapter;
+            minstd::atomic<uint64_t> head;
+            minstd::atomic<bool> go;
+            minstd::atomic<uint32_t> violations;
+        };
+
+        static shared_state state{{nodes, UINT32_MAX}, {tag_type::make(nullptr)}, {false}, {0}};
+
+        for (size_t i = 0; i < NUM_NODES; ++i)
+        {
+            nodes[i] = {static_cast<int>(i), UINT32_MAX, UINT32_MAX};
+            owners[i].store(0);
+            stack_type::push(state.head, nodes[i], state.adapter, no_backoff);
+        }
+
+        auto worker = [](void *) -> void *
+        {
+            while (!state.go.load(minstd::memory_order_acquire)) {}
+
+            for (size_t i = 0; i < ITERATIONS; ++i)
+            {
+                indexed_node *node = stack_type::pop(state.head, state.adapter, no_backoff);
+                if (node == nullptr)
+                {
+                    continue;
+                }
+
+                const size_t index = static_cast<size_t>(node - nodes);
+
+                if (owners[index].fetch_add(1) != 0) //  someone else also holds this node
+                {
+                    state.violations.fetch_add(1);
+                }
+
+                owners[index].fetch_sub(1);
+                stack_type::push(state.head, *node, state.adapter, no_backoff);
+            }
+            return nullptr;
+        };
+
+        pthread_t threads[NUM_THREADS];
+        for (size_t t = 0; t < NUM_THREADS; ++t)
+        {
+            CHECK_EQUAL(0, pthread_create(&threads[t], nullptr, worker, nullptr));
+        }
+
+        state.go.store(true, minstd::memory_order_release);
+
+        for (size_t t = 0; t < NUM_THREADS; ++t)
+        {
+            pthread_join(threads[t], nullptr);
+        }
+
+        CHECK_EQUAL(0u, state.violations.load());
+
+        size_t count = 0;
+        while (stack_type::pop(state.head, state.adapter, no_backoff) != nullptr)
+        {
+            ++count;
+        }
+
+        CHECK_EQUAL(NUM_NODES, count); //  no node lost or duplicated
     }
 }

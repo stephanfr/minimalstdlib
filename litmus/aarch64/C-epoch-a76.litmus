@@ -1,0 +1,14 @@
+AArch64 C-epoch-a76
+{
+link=1;
+0:X0=depth; 0:X1=link; 0:X2=epoch;
+1:X0=depth; 1:X1=link;
+}
+P0                         | P1                         ;
+MOV W8,#1                  | MOV W2,#1                  ;
+LDADDAL W8,W7,[X0]         | MOV W9,#2                  ;
+MOV W3,#5                  | CASAL W2,W9,[X1]           ;
+STLR W3,[X2]               | DMB ISH                    ;
+DMB ISH                    | LDAPR W4,[X0]              ;
+LDAPR W4,[X1]              |                            ;
+exists (1:X2=1 /\ 0:X4=1 /\ 1:X4=0)

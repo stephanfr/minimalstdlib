@@ -9,6 +9,7 @@
 #include "atomic"
 #include "new"
 
+#include "lockfree/arena_tagged_ptr"
 #include "lockfree/intrusive_tagged_stack"
 #include "lockfree/tagged_ptr"
 #include "memory_resource.h"
@@ -28,27 +29,53 @@ namespace MINIMAL_STD_NAMESPACE
                 free_block_node* next;
             };
 
+            //  Free-bin heads hold an arena-relative block index rather than a pointer: every block is MIN_ALIGNMENT
+            //      aligned and inside the arena, so the index needs only log2(arena size / 64) bits and the rest of the
+            //      word is ABA counter (39 bits for a 1 GiB arena, against tagged_ptr's 16).  A popper stalled between
+            //      its head load and its CAS is fooled only if its bin changes 2^counter_bits times meanwhile.
             using tagged_ptr_type = lockfree::tagged_ptr<free_block_node>;
+            using head_codec_type = lockfree::arena_tagged_ptr<free_block_node, 64>;
             using stack_type = lockfree::intrusive_tagged_stack<free_block_node, tagged_ptr_type, free_block_node*, &free_block_node::next>;
 
             uint8_t* arena_start_;
             uint8_t* arena_end_;
             atomic<uint8_t*> current_ptr_;
+            const head_codec_type head_codec_;
 
             static constexpr size_t NUM_BINS = 8;
             static constexpr size_t MIN_ALIGNMENT = 64;
+            static constexpr size_t LARGEST_CLASS = 4096; //  bins 0-6 hold exactly 64, 128, ... 4096 bytes; bin 7 holds larger blocks
             alignas(64) atomic<typename tagged_ptr_type::storage_type> free_stack_heads_[NUM_BINS];
 
-            size_t get_bin(size_t size) const {
-                size_t aligned_size = (size + (MIN_ALIGNMENT - 1)) & ~(MIN_ALIGNMENT - 1);
-                if (aligned_size <= 64) return 0;
-                if (aligned_size <= 128) return 1;
-                if (aligned_size <= 256) return 2;
-                if (aligned_size <= 512) return 3;
-                if (aligned_size <= 1024) return 4;
-                if (aligned_size <= 2048) return 5;
-                if (aligned_size <= 4096) return 6;
-                return 7;
+            //  The size actually reserved for a request.  Up to 4 KiB every request is rounded up to a whole size
+            //      class, so any block in a class bin fits any request for that bin.  Larger requests are rounded
+            //      to MIN_ALIGNMENT and kept in bin 7, which is searched best-fit.  Both allocate and deallocate
+            //      use this, so a block always returns to the bin it came from.
+            static size_t block_size_for(size_t bytes)
+            {
+                size_t size = (bytes < sizeof(free_block_node)) ? sizeof(free_block_node) : bytes;
+                size = (size + (MIN_ALIGNMENT - 1)) & ~(MIN_ALIGNMENT - 1);
+
+                if (size > LARGEST_CLASS) {
+                    return size;
+                }
+
+                size_t class_size = MIN_ALIGNMENT;
+                while (class_size < size) {
+                    class_size <<= 1;
+                }
+                return class_size;
+            }
+
+            //  block_size must come from block_size_for().
+            static size_t get_bin(size_t block_size) {
+                if (block_size > LARGEST_CLASS) return NUM_BINS - 1;
+
+                size_t bin = 0;
+                for (size_t class_size = MIN_ALIGNMENT; class_size < block_size; class_size <<= 1) {
+                    ++bin;
+                }
+                return bin;
             }
 
             // adapter for intrusive stack
@@ -68,10 +95,11 @@ namespace MINIMAL_STD_NAMESPACE
             lockfree_static_arena_resource(void* start, size_t size)
                 : arena_start_(static_cast<uint8_t*>(start)),
                   arena_end_(arena_start_ + size),
-                  current_ptr_(arena_start_)
+                  current_ptr_(arena_start_),
+                  head_codec_(start, size)
             {
                 for (size_t i = 0; i < NUM_BINS; ++i) {
-                    free_stack_heads_[i].store(0, memory_order_relaxed);
+                    free_stack_heads_[i].store(head_codec_.make(nullptr), memory_order_relaxed);
                 }
             }
 
@@ -83,13 +111,8 @@ namespace MINIMAL_STD_NAMESPACE
                 if (alignment > MIN_ALIGNMENT) {
                     return nullptr;
                 }
-                
-                size_t alloc_size = bytes;
-                if (alloc_size < sizeof(free_block_node)) {
-                    alloc_size = sizeof(free_block_node);
-                }
-                // Round up to min alignment boundary
-                alloc_size = (alloc_size + (MIN_ALIGNMENT - 1)) & ~(MIN_ALIGNMENT - 1);
+
+                const size_t alloc_size = block_size_for(bytes);
 
                 // Bump pointer allocation
                 uint8_t* expected = current_ptr_.load(memory_order_relaxed);
@@ -115,79 +138,78 @@ namespace MINIMAL_STD_NAMESPACE
                 adapter_type adapter;
                 backoff_type backoff;
 
-                size_t start_bin = get_bin(alloc_size);
+                const size_t start_bin = get_bin(alloc_size);
 
-                for (size_t bin = start_bin; bin < NUM_BINS; ++bin)
+                //  Class bins (up to 4 KiB): every block in a bin is at least as large as any request for it, so a
+                //      single lock-free pop is enough.  A larger class bin is tried if ours is empty.  The bin is never
+                //      emptied temporarily, so a concurrent allocator never sees a false out-of-memory.
+                for (size_t bin = start_bin; bin < NUM_BINS - 1; ++bin)
                 {
-                    free_block_node* stolen_list = stack_type::steal_all(free_stack_heads_[bin]);
-                    if (!stolen_list) continue;
-
-                    free_block_node* best_fit = nullptr;
-                    free_block_node* prev = nullptr;
-                    free_block_node* best_fit_prev = nullptr;
-
-                    free_block_node* current = stolen_list;
-
-                    while (current)
-                    {
-                        uintptr_t ptr_as_int = reinterpret_cast<uintptr_t>(current);
-                        
-                        if ((ptr_as_int & (MIN_ALIGNMENT - 1)) == 0 && current->size >= alloc_size)
-                        {
-                            if (!best_fit || current->size < best_fit->size)
-                            {
-                                best_fit = current;
-                                best_fit_prev = prev;
-                            }
-                        }
-                        prev = current;
-                        current = current->next;
-                    }
-
-                    if (best_fit) {
-                        if (best_fit_prev) {
-                            best_fit_prev->next = best_fit->next;
-                        } else {
-                            stolen_list = best_fit->next;
-                        }
-                        best_fit->next = nullptr;
-                    }
-
-                    // Put remainder back into the same bin
-                    current = stolen_list;
-                    while (current)
-                    {
-                        free_block_node* next = current->next;
-                        stack_type::push(free_stack_heads_[bin], *current, adapter, backoff);
-                        current = next;
-                    }
-
-                    if (best_fit) {
-                        return best_fit;
+                    if (free_block_node* node = stack_type::pop(free_stack_heads_[bin], adapter, backoff, head_codec_)) {
+                        return node;
                     }
                 }
 
-                return nullptr;
+                //  Bin 7 (> 4 KiB) holds blocks of different sizes: steal the list, take the best fit, and push the
+                //      rest back.  While a list is stolen, a concurrent large allocation can see bin 7 empty; large
+                //      blocks are expected to be rare in this resource.
+                const size_t bin = NUM_BINS - 1;
+
+                free_block_node* stolen_list = stack_type::steal_all(free_stack_heads_[bin], head_codec_);
+
+                free_block_node* best_fit = nullptr;
+                free_block_node* prev = nullptr;
+                free_block_node* best_fit_prev = nullptr;
+
+                for (free_block_node* current = stolen_list; current != nullptr; current = current->next)
+                {
+                    const bool aligned = (reinterpret_cast<uintptr_t>(current) & (MIN_ALIGNMENT - 1)) == 0;
+
+                    if (aligned && current->size >= alloc_size && (!best_fit || current->size < best_fit->size))
+                    {
+                        best_fit = current;
+                        best_fit_prev = prev;
+                    }
+                    prev = current;
+                }
+
+                if (best_fit) {
+                    if (best_fit_prev) {
+                        stack_type::store_link(*best_fit_prev, best_fit->next);
+                    } else {
+                        stolen_list = best_fit->next;
+                    }
+                    stack_type::store_link(*best_fit, nullptr);
+                }
+
+                // Put remainder back into the same bin
+                for (free_block_node* current = stolen_list; current != nullptr;)
+                {
+                    free_block_node* next = current->next;
+                    stack_type::push(free_stack_heads_[bin], *current, adapter, backoff, head_codec_);
+                    current = next;
+                }
+
+                return best_fit;
             }
 
             void do_deallocate(void* p, size_t bytes, size_t alignment) override
             {
-                if (p == nullptr || bytes < sizeof(free_block_node)) {
+                if (p == nullptr) {
                     return;
                 }
 
-                size_t rounded_bytes = (bytes < sizeof(free_block_node)) ? sizeof(free_block_node) : bytes;
-                rounded_bytes = (rounded_bytes + (MIN_ALIGNMENT - 1)) & ~(MIN_ALIGNMENT - 1);
+                //  Same size as do_allocate() reserved, so the block goes back to the bin it came from.
+                const size_t rounded_bytes = block_size_for(bytes);
 
                 free_block_node* node = static_cast<free_block_node*>(p);
                 node->size = rounded_bytes;
-                node->next = nullptr;
 
                 adapter_type adapter;
                 backoff_type backoff;
 
                 size_t bin = get_bin(rounded_bytes);
-                stack_type::push(free_stack_heads_[bin], *node, adapter, backoff);
+                stack_type::push(free_stack_heads_[bin], *node, adapter, backoff, head_codec_);
             }
 
             bool do_is_equal(memory_resource const& other) const noexcept override

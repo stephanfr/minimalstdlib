@@ -1,0 +1,12 @@
+AArch64 E-bitblock-hint-llsc-rcpc-control
+"block construction / hint publication"
+{
+0:X0=hint; 0:X1=field; 0:X2=first; 0:X3=bitmap;
+1:X0=hint; 1:X1=field;
+}
+P0                                 | P1                                 ;
+MOV W11,#1                         | LDR W11,[X0]                       ;
+STR W11,[X1]                       | LDR W12,[X1]                       ;
+MOV W12,#1                         |                                    ;
+STR W12,[X0]                       |                                    ;
+exists (1:X11=1 /\ 1:X12=0)

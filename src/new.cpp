@@ -21,9 +21,11 @@ void operator delete(void* ptr, std::align_val_t al) { operator delete(ptr); }
 void operator delete(void* ptr, size_t size, std::align_val_t al) { operator delete(ptr); }
 void operator delete[](void* ptr, std::align_val_t al) { operator delete(ptr); }
 void operator delete[](void* ptr, size_t size, std::align_val_t al) { operator delete(ptr); }
-void* operator new(size_t size) { return nullptr; }
+//  The library provides no general-purpose heap.  A non-placement new must not return nullptr: the compiler
+//      constructs the object at the returned address without checking it.  Fail loudly instead.
+void* operator new(size_t size) { __builtin_trap(); }
 void operator delete(void* ptr) {}
-void* operator new[](size_t size) { return nullptr; }
+void* operator new[](size_t size) { __builtin_trap(); }
 void operator delete[](void* ptr) {}
 void operator delete(void* ptr, size_t size) {}
 void operator delete[](void* ptr, size_t size) {}

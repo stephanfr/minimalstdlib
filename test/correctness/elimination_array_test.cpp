@@ -58,9 +58,9 @@ namespace
     using test_elimination_array = minstd::elimination_array<test_element, 16, 5000>;
 
     // Thread synchronization for multithreaded tests
-    static volatile bool start_threads = false;
-    static volatile bool stop_threads = false;
-
+    static minstd::atomic<bool> start_threads{false};
+    static minstd::atomic<bool> stop_threads{false};
+    
     struct thread_test_args
     {
         test_elimination_array *array;

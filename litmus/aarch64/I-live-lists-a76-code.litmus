@@ -1,0 +1,14 @@
+AArch64 I-live-lists-a76-code
+"slot block retirement vs new list"
+{
+blocks=1; live=1;
+0:X0=blocks; 0:X1=live;
+1:X0=blocks; 1:X1=live;
+}
+P0                                 | P1                                 ;
+MOV W11,#0                         | MOV W11,#1                         ;
+MOV W12,#1                         | LDADDAL W11,W12,[X1]               ;
+CASAL W12,W11,[X0]                 | DMB ISH                            ;
+DMB ISH                            | LDAPR W13,[X0]                     ;
+LDAPR W13,[X1]                     |                                    ;
+exists (0:X12=1 /\ 1:X12=1 /\ 0:X13=1 /\ 1:X13=1)

@@ -10,6 +10,9 @@
 #include <__memory_resource/polymorphic_allocator.h>
 #include <forward_list>
 
+#include <../shared/poisoning_memory_resource.h>
+#include "../shared/process_isolation.h"
+
 #define TEST_BUFFER_SIZE 65536
 
 namespace
@@ -208,5 +211,73 @@ namespace
         forward_list_monotonic_allocator monotonic_allocator(&monotonic_resource);
 
         testListFunctionality(monotonic_allocator);
+    }
+
+    TEST(ForwardListTests, DestructorReleasesAllNodes)
+    {
+        minstd::pmr::test::poisoning_memory_resource resource;
+        forward_list_static_heap_allocator allocator(&resource);
+
+        {
+            test_element_forward_list list(allocator);
+
+            list.push_front(test_element(1));
+            list.push_front(test_element(2));
+            list.emplace_front(3);
+        }
+
+        CHECK_EQUAL(0, resource.bytes_in_use()); //  before: 3 nodes' worth
+    }
+
+    //  Hands out `budget` nodes, then fails.
+    class limited_forward_list_allocator : public forward_list_allocator
+    {
+    public:
+        explicit limited_forward_list_allocator(size_t budget)
+            : budget_(budget)
+        {
+        }
+
+        size_t max_size() const noexcept override
+        {
+            return 4;
+        }
+
+        test_element_forward_list::node_type *allocate(size_t num_elements) override
+        {
+            if ((num_elements != 1) || (used_ >= budget_))
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<test_element_forward_list::node_type *>(&slots_[used_++][0]);
+        }
+
+        void deallocate(test_element_forward_list::node_type *, size_t) override
+        {
+        }
+
+    private:
+        alignas(test_element_forward_list::node_type) unsigned char slots_[4][sizeof(test_element_forward_list::node_type)] = {{0}};
+        size_t budget_;
+        size_t used_ = 0;
+    };
+
+    TEST(ForwardListTests, FailedAllocationLeavesListUnchanged)
+    {
+        //  Under the default (LEGACY) allocation-failure policy, a failed node allocation used to fall through
+        //      and construct the element at address 0.
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        limited_forward_list_allocator allocator(1);
+                                                        test_element_forward_list list(allocator);
+
+                                                        list.push_front(test_element(1));
+                                                        list.push_front(test_element(2));
+                                                        if (list.insert_after(list.begin(), test_element(3)) != list.end()) _exit(1);
+                                                        if (list.emplace_after(list.begin(), 4u) != list.end()) _exit(2);
+
+                                                        if (list.front().value() != 1) _exit(3);
+                                                        if (++list.begin() != list.end()) _exit(4); })); //  before: child segfaults
     }
 }

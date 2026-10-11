@@ -47,9 +47,23 @@ namespace MINIMAL_STD_NAMESPACE
         spsc_queue(const spsc_queue &) = delete;
         spsc_queue(spsc_queue &&) = delete;
 
+        //  Precondition: no producer or consumer is running.
         ~spsc_queue()
         {
-            allocator_traits_type::deallocate(allocator_, elements_, size_); //
+            uint32_t current = read_index_.load(memory_order_relaxed);
+            const uint32_t end = write_index_.load(memory_order_acquire);
+
+            while (current != end)
+            {
+                allocator_traits_type::destroy(allocator_, &elements_[current]);
+
+                if (++current == size_)
+                {
+                    current = 0;
+                }
+            }
+
+            allocator_traits_type::deallocate(allocator_, elements_, size_);
         }
 
         spsc_queue &operator=(const spsc_queue &) = delete;
@@ -57,7 +71,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t capacity() const
         {
-            return size_ - 1;
+            return (size_ > 0) ? size_ - 1 : 0; //  one slot is always left empty
         }
 
         bool empty() const
@@ -99,6 +113,11 @@ namespace MINIMAL_STD_NAMESPACE
         template <class... Args>
         bool push_back(Args &&...args)
         {
+            if ((size_ < 2) || (elements_ == nullptr))
+            {
+                return false; //  no usable slot: too small, or the buffer allocation failed
+            }
+
             auto const current = write_index_.load(memory_order_relaxed);
 
             auto next = current + 1;
@@ -161,7 +180,11 @@ namespace MINIMAL_STD_NAMESPACE
         void popFront()
         {
             auto const current = read_index_.load(memory_order_relaxed);
-            //            assert(current != write_index_.load(memory_order_acquire));
+
+            if (current == write_index_.load(memory_order_acquire))
+            {
+                return; //  empty: nothing to drop
+            }
 
             auto next = current + 1;
 

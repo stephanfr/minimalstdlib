@@ -20,6 +20,57 @@ namespace
     };
 #pragma GCC diagnostic pop
 
+    class recording_resource : public minstd::pmr::memory_resource
+    {
+    public:
+        void *last_allocated_ = nullptr;
+        size_t last_allocated_bytes_ = 0;
+        void *last_deallocated_ = nullptr;
+        size_t last_deallocated_bytes_ = 0;
+        size_t last_deallocated_alignment_ = 0;
+
+    private:
+        alignas(64) unsigned char arena_[4096];
+        size_t used_ = 0;
+
+        void *do_allocate(size_t bytes, size_t alignment) override
+        {
+            used_ = (used_ + alignment - 1) & ~(alignment - 1);
+            void *ptr = arena_ + used_;
+            used_ += bytes;
+            last_allocated_ = ptr;
+            last_allocated_bytes_ = bytes;
+            return ptr;
+        }
+
+        void do_deallocate(void *ptr, size_t bytes, size_t alignment) override
+        {
+            last_deallocated_ = ptr;
+            last_deallocated_bytes_ = bytes;
+            last_deallocated_alignment_ = alignment;
+        }
+
+        bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override { return this == &other; }
+    };
+
+    struct conversion_other_base
+    {
+        int other_value_ = 2;
+    };
+
+    struct conversion_base //  deliberately no virtual destructor
+    {
+        int base_value_ = 1;
+    };
+
+    struct conversion_derived : conversion_other_base, conversion_base //  conversion_base is NOT at offset 0
+    {
+        static inline int destroyed_ = 0;
+        char payload_[1200]; //  > composite THRESHOLD_BYTES, so size-routing would pick the wrong pool
+
+        ~conversion_derived() { destroyed_++; }
+    };
+
     class counting_resource : public minstd::pmr::memory_resource
     {
     public:
@@ -232,5 +283,52 @@ namespace
         CHECK_EQUAL(0, tracked_element::live_instances());
         CHECK_EQUAL(1, tracked_element::destroyed());
         CHECK_EQUAL(1, resource.deallocate_calls_);
+    }
+
+    TEST(UniquePtrTests, ConvertingMoveDestroysAndFreesTheOriginalAllocation)
+    {
+        recording_resource resource;
+        conversion_derived::destroyed_ = 0;
+
+        {
+            minstd::unique_ptr<conversion_derived> derived(new (resource.allocate(sizeof(conversion_derived), alignof(conversion_derived))) conversion_derived(), resource);
+
+            minstd::unique_ptr<conversion_base> base(minstd::move(derived));
+
+            CHECK(derived.get() == nullptr);
+            CHECK_EQUAL(1, base->base_value_);
+        }
+
+        CHECK_EQUAL(1, conversion_derived::destroyed_);                                  //  before: 0
+        CHECK(resource.last_deallocated_ == resource.last_allocated_);                    //  before: Base subobject address
+        CHECK_EQUAL(sizeof(conversion_derived), resource.last_deallocated_bytes_);        //  before: sizeof(conversion_base)
+        CHECK_EQUAL(alignof(conversion_derived), resource.last_deallocated_alignment_);
+    }
+
+    TEST(UniquePtrTests, ConvertingMoveAssignmentFreesTheOriginalAllocation)
+    {
+        recording_resource resource;
+        conversion_derived::destroyed_ = 0;
+
+        {
+            minstd::unique_ptr<conversion_base> base;
+            base = minstd::unique_ptr<conversion_derived>(new (resource.allocate(sizeof(conversion_derived), alignof(conversion_derived))) conversion_derived(), resource);
+        }
+
+        CHECK_EQUAL(1, conversion_derived::destroyed_);
+        CHECK(resource.last_deallocated_ == resource.last_allocated_);
+        CHECK_EQUAL(sizeof(conversion_derived), resource.last_deallocated_bytes_);
+    }
+
+    TEST(UniquePtrTests, SelfMoveAssignmentKeepsObject) //  pass-1 #27, same function
+    {
+        recording_resource resource;
+        minstd::unique_ptr<int> ptr(new (resource.allocate(sizeof(int), alignof(int))) int(42), resource);
+
+        auto &alias = ptr;
+        ptr = minstd::move(alias);
+
+        CHECK(ptr.get() != nullptr); //  before: destroyed and null
+        CHECK_EQUAL(42, *ptr);
     }
 }

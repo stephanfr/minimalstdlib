@@ -1,0 +1,12 @@
+AArch64 B-upperlevels-a76
+{
+0:X0=remaining; 0:X1=ownlink;
+1:X0=remaining; 1:X1=ownlink;
+}
+P0                         | P1                         ;
+MOV W8,#1                  | MOV W2,#0                  ;
+LDADDAL W8,W7,[X0]         | MOV W9,#1                  ;
+DMB ISH                    | CASAL W2,W9,[X1]           ;
+LDAPR W4,[X1]              | DMB ISH                    ;
+                           | LDAPR W4,[X0]              ;
+exists (1:X2=0 /\ 0:X4=0 /\ 1:X4=0)

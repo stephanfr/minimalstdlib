@@ -15,23 +15,13 @@
 (* operations, the data structure is in an intermediate state where       *)
 (* another thread or ISR can interleave.                                  *)
 (*                                                                        *)
-(* C++ multi-word acquire:                                                *)
-(*   old_first = words[sw].fetch_or(first_mask)     // step 1             *)
-(*   if (old_first & first_mask) return FAIL         // no rollback!      *)
-(*   old_last = words[ew].fetch_or(last_mask)        // step 2            *)
-(*   if (old_last & last_mask) {                                          *)
-(*       words[sw].fetch_and(~first_mask)            // rollback step 1   *)
-(*       return FAIL                                                      *)
-(*   }                                                                    *)
-(*   return SUCCESS                                                       *)
-(*                                                                        *)
-(* C++ multi-word release:                                                *)
-(*   old_first = words[sw].load()                    // step 1            *)
-(*   old_last  = words[ew].load()                    // step 2            *)
-(*   if (!check(old_first, old_last)) return FAIL    // TOCTOU check      *)
-(*   words[sw].fetch_and(~first_mask)                // step 3            *)
-(*   words[ew].fetch_and(~last_mask)                 // step 4            *)
-(*   return SUCCESS                                                       *)
+(* Multi-word acquire and release (include/lockfree/bitblock_set,        *)
+(* acquire_multi_word / release_multi_word) are modelled step by step     *)
+(* below, including the undo steps on their failure paths: a failed      *)
+(* acquire clears only the bits it set (first word, then last word) and   *)
+(* gives back the first word; release clears the first word with a CAS,   *)
+(* then the last word with fetch_and, restoring both if the last word was *)
+(* not fully set.                                                         *)
 (*                                                                        *)
 (* This model verifies safety under arbitrary interleaving of threads     *)
 (* and interrupt handlers, including kernel reentrancy scenarios.         *)
@@ -224,42 +214,57 @@ AcquireSingleWord(c) ==
 
 -----------------------------------------------------------------------------
 (* ===================================================================== *)
-(* ACQUIRE: MULTI-WORD STEP 1 - fetch_or on first word                  *)
+(* ACQUIRE: MULTI-WORD                                                   *)
 (*                                                                       *)
-(* BUG IN C++: if (old_first & first_mask), the code returns FAIL        *)
-(* without rolling back the bits it just set via fetch_or. Bits that     *)
-(* were clear get set and are ORPHANED (set but unowned).                *)
+(* acquire_multi_word():                                                 *)
+(*   old_first = words[sw].fetch_or(first_mask)                          *)
+(*   if (old_first & first_mask) {                                       *)
+(*       words[sw].fetch_and(~(first_mask & ~old_first))  // undo ours   *)
+(*       return FAIL                                                     *)
+(*   }                                                                   *)
+(*   old_last = words[ew].fetch_or(last_mask)                            *)
+(*   if (old_last & last_mask) {                                         *)
+(*       words[ew].fetch_and(~(last_mask & ~old_last))     // undo ours   *)
+(*       words[sw].fetch_and(~first_mask)                  // give back   *)
+(*       return FAIL                                                     *)
+(*   }                                                                   *)
+(*   return SUCCESS                                                      *)
+(*                                                                       *)
+(* Each line is one atomic step.  Bits we set but do not (yet) own are   *)
+(* tracked in tentative until they are confirmed or undone.              *)
 (* ===================================================================== *)
+
+GlobOf(w, L) == {w * BPW + l : l \in L}
 
 AcquireMultiFirst(c) ==
     /\ IsActive(c)
     /\ pc[c] = "acq_mw1"
     /\ LET curWord == words[sW[c]]
            mask == fM[c]
+           newlySet == mask \ curWord
        IN
-       \* fetch_or: unconditionally set bits, get old value
        /\ savedOld' = [savedOld EXCEPT ![c] = curWord]
        /\ words' = [words EXCEPT ![sW[c]] = curWord \union mask]
        /\ IF mask \cap curWord # {} THEN
-              \* FAIL: some bits were already set in the first word.
-              \* BUG: fetch_or already set (mask \ curWord) bits -- they are now ORPHANED.
-              \* The C++ code does NOT roll back these newly set bits.
-              /\ pc' = [pc EXCEPT ![c] = "done"]
-              /\ UNCHANGED <<owned, tentative>>
+              \* Conflict: the bits we just set are ours only until the undo step
+              /\ tentative' = [tentative EXCEPT ![c] = GlobOf(sW[c], newlySet)]
+              /\ pc' = [pc EXCEPT ![c] = "acq_mw1_undo"]
           ELSE
-              \* First word acquired -- mark as tentative, proceed to second word
               /\ tentative' = [tentative EXCEPT ![c] = firstGlob[c]]
               /\ pc' = [pc EXCEPT ![c] = "acq_mw2"]
-              /\ UNCHANGED owned
+       /\ UNCHANGED owned
     /\ UNCHANGED <<activeDepth, sb, nb, sW, eW, fM, lM,
                    acqB, firstGlob, lastGlob, ops>>
 
------------------------------------------------------------------------------
-(* ===================================================================== *)
-(* ACQUIRE: MULTI-WORD STEP 2 - fetch_or on last word                   *)
-(*                                                                       *)
-(* If this step fails, the code DOES roll back the first word.           *)
-(* ===================================================================== *)
+\* fetch_and(~(first_mask & ~old_first)): clear only the bits this call set
+AcquireMultiFirstUndo(c) ==
+    /\ IsActive(c)
+    /\ pc[c] = "acq_mw1_undo"
+    /\ words' = [words EXCEPT ![sW[c]] = words[sW[c]] \ (fM[c] \ savedOld[c])]
+    /\ tentative' = [tentative EXCEPT ![c] = {}]
+    /\ pc' = [pc EXCEPT ![c] = "done"]
+    /\ UNCHANGED <<owned, activeDepth, sb, nb, sW, eW, fM, lM,
+                   acqB, firstGlob, lastGlob, savedOld, ops>>
 
 AcquireMultiLast(c) ==
     /\ IsActive(c)
@@ -267,26 +272,38 @@ AcquireMultiLast(c) ==
     /\ LET curWord == words[eW[c]]
            mask == lM[c]
        IN
-       IF mask \cap curWord # {} THEN
-           \* FAIL on last word.
-           \* fetch_or on last word sets bits (some already set, some maybe not).
-           \* C++ rolls back first word via fetch_and(~first_mask).
-           \* C++ does NOT clean up newly set bits in last word.
-           \* Model: first word cleared of fM, last word gets mask OR'd in.
-           /\ words' = [words EXCEPT
-                  ![sW[c]] = words[sW[c]] \ fM[c],
-                  ![eW[c]] = curWord \union mask]
-           /\ tentative' = [tentative EXCEPT ![c] = {}]
-           /\ pc' = [pc EXCEPT ![c] = "done"]
-           /\ UNCHANGED owned
-       ELSE
-           \* SUCCESS: fetch_or on last word sets bits (all were clear).
-           \* Both words now have our bits set.
-           /\ words' = [words EXCEPT ![eW[c]] = curWord \union mask]
-           /\ owned' = [owned EXCEPT ![c] = owned[c] \union acqB[c]]
-           /\ tentative' = [tentative EXCEPT ![c] = {}]
-           /\ pc' = [pc EXCEPT ![c] = "done"]
+       /\ savedOld' = [savedOld EXCEPT ![c] = curWord]
+       /\ words' = [words EXCEPT ![eW[c]] = curWord \union mask]
+       /\ IF mask \cap curWord # {} THEN
+              \* Conflict: undo our last-word bits, then give back the first word
+              /\ tentative' = [tentative EXCEPT ![c] = @ \union GlobOf(eW[c], mask \ curWord)]
+              /\ pc' = [pc EXCEPT ![c] = "acq_mw2_undo_last"]
+              /\ UNCHANGED owned
+          ELSE
+              /\ owned' = [owned EXCEPT ![c] = owned[c] \union acqB[c]]
+              /\ tentative' = [tentative EXCEPT ![c] = {}]
+              /\ pc' = [pc EXCEPT ![c] = "done"]
     /\ UNCHANGED <<activeDepth, sb, nb, sW, eW, fM, lM,
+                   acqB, firstGlob, lastGlob, ops>>
+
+\* fetch_and(~(last_mask & ~old_last)) on the last word
+AcquireMultiLastUndo(c) ==
+    /\ IsActive(c)
+    /\ pc[c] = "acq_mw2_undo_last"
+    /\ words' = [words EXCEPT ![eW[c]] = words[eW[c]] \ (lM[c] \ savedOld[c])]
+    /\ tentative' = [tentative EXCEPT ![c] = firstGlob[c]]
+    /\ pc' = [pc EXCEPT ![c] = "acq_mw2_undo_first"]
+    /\ UNCHANGED <<owned, activeDepth, sb, nb, sW, eW, fM, lM,
+                   acqB, firstGlob, lastGlob, savedOld, ops>>
+
+\* fetch_and(~first_mask) on the first word
+AcquireMultiFirstGiveBack(c) ==
+    /\ IsActive(c)
+    /\ pc[c] = "acq_mw2_undo_first"
+    /\ words' = [words EXCEPT ![sW[c]] = words[sW[c]] \ fM[c]]
+    /\ tentative' = [tentative EXCEPT ![c] = {}]
+    /\ pc' = [pc EXCEPT ![c] = "done"]
+    /\ UNCHANGED <<owned, activeDepth, sb, nb, sW, eW, fM, lM,
                    acqB, firstGlob, lastGlob, savedOld, ops>>
 
 -----------------------------------------------------------------------------
@@ -308,54 +325,61 @@ ReleaseSingleWord(c) ==
 -----------------------------------------------------------------------------
 (* ===================================================================== *)
 (* RELEASE: MULTI-WORD                                                   *)
-(* Step 1: Load first word (for TOCTOU check)                           *)
-(* Step 2: Load last word and check both                                *)
-(* Step 3: fetch_and(~first_mask) on first word                         *)
-(* Step 4: fetch_and(~last_mask) on last word                           *)
+(*                                                                       *)
+(* release_multi_word():                                                 *)
+(*   CAS loop on the first word: fail if not all of first_mask is set,   *)
+(*       otherwise clear it (one atomic step)                            *)
+(*   old_last = words[ew].fetch_and(~last_mask)                          *)
+(*   if ((old_last & last_mask) != last_mask) {                          *)
+(*       words[ew].fetch_or(old_last & last_mask)   // restore            *)
+(*       words[sw].fetch_or(first_mask)             // roll back first    *)
+(*       return FAIL                                                     *)
+(*   }                                                                   *)
+(* The failure path needs a caller that does not own the bits; it is     *)
+(* modelled for fidelity, and StartRelease only releases owned bits.     *)
 (* ===================================================================== *)
 
-ReleaseMultiLoad(c) ==
+ReleaseMultiFirst(c) ==
     /\ IsActive(c)
-    /\ pc[c] = "rel_mw_load"
-    \* Load first word (save for check)
-    /\ savedOld' = [savedOld EXCEPT ![c] = words[sW[c]]]
-    /\ pc' = [pc EXCEPT ![c] = "rel_mw_check"]
-    /\ UNCHANGED <<words, owned, tentative, activeDepth, sb, nb, sW, eW,
-                   fM, lM, acqB, firstGlob, lastGlob, ops>>
-
-ReleaseMultiCheck(c) ==
-    /\ IsActive(c)
-    /\ pc[c] = "rel_mw_check"
-    \* Load last word and check both (C++ loads both then checks)
-    /\ LET lastWord == words[eW[c]] IN
-       IF ~(fM[c] \subseteq savedOld[c]) \/ ~(lM[c] \subseteq lastWord) THEN
-           \* Check failed -- bits not all set (shouldn't happen with correct callers)
-           /\ pc' = [pc EXCEPT ![c] = "done"]
-           /\ UNCHANGED <<words, owned, tentative>>
+    /\ pc[c] = "rel_mw_first"
+    /\ IF fM[c] \subseteq words[sW[c]] THEN
+           /\ words' = [words EXCEPT ![sW[c]] = words[sW[c]] \ fM[c]]
+           /\ owned' = [owned EXCEPT ![c] = owned[c] \ firstGlob[c]]
+           /\ pc' = [pc EXCEPT ![c] = "rel_mw_last"]
        ELSE
-           /\ pc' = [pc EXCEPT ![c] = "rel_mw_clear1"]
-           /\ UNCHANGED <<words, owned, tentative>>
-    /\ UNCHANGED <<activeDepth, sb, nb, sW, eW, fM, lM,
-                   acqB, firstGlob, lastGlob, savedOld, ops>>
-
-ReleaseMultiClear1(c) ==
-    /\ IsActive(c)
-    /\ pc[c] = "rel_mw_clear1"
-    \* fetch_and(~first_mask): clear first word bits
-    /\ words' = [words EXCEPT ![sW[c]] = words[sW[c]] \ fM[c]]
-    \* Ghost: release ownership of first word's bits immediately
-    /\ owned' = [owned EXCEPT ![c] = owned[c] \ firstGlob[c]]
-    /\ pc' = [pc EXCEPT ![c] = "rel_mw_clear2"]
+           /\ pc' = [pc EXCEPT ![c] = "done"]
+           /\ UNCHANGED <<words, owned>>
     /\ UNCHANGED <<tentative, activeDepth, sb, nb, sW, eW, fM, lM,
                    acqB, firstGlob, lastGlob, savedOld, ops>>
 
-ReleaseMultiClear2(c) ==
+ReleaseMultiLast(c) ==
     /\ IsActive(c)
-    /\ pc[c] = "rel_mw_clear2"
-    \* fetch_and(~last_mask): clear last word bits
-    /\ words' = [words EXCEPT ![eW[c]] = words[eW[c]] \ lM[c]]
-    \* Ghost: release ownership of last word's bits
-    /\ owned' = [owned EXCEPT ![c] = owned[c] \ lastGlob[c]]
+    /\ pc[c] = "rel_mw_last"
+    /\ LET old == words[eW[c]] IN
+       /\ savedOld' = [savedOld EXCEPT ![c] = old]
+       /\ words' = [words EXCEPT ![eW[c]] = old \ lM[c]]
+       /\ IF lM[c] \subseteq old THEN
+              /\ owned' = [owned EXCEPT ![c] = owned[c] \ lastGlob[c]]
+              /\ pc' = [pc EXCEPT ![c] = "done"]
+          ELSE
+              /\ pc' = [pc EXCEPT ![c] = "rel_mw_restore_last"]
+              /\ UNCHANGED owned
+    /\ UNCHANGED <<tentative, activeDepth, sb, nb, sW, eW, fM, lM,
+                   acqB, firstGlob, lastGlob, ops>>
+
+ReleaseMultiRestoreLast(c) ==
+    /\ IsActive(c)
+    /\ pc[c] = "rel_mw_restore_last"
+    /\ words' = [words EXCEPT ![eW[c]] = words[eW[c]] \union (savedOld[c] \cap lM[c])]
+    /\ pc' = [pc EXCEPT ![c] = "rel_mw_restore_first"]
+    /\ UNCHANGED <<owned, tentative, activeDepth, sb, nb, sW, eW, fM, lM,
+                   acqB, firstGlob, lastGlob, savedOld, ops>>
+
+ReleaseMultiRestoreFirst(c) ==
+    /\ IsActive(c)
+    /\ pc[c] = "rel_mw_restore_first"
+    /\ words' = [words EXCEPT ![sW[c]] = words[sW[c]] \union fM[c]]
+    /\ owned' = [owned EXCEPT ![c] = owned[c] \union firstGlob[c]]
     /\ pc' = [pc EXCEPT ![c] = "done"]
     /\ UNCHANGED <<tentative, activeDepth, sb, nb, sW, eW, fM, lM,
                    acqB, firstGlob, lastGlob, savedOld, ops>>
@@ -402,7 +426,7 @@ StartRelease(c, s, n) ==
     /\ lastGlob' = [lastGlob EXCEPT ![c] = LastGlobalBits(s, n)]
     /\ IF SingleWord(s, n)
        THEN pc' = [pc EXCEPT ![c] = "rel_sw"]
-       ELSE pc' = [pc EXCEPT ![c] = "rel_mw_load"]
+       ELSE pc' = [pc EXCEPT ![c] = "rel_mw_first"]
     /\ UNCHANGED <<words, owned, tentative, activeDepth, savedOld, ops>>
 
 FinishOp(c) ==
@@ -447,12 +471,15 @@ Next ==
             \/ StartRelease(c, s, n)
         \/ AcquireSingleWord(c)
         \/ AcquireMultiFirst(c)
+        \/ AcquireMultiFirstUndo(c)
         \/ AcquireMultiLast(c)
+        \/ AcquireMultiLastUndo(c)
+        \/ AcquireMultiFirstGiveBack(c)
         \/ ReleaseSingleWord(c)
-        \/ ReleaseMultiLoad(c)
-        \/ ReleaseMultiCheck(c)
-        \/ ReleaseMultiClear1(c)
-        \/ ReleaseMultiClear2(c)
+        \/ ReleaseMultiFirst(c)
+        \/ ReleaseMultiLast(c)
+        \/ ReleaseMultiRestoreLast(c)
+        \/ ReleaseMultiRestoreFirst(c)
         \/ FinishOp(c)
     \/ \E cpu \in 1..NumCPUs :
         \/ FireInterrupt(cpu)

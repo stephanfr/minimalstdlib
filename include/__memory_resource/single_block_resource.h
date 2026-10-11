@@ -84,6 +84,8 @@ namespace MINIMAL_STD_NAMESPACE
         private:
             void *do_allocate(size_t bytes, size_t alignment) override
             {
+                const size_t effective_alignment = (alignment > DEFAULT_ALIGNMENT) ? alignment : DEFAULT_ALIGNMENT;
+
                 //  If the total number of deallocations is greater than 10% of the total number of allocations, then
                 //      Try to re-use some released blocks before allocating a new block.
 
@@ -95,7 +97,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     for (size_t i = 0; i < NUM_DEALLOCATION_BINS; i++)
                     {
-                        if (bytes + BLOCK_HEADER_SIZE >= DEALLOCATION_BIN_SIZES[i])
+                        if (bytes + BLOCK_HEADER_SIZE <= DEALLOCATION_BIN_SIZES[i])
                         {
                             deallocation_bin = i;
                             break;
@@ -109,10 +111,12 @@ namespace MINIMAL_STD_NAMESPACE
 
                     while (current->next_deallocated_.load(memory_order_acquire) != nullptr) //  The last block is the end_of_list_marker_ so we don't want to use that one
                     {
-                        block_header *next = current->next_;
+                        block_header *next = current->next_deallocated_.load(memory_order_acquire);
                         void *return_value = (uint8_t *)current + BLOCK_HEADER_SIZE;
 
-                        if (!current->in_use_)
+                        if (!current->in_use_ &&
+                            (current->actual_size_ >= bytes + BLOCK_HEADER_SIZE) &&
+                            (((uintptr_t)return_value % effective_alignment) == 0))
                         {
                             //  Try to grab the block.  If that fails, then try again from the top.
 
@@ -132,7 +136,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                             return return_value;
                         }
-                        else
+                        else if (current->in_use_)
                         {
                             //  If the block is in use, then we need to remove it from the deallocated list.
 
@@ -140,7 +144,6 @@ namespace MINIMAL_STD_NAMESPACE
 
                             if (previous == nullptr)
                             {
-                                
                                 deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_value, next, memory_order_acq_rel, memory_order_acquire);
                             }
                             else
@@ -160,7 +163,10 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     block_header *next_block = next_empty_block_.load(memory_order_acquire);
 
-                    void *returned_pointer = (char *)next_block + BLOCK_HEADER_SIZE;
+                    //  At the default alignment there is no padding.
+
+                    void *returned_pointer = align_pointer((char *)next_block + BLOCK_HEADER_SIZE, effective_alignment);
+                    block_header *header = (block_header *)((char *)returned_pointer - BLOCK_HEADER_SIZE);
 
                     block_header *block_following_next_block = (block_header *)align_pointer((char *)returned_pointer + bytes);
 
@@ -173,12 +179,14 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (next_empty_block_.compare_exchange_strong(next_block, block_following_next_block, memory_order_acq_rel, memory_order_acquire))
                     {
-                        next_block->in_use_ = true;
-                        next_block->requested_size_ = bytes;
+                        header->in_use_ = true;
+                        header->requested_size_ = bytes;
+                        header->actual_size_ = (char *)block_following_next_block - (char *)header;
+                        header->next_deallocated_.store(nullptr, memory_order_relaxed);
 
                         //  Add the block to the list of blocks in use
 
-                        while (!head_.compare_exchange_strong(next_block->next_, next_block, memory_order_acq_rel, memory_order_acquire)){};
+                        while (!head_.compare_exchange_strong(header->next_, header, memory_order_acq_rel, memory_order_acquire)){};
 
                         this->allocation_made(bytes);
 
@@ -201,7 +209,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 for (size_t i = 0; i < NUM_DEALLOCATION_BINS; i++)
                 {
-                    if (bytes + BLOCK_HEADER_SIZE >= DEALLOCATION_BIN_SIZES[i])
+                    if (bytes + BLOCK_HEADER_SIZE <= DEALLOCATION_BIN_SIZES[i])
                     {
                         deallocation_bin = i;
                         break;
@@ -235,7 +243,7 @@ namespace MINIMAL_STD_NAMESPACE
                 do
                 {
                     header->next_deallocated_.store(current_deallocated_head, memory_order_release);
-                } while (deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_deallocated_head, header, memory_order_acq_rel, memory_order_acquire));
+                } while (!deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_deallocated_head, header, memory_order_acq_rel, memory_order_acquire));
 
                 //  Update the statistics
 
@@ -273,8 +281,10 @@ namespace MINIMAL_STD_NAMESPACE
             atomic<block_header *> next_empty_block_;
             atomic<block_header *> head_ = &end_of_list_marker_;
 
-            array<atomic<block_header *>, NUM_DEALLOCATION_BINS> deallocated_head_bins_ = {&end_of_list_marker_};
-
+            array<atomic<block_header *>, NUM_DEALLOCATION_BINS> deallocated_head_bins_ = {&end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_,
+                                                                                           &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_,
+                                                                                           &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_,
+                                                                                           &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_};
             atomic<size_t> cmp_exchange_retries_ = 0;
 
             static void *align_pointer(void *ptr, size_t alignment = DEFAULT_ALIGNMENT)

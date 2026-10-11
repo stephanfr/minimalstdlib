@@ -109,6 +109,16 @@ namespace MINIMAL_STD_NAMESPACE
 
                     block *current_block = first_block_.load(memory_order_acquire);
 
+                    if (current_block == nullptr)
+                    {
+                        if (!add_new_block(cap_reached))
+                        {
+                            return nullptr;
+                        }
+
+                        current_block = first_block_.load(memory_order_acquire);
+                    }
+
                     minstd::optional<size_t> allocation;
 
                     while (!allocation.has_value())
@@ -144,7 +154,7 @@ namespace MINIMAL_STD_NAMESPACE
                         }
                     }
 
-                    allocation_hint_.store(current_block, memory_order_relaxed);
+                    allocation_hint_.store(current_block, memory_order_release);
                     return parent_->finalize_allocation(current_block, allocation.value(), num_elements);
                 }
 
@@ -163,7 +173,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                         if (allocation.has_value())
                         {
-                            allocation_hint_.store(current_block, memory_order_relaxed);
+                            allocation_hint_.store(current_block, memory_order_release);
                             return parent_->finalize_allocation(current_block, allocation.value(), num_elements);
                         }
 
@@ -183,7 +193,7 @@ namespace MINIMAL_STD_NAMESPACE
                         return false;
                     }
 
-                    auto new_block_space = upstream_resource_->allocate(sizeof(block));
+                    auto new_block_space = upstream_resource_->allocate(sizeof(block), alignof(block));
 
                     if (new_block_space == nullptr)
                     {
@@ -224,18 +234,33 @@ namespace MINIMAL_STD_NAMESPACE
                 : upstream_resource_(memory_resource),
                   number_of_arenas_(clamp_arena_count(number_of_arenas))
             {
+                size_t blocks_created = 0;
+
                 for (size_t i = 0; i < number_of_arenas_; i++)
                 {
                     arenas_[i].upstream_resource_ = memory_resource;
                     arenas_[i].parent_ = this;
                     arenas_[i].arena_index_ = i;
-                    auto initial_block = new (upstream_resource_->allocate(sizeof(block))) block();
+                    arenas_[i].first_block_.store(nullptr, memory_order_relaxed);
+                    arenas_[i].block_count_ = 0;
+
+                    void *block_space = upstream_resource_->allocate(sizeof(block), alignof(block));
+
+                    if (block_space == nullptr)
+                    {
+                        //  Leave this arena empty; do_allocate() adds a block when memory becomes available.
+                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block), continue);
+                    }
+
+                    auto initial_block = new (block_space) block();
                     initial_block->arena_index_ = i;
+
                     arenas_[i].first_block_.store(initial_block, memory_order_release);
                     arenas_[i].block_count_ = 1;
+                    blocks_created++;
                 }
 
-                total_blocks_.store(number_of_arenas_, memory_order_release);
+                total_blocks_.store(blocks_created, memory_order_release);
             }
 
             ~lockfree_bitblock_resource()
@@ -248,7 +273,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         auto next_block = current_block->next_block_;
 
-                        upstream_resource_->deallocate(current_block, sizeof(block));
+                        upstream_resource_->deallocate(current_block, sizeof(block), alignof(block));
 
                         current_block = next_block;
                     }
@@ -319,8 +344,8 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 uint64_t core_id = platform::get_cpu_id();
                 size_t hint_index = core_id % MAX_NUMBER_OF_ARENAS;
-                core_hints_[hint_index].last_block.store(blk, memory_order_relaxed);
-                arenas_[blk->arena_index_].allocation_hint_.store(blk, memory_order_relaxed);
+                core_hints_[hint_index].last_block.store(blk, memory_order_release);
+                arenas_[blk->arena_index_].allocation_hint_.store(blk, memory_order_release);
             }
 
             static size_t clamp_arena_count(size_t requested) noexcept
@@ -373,7 +398,10 @@ namespace MINIMAL_STD_NAMESPACE
                 //  In churn workloads, the preceding deallocation stored the freed block here,
                 //  so this path provides O(1) allocation in the common case.
 
-                block *hint_blk = core_hints_[hint_index].last_block.load(memory_order_relaxed);
+                //  Hints are published release / read acquire: this thread may never have loaded first_block_
+                //      since the hinted block was constructed, and it reads the block's plain fields below.
+
+                block *hint_blk = core_hints_[hint_index].last_block.load(memory_order_acquire);
 
                 if (hint_blk != nullptr && hint_blk->arena_index_ == arena_in_use)
                 {
@@ -381,7 +409,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (allocation.has_value())
                     {
-                        arenas_[arena_in_use].allocation_hint_.store(hint_blk, memory_order_relaxed);
+                        arenas_[arena_in_use].allocation_hint_.store(hint_blk, memory_order_release);
                         return finalize_allocation(hint_blk, allocation.value(), num_elements);
                     }
                 }
@@ -390,7 +418,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  This catches cases where a different core freed space in the arena's
                 //  most recently successful block.
 
-                hint_blk = arenas_[arena_in_use].allocation_hint_.load(memory_order_relaxed);
+                hint_blk = arenas_[arena_in_use].allocation_hint_.load(memory_order_acquire);
 
                 if (hint_blk != nullptr)
                 {
@@ -398,7 +426,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                     if (allocation.has_value())
                     {
-                        core_hints_[hint_index].last_block.store(hint_blk, memory_order_relaxed);
+                        core_hints_[hint_index].last_block.store(hint_blk, memory_order_release);
                         return finalize_allocation(hint_blk, allocation.value(), num_elements);
                     }
                 }
@@ -412,7 +440,7 @@ namespace MINIMAL_STD_NAMESPACE
                 if (result != nullptr)
                 {
                     block *successful_blk = block_from_allocation(result);
-                    core_hints_[hint_index].last_block.store(successful_blk, memory_order_relaxed);
+                    core_hints_[hint_index].last_block.store(successful_blk, memory_order_release);
                     return result;
                 }
 
@@ -431,7 +459,7 @@ namespace MINIMAL_STD_NAMESPACE
                     if (other_result != nullptr)
                     {
                         block *successful_blk = block_from_allocation(other_result);
-                        core_hints_[hint_index].last_block.store(successful_blk, memory_order_relaxed);
+                        core_hints_[hint_index].last_block.store(successful_blk, memory_order_release);
                         return other_result;
                     }
                 }

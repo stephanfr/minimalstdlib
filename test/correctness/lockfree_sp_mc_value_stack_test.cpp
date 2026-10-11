@@ -23,6 +23,14 @@ namespace
     //  Single-threaded correctness
     //  -----------------------------------------------------------------------
 
+    TEST(SpMcValueStackTests, SlotsAreLockFreeAtomics)
+    {
+        // Ensure that the atomic types used in the stack are lock-free
+        
+        CHECK(minstd::atomic<uint32_t>::is_always_lock_free);
+        CHECK(minstd::atomic<uint64_t>::is_always_lock_free);
+    }
+
     TEST(SpMcValueStackTests, EmptyOnConstruction)
     {
         minstd::lockfree::sp_mc_value_stack<uint16_t, 8> s;

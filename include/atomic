@@ -121,11 +121,20 @@ namespace MINIMAL_STD_NAMESPACE
             return __atomic_compare_exchange_n(&value_, &expected, new_value, true, static_cast<int>(success_order), static_cast<int>(failure_order));
         }
 
+        //  A failed CAS performs no store, so its order may not contain release semantics.  Derive it the way
+        //      std::atomic does: acq_rel -> acquire, release -> relaxed, anything else unchanged.
+        static constexpr memory_order failure_order_for(memory_order order) noexcept
+        {
+            return (order == memory_order_acq_rel)   ? memory_order_acquire
+                   : (order == memory_order_release) ? memory_order_relaxed
+                                                     : order;
+        }
+
         bool compare_exchange_weak(T &expected,
                                    T new_value,
                                    memory_order order) noexcept
         {
-            return __atomic_compare_exchange_n(&value_, &expected, new_value, true, static_cast<int>(order), static_cast<int>(order));
+            return __atomic_compare_exchange_n(&value_, &expected, new_value, true, static_cast<int>(order), static_cast<int>(failure_order_for(order)));
         }
 
         bool compare_exchange_strong(T &expected,
@@ -140,7 +149,7 @@ namespace MINIMAL_STD_NAMESPACE
                                      T new_value,
                                      memory_order order) noexcept
         {
-            return __atomic_compare_exchange_n(&value_, &expected, new_value, false, static_cast<int>(order), static_cast<int>(order));
+            return __atomic_compare_exchange_n(&value_, &expected, new_value, false, static_cast<int>(order), static_cast<int>(failure_order_for(order)));
         }
 
         T fetch_add(T value, memory_order order = memory_order_seq_cst) noexcept

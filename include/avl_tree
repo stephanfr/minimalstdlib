@@ -109,9 +109,8 @@ namespace MINIMAL_STD_NAMESPACE
                     left_->left_reverse_ = this;
                     left_->right_reverse_ = nullptr;
                 }
-                else if (left_ != nullptr)
+                else
                 {
-                    left_->left_reverse_ = nullptr;
                     left_ = nullptr;
                 }
             }
@@ -125,9 +124,8 @@ namespace MINIMAL_STD_NAMESPACE
                     right_->right_reverse_ = this;
                     right_->left_reverse_ = nullptr;
                 }
-                else if (right_ != nullptr)
+                else
                 {
-                    right_->right_reverse_ = nullptr;
                     right_ = nullptr;
                 }
             }
@@ -166,6 +164,9 @@ namespace MINIMAL_STD_NAMESPACE
             : allocator_(allocator)
         {
         }
+        
+        avl_tree(const avl_tree &) = delete;
+        avl_tree &operator=(const avl_tree &) = delete;
 
         ~avl_tree()
         {
@@ -489,12 +490,17 @@ namespace MINIMAL_STD_NAMESPACE
 
                     node_type *subtree_front = find_front(subtree_root->right_);
 
-                    subtree_root->value_ = minstd::move(subtree_front->value_);
+                    //  Keep the successor's key intact until its node is gone: the erase below finds it by key.
+                    //      Take a copy of the key and only move the mapped value out.
+
+                    key_type successor_key = subtree_front->key();
+                    mapped_type successor_value = minstd::move(get<1>(subtree_front->value_));
 
                     //  Delete the ordered successor
 
-                    subtree_root->right_ = erase_recursive(subtree_root->right_, subtree_front->key());
-                }
+                    subtree_root->set_right(erase_recursive(subtree_root->right_, successor_key));
+
+                    subtree_root->value_ = value_type(minstd::move(successor_key), minstd::move(successor_value));                }
             }
 
             if (subtree_root == nullptr)
@@ -964,9 +970,17 @@ namespace MINIMAL_STD_NAMESPACE
 
         ++next_element;
 
+        if (next_element == end())
+        {
+            erase(get<0>(*element_to_erase));
+            return end();
+        }
+
+        key_type next_key = get<0>(*next_element);
+
         erase(get<0>(*element_to_erase));
 
-        return next_element;
+        return find(next_key);
     }
 
 }

@@ -1,0 +1,18 @@
+AArch64 D-retire-epoch-a76-fence
+"unlinker / epoch advancer / reader"
+{
+link=1; epoch=1;
+0:X0=link; 0:X1=flag; 0:X2=epoch;
+1:X2=epoch;
+2:X0=link; 2:X2=epoch;
+}
+P0                                 | P1                                 | P2                                 ;
+MOV W11,#2                         | DMB ISH                            | LDAPR W11,[X2]                     ;
+MOV W12,#1                         | MOV W11,#2                         | DMB ISH                            ;
+CASAL W12,W11,[X0]                 | MOV W12,#1                         | LDAPR W12,[X0]                     ;
+MOV W13,#1                         | CASAL W12,W11,[X2]                 |                                    ;
+MOV W14,#0                         |                                    |                                    ;
+CASAL W14,W13,[X1]                 |                                    |                                    ;
+DMB ISH                            |                                    |                                    ;
+LDAPR W15,[X2]                     |                                    |                                    ;
+exists (0:X12=1 /\ 0:X14=0 /\ 1:X12=1 /\ 0:X15=1 /\ 2:X11=2 /\ 2:X12=1)

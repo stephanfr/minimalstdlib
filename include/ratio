@@ -111,37 +111,37 @@ namespace MINIMAL_STD_NAMESPACE
     template <typename R1, typename R2>
     struct ratio_add
     {
-        static constexpr int64_t num = R1::num * R2::den + R2::num * R1::den;
-        static constexpr int64_t den = R1::den * R2::den;
+        using type = typename ratio<R1::num * R2::den + R2::num * R1::den, R1::den * R2::den>::type; //  reduced, as std
 
-        using type = ratio<num, den>;
+        static constexpr int64_t num = type::num;
+        static constexpr int64_t den = type::den;
      };
 
     template <typename R1, typename R2>
     struct ratio_subtract
     {
-        static constexpr int64_t num = R1::num * R2::den - R2::num * R1::den;
-        static constexpr int64_t den = R1::den * R2::den;
+        using type = typename ratio<R1::num * R2::den - R2::num * R1::den, R1::den * R2::den>::type; //  reduced, as std
 
-        using type = ratio<num, den>;
+        static constexpr int64_t num = type::num;
+        static constexpr int64_t den = type::den;
      };
 
     template <typename R1, typename R2>
     struct ratio_multiply
     {
-        static constexpr int64_t num = R1::num * R2::num;
-        static constexpr int64_t den = R1::den * R2::den;
+        using type = typename ratio<R1::num * R2::num, R1::den * R2::den>::type; //  reduced, as std
 
-        using type = ratio<num, den>;
+        static constexpr int64_t num = type::num;
+        static constexpr int64_t den = type::den;
      };
 
     template <typename R1, typename R2>
     struct ratio_divide
     {
-        static constexpr int64_t num = R1::num * R2::den;
-        static constexpr int64_t den = R1::den * R2::num;
+        using type = typename ratio<R1::num * R2::den, R1::den * R2::num>::type; //  reduced, as std
 
-        using type = ratio<num, den>;
+        static constexpr int64_t num = type::num;
+        static constexpr int64_t den = type::den;
     };
 
     template <class _Tp>

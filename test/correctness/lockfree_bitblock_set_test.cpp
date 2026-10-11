@@ -567,4 +567,21 @@ namespace
         // If the TOCTOU bug exists, total_successes > RACE_ITERATIONS
         CHECK_EQUAL(RACE_ITERATIONS, total_successes);
     }
+
+    TEST(BitblockSetTests, FailedMultiWordAcquireLeavesNoBitsSet)
+    {
+        minstd::bitblock_set<256> set;
+
+        CHECK(set.acquire(64, 1) == minstd::bitblock_set_result::success); //  bit 0 of word 1
+
+        //  60..67 spans words 0 and 1 and collides with bit 64
+        CHECK(set.acquire(60, 8) == minstd::bitblock_set_result::failed_bit_already_acquired_last_word);
+
+        for (size_t bit = 60; bit < 68; ++bit)
+        {
+            CHECK_EQUAL(bit == 64, set.is_acquired(bit)); //  before: 65, 66, 67 stay set
+        }
+
+        CHECK(set.acquire(65, 3) == minstd::bitblock_set_result::success);
+    }
 }
