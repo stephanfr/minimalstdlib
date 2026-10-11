@@ -217,7 +217,7 @@ namespace
     {
         minstd::pmr::single_block_resource upstream_resource(buffer, BUFFER_SIZE);
 
-        minstd::pmr::lockfree_bitblock_resource<32, 2024, MAX_NUMBER_OF_ARENAS, MAX_NUMBER_OF_BLOCKS> resource(
+        minstd::pmr::lockfree_bitblock_resource<32, 2024, MAX_NUMBER_OF_ARENAS, MAX_NUMBER_OF_BLOCKS, true> resource(
             static_cast<minstd::pmr::memory_resource *>(&upstream_resource),
             get_number_of_arenas());
 
@@ -293,7 +293,7 @@ namespace
     {
         minstd::pmr::single_block_resource upstream_resource(buffer, BUFFER_SIZE);
 
-        minstd::pmr::lockfree_bitblock_resource<32, 2048, MAX_NUMBER_OF_ARENAS, MAX_NUMBER_OF_BLOCKS> resource(
+        minstd::pmr::lockfree_bitblock_resource<32, 2048, MAX_NUMBER_OF_ARENAS, MAX_NUMBER_OF_BLOCKS, true> resource(
             static_cast<minstd::pmr::memory_resource *>(&upstream_resource),
             get_number_of_arenas());
 
