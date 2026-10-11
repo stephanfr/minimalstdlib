@@ -84,6 +84,7 @@ Deadlock checking is on, which is how an interrupt handler that can never finish
 | `fixed_small_live.cfg` | all fixed; 2 CPUs (2 + 1 ops), `SpecIFair` (weak fairness per process) | no error; `Termination` (no livelock in the spin/undo loops) | no error, `Termination` holds; 99,093 distinct states |
 | `fixed_irq_live.cfg` | as `fixed_irq.cfg`, `SpecIFair` | no error; `Termination` | no error, `Termination` holds; 1,513,359 distinct states |
 | `fixed_irq2.cfg` | all fixed; 2 CPUs × 1 op, each with an interrupt handler (1 op) | no error, no deadlock | no error in 13,254,117 distinct states (stopped after 50 min with TSan sharing the CPUs, not exhaustive; 811,561 states left on the queue) |
+| `fixed_irq2_small.cfg` | as `fixed_irq2.cfg` with one block size (2) and 10 arena units | no error, no deadlock | no error; 31,195,287 distinct states (exhaustive, 60 min on 4 workers) |
 | `bug_precas.cfg` | `pre_cas_backlink`, no serialisation | assertion in `FB_pre`: back-link written inside a live block | assertion in `FB_pre` fails |
 | `bug_n3only_stale.cfg` | `post_cas_hint` (N3 only), no serialisation, `StaleBacklinkAt5` | assertion in `TR_meta`: reclaimer reads a header inside a live block (the TSan report behind N4) | assertion in `TR_meta` fails |
 | `bug_n5.cfg` | `PendingCountFirst = FALSE` | `PendingCountExact` violated | `Safety` violated (count 1, list empty) |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the D-I litmus tests (the A-C tests and SB sanity checks are hand-written).
+"""Generate the D-K litmus tests (the A-C tests and SB sanity checks are hand-written).
 
     python3 gen.py        (writes the .litmus files next to this script)
 
@@ -226,7 +226,30 @@ def gen_J(cg, variant):
           [x, r, a, p], ([f"{lst}=1"] if lst else []) + [f"{st}=1", f"{pe}=2", f"{pb}=1"])
 
 
+def gen_K(cg, variant):
+    """skiplist iterator: retire_node stores the retired mark (relaxed), fences, and stamps the epoch (retirer);
+    an advancer moves the epoch 1 -> 2; an iterator's operator++ enters a read section (epoch load, snapshot
+    store, fence) and loads the mark.  Bad: stamp 1, the iterator in epoch 2 misses the mark and dereferences a
+    node that is freed once its section's snapshot no longer blocks reclaim.  control: no fence in retire_node."""
+    r, a, p = Thread(0, cg), Thread(1, cg), Thread(2, cg)
+    r.store("X0", 1, False)
+    if variant == "code":
+        r.fence()
+    st = r.load("X2", True)
+    a.fence()
+    a.cas("X2", 1, 2)
+    pe = p.load("X2", True)
+    p.store("X3", 1, True)                  # reader snapshot
+    p.fence()
+    pm = p.load("X0", True)
+    write(f"K-iterator-mark-{cg}-{variant}", "retire mark / epoch advancer / iterator",
+          "epoch=1;", {0: {"X0": "mark", "X2": "epoch"}, 1: {"X2": "epoch"}, 2: {"X0": "mark", "X2": "epoch", "X3": "snap"}},
+          [r, a, p], [f"{st}=1", f"{pe}=2", f"{pm}=0"])
+
+
 for cg in CODEGENS:
+    for v in ("code", "control"):
+        gen_K(cg, v)
     for v in ("code", "fence", "control"):
         gen_J(cg, v)
     for v in ("code", "fence", "control"):
