@@ -28,3 +28,16 @@ PERFORMANCE_OBJ += $(PERFORMANCE_OBJ_DIR)/moodycamel_runner.o
 $(PERFORMANCE_OBJ_DIR)/moodycamel_runner.o: $(MOODYCAMEL_SRC)
 	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
 	$(CC) $(MOODYCAMEL_INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(DEPFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# std + mutex baselines for LockfreeVsStdComparisonPerformanceTests
+# Also compiled without -Iinclude: <map>, <mutex>, <memory_resource> ... are the
+# real standard library.
+# ---------------------------------------------------------------------------
+STD_BASELINES_SRC := test/performance/external/std_baselines/std_runner.cpp
+
+PERFORMANCE_OBJ += $(PERFORMANCE_OBJ_DIR)/std_baselines_runner.o
+
+$(PERFORMANCE_OBJ_DIR)/std_baselines_runner.o: $(STD_BASELINES_SRC)
+	@/bin/mkdir -p $(PERFORMANCE_OBJ_DIR)
+	$(CC) $(MOODYCAMEL_INCLUDE_DIRS) $(CPP_FLAGS) $(TEST_OPTIMIZATION_FLAGS) $(TEST_CPP_FLAGS) $(DEPFLAGS) -c $< -o $@
