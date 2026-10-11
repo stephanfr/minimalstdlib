@@ -390,7 +390,7 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 uint64_t core_id = platform::get_cpu_id();
-                uint64_t arena_in_use = core_id % number_of_arenas_;
+                uint64_t arena_in_use = (core_id < number_of_arenas_) ? core_id : (core_id % number_of_arenas_); //  no divide on the usual path
                 size_t hint_index = core_id % MAX_NUMBER_OF_ARENAS;
                 size_t scan_offset = core_id;
 
