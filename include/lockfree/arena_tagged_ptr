@@ -1,0 +1,114 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    namespace lockfree
+    {
+        //  A tagged head word for nodes that are ALIGN-aligned and lie inside one arena: the node is stored as its
+        //      index in the arena ((p - base) / ALIGN + 1, 0 for null), so the index needs only as many bits as the
+        //      arena has ALIGN-sized units, and every other bit of the 64-bit word holds the ABA counter.  A 1 GiB arena
+        //      of 64-byte units leaves 39 counter bits (tagged_ptr leaves 16), so a stalled popper would have to sleep
+        //      through 2^39 head changes before its CAS could be fooled.
+        //
+        //      Layout: [counter : counter_bits()][index : index_bits()]
+        //
+        //      A codec object for intrusive_tagged_stack's codec overloads.
+        template <typename T, size_t ALIGN = 64>
+        class arena_tagged_ptr
+        {
+            static_assert((ALIGN & (ALIGN - 1)) == 0, "arena_tagged_ptr: ALIGN must be a power of two");
+
+        public:
+            using pointer = T *;
+            using counter_type = uint64_t;
+            using storage_type = uint64_t;
+
+            //  The smallest counter this codec accepts: tagged_ptr's.
+            static constexpr uint32_t MIN_COUNTER_BITS = 16;
+
+            arena_tagged_ptr(const void *arena_start, size_t arena_size)
+                : base_(reinterpret_cast<uintptr_t>(arena_start) & ~static_cast<uintptr_t>(ALIGN - 1)),
+                  max_index_(((reinterpret_cast<uintptr_t>(arena_start) + arena_size - base_) / ALIGN) + 1),
+                  index_bits_(bits_for(max_index_)),
+                  index_mask_((storage_type{1} << index_bits_) - 1),
+                  counter_mask_((index_bits_ == 0) ? ~storage_type{0} : (~storage_type{0} >> index_bits_))
+            {
+                MINIMAL_STD_ASSERT(counter_bits() >= MIN_COUNTER_BITS);
+            }
+
+            uint32_t index_bits() const noexcept { return index_bits_; }
+            uint32_t counter_bits() const noexcept { return 64 - index_bits_; }
+            storage_type counter_mask() const noexcept { return counter_mask_; }
+
+            storage_type pack(pointer ptr, counter_type counter) const noexcept
+            {
+                return ((counter & counter_mask_) << index_bits_) | index_of(ptr);
+            }
+
+            pointer unpack_ptr(storage_type value) const noexcept
+            {
+                const storage_type index = value & index_mask_;
+
+                if (index == 0)
+                {
+                    return nullptr;
+                }
+
+                return reinterpret_cast<pointer>(base_ + ((index - 1) * ALIGN));
+            }
+
+            counter_type unpack_counter(storage_type value) const noexcept
+            {
+                return (value >> index_bits_) & counter_mask_;
+            }
+
+            storage_type make(pointer ptr, counter_type counter = 0) const noexcept
+            {
+                return pack(ptr, counter);
+            }
+
+        private:
+            uintptr_t base_;
+            storage_type max_index_;
+            uint32_t index_bits_;
+            storage_type index_mask_;
+            storage_type counter_mask_;
+
+            static uint32_t bits_for(storage_type value) noexcept
+            {
+                uint32_t bits = 1;
+
+                while ((bits < 64) && ((value >> bits) != 0))
+                {
+                    ++bits;
+                }
+
+                return bits;
+            }
+
+            storage_type index_of(pointer ptr) const noexcept
+            {
+                if (ptr == nullptr)
+                {
+                    return 0;
+                }
+
+                const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+
+                MINIMAL_STD_ASSERT((address >= base_) && (((address - base_) & (ALIGN - 1)) == 0) &&
+                                   (((address - base_) / ALIGN) + 1 <= max_index_));
+
+                return ((address - base_) / ALIGN) + 1;
+            }
+        };
+    }
+}

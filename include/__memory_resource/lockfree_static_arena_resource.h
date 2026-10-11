@@ -9,6 +9,7 @@
 #include "atomic"
 #include "new"
 
+#include "lockfree/arena_tagged_ptr"
 #include "lockfree/intrusive_tagged_stack"
 #include "lockfree/tagged_ptr"
 #include "memory_resource.h"
@@ -28,12 +29,18 @@ namespace MINIMAL_STD_NAMESPACE
                 free_block_node* next;
             };
 
+            //  Free-bin heads hold an arena-relative block index rather than a pointer: every block is MIN_ALIGNMENT
+            //      aligned and inside the arena, so the index needs only log2(arena size / 64) bits and the rest of the
+            //      word is ABA counter (39 bits for a 1 GiB arena, against tagged_ptr's 16).  A popper stalled between
+            //      its head load and its CAS is fooled only if its bin changes 2^counter_bits times meanwhile.
             using tagged_ptr_type = lockfree::tagged_ptr<free_block_node>;
+            using head_codec_type = lockfree::arena_tagged_ptr<free_block_node, 64>;
             using stack_type = lockfree::intrusive_tagged_stack<free_block_node, tagged_ptr_type, free_block_node*, &free_block_node::next>;
 
             uint8_t* arena_start_;
             uint8_t* arena_end_;
             atomic<uint8_t*> current_ptr_;
+            const head_codec_type head_codec_;
 
             static constexpr size_t NUM_BINS = 8;
             static constexpr size_t MIN_ALIGNMENT = 64;
@@ -88,10 +95,11 @@ namespace MINIMAL_STD_NAMESPACE
             lockfree_static_arena_resource(void* start, size_t size)
                 : arena_start_(static_cast<uint8_t*>(start)),
                   arena_end_(arena_start_ + size),
-                  current_ptr_(arena_start_)
+                  current_ptr_(arena_start_),
+                  head_codec_(start, size)
             {
                 for (size_t i = 0; i < NUM_BINS; ++i) {
-                    free_stack_heads_[i].store(0, memory_order_relaxed);
+                    free_stack_heads_[i].store(head_codec_.make(nullptr), memory_order_relaxed);
                 }
             }
 
@@ -137,7 +145,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //      emptied temporarily, so a concurrent allocator never sees a false out-of-memory.
                 for (size_t bin = start_bin; bin < NUM_BINS - 1; ++bin)
                 {
-                    if (free_block_node* node = stack_type::pop(free_stack_heads_[bin], adapter, backoff)) {
+                    if (free_block_node* node = stack_type::pop(free_stack_heads_[bin], adapter, backoff, head_codec_)) {
                         return node;
                     }
                 }
@@ -147,7 +155,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //      blocks are expected to be rare in this resource.
                 const size_t bin = NUM_BINS - 1;
 
-                free_block_node* stolen_list = stack_type::steal_all(free_stack_heads_[bin]);
+                free_block_node* stolen_list = stack_type::steal_all(free_stack_heads_[bin], head_codec_);
 
                 free_block_node* best_fit = nullptr;
                 free_block_node* prev = nullptr;
@@ -178,7 +186,7 @@ namespace MINIMAL_STD_NAMESPACE
                 for (free_block_node* current = stolen_list; current != nullptr;)
                 {
                     free_block_node* next = current->next;
-                    stack_type::push(free_stack_heads_[bin], *current, adapter, backoff);
+                    stack_type::push(free_stack_heads_[bin], *current, adapter, backoff, head_codec_);
                     current = next;
                 }
 
@@ -201,7 +209,7 @@ namespace MINIMAL_STD_NAMESPACE
                 backoff_type backoff;
 
                 size_t bin = get_bin(rounded_bytes);
-                stack_type::push(free_stack_heads_[bin], *node, adapter, backoff);
+                stack_type::push(free_stack_heads_[bin], *node, adapter, backoff, head_codec_);
             }
 
             bool do_is_equal(memory_resource const& other) const noexcept override

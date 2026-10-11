@@ -42,6 +42,20 @@ One label per shared-memory access:
 then succeed against a later `(A, 0)` and install a stale next pointer. `steal_all` now advances the counter with a
 CAS loop. `lockfree_single_arena_resource::steal_pending_deallocation_list` uses it instead of its own `exchange`.
 
+## Counter width per user
+
+The counter must not wrap while one popper is stalled between its head load and its CAS. `tag_wraps.cfg` shows what
+happens when it does.
+
+| User | Head encoding | Counter bits | Head changes needed during one stall |
+|------|---------------|--------------|--------------------------------------|
+| `lockfree_static_arena_resource` | `arena_tagged_ptr`: arena-relative 64-byte block index | 64 − ⌈log2(arena / 64 + 2)⌉: 59 for 1 KiB, 49 for 1 MiB, 39 for 1 GiB | 2^39 or more |
+| `lockfree_single_arena_resource` | `tagged_ptr<block_metadata, uint16_t>` | 16 | 65,536 |
+
+The static arena's stalled popper would need its bin to change 2^39 times. At about 10^7 head changes per second that
+is roughly 15 hours of saturated churn on one bin during a single stall. Its stacks pass the codec to
+`intrusive_tagged_stack`'s codec overloads; the model is the same, with `TagMod` = 2^counter bits.
+
 ## Type stability per user
 
 A stale popper reads the link word of a node that may since have been popped and handed out. That needs the node's

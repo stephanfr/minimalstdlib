@@ -39,22 +39,40 @@ namespace MINIMAL_STD_NAMESPACE
                 __atomic_store_n(&(node.*next_field), link, __ATOMIC_RELAXED);
             }
 
+            //  The head word is encoded by a codec: pack(node *, counter), unpack_ptr(), unpack_counter().  The static
+            //      overloads use tagged_ptr_type itself (all-static members); a stateful codec such as
+            //      arena_tagged_ptr (an arena-relative index instead of a pointer, leaving more bits for the counter)
+            //      is passed as an object.  The counter is incremented by every head change and wraps within its
+            //      field; it must not wrap while one popper is stalled between its head load and its CAS.
+
             template <typename adapter_type, typename backoff_type>
             static void push(atomic<storage_type> &head,
                              node_type &node,
                              const adapter_type &adapter,
                              backoff_type &&backoff)
             {
+                push(head, node, adapter, backoff, tagged_ptr_type{});
+            }
+
+            template <typename adapter_type, typename backoff_type, typename codec_type>
+            static void push(atomic<storage_type> &head,
+                             node_type &node,
+                             const adapter_type &adapter,
+                             backoff_type &&backoff,
+                             const codec_type &codec)
+            {
+                using codec_counter_type = typename codec_type::counter_type;
+
                 storage_type current_tag = head.load(memory_order_acquire);
                 size_t retries = 0;
 
                 while (true)
                 {
-                    store_link(node, adapter.to_link(tagged_ptr_type::unpack_ptr(current_tag)));
+                    store_link(node, adapter.to_link(codec.unpack_ptr(current_tag)));
 
-                    storage_type desired_tag = tagged_ptr_type::pack(
+                    storage_type desired_tag = codec.pack(
                         &node,
-                        static_cast<counter_type>(tagged_ptr_type::unpack_counter(current_tag) + 1));
+                        static_cast<codec_counter_type>(codec.unpack_counter(current_tag) + 1));
 
                     if (head.compare_exchange_strong(
                             current_tag,
@@ -74,19 +92,26 @@ namespace MINIMAL_STD_NAMESPACE
                                   const adapter_type &adapter,
                                   backoff_type &&backoff)
             {
+                return pop(head, adapter, backoff, tagged_ptr_type{});
+            }
+
+            template <typename adapter_type, typename backoff_type, typename codec_type>
+            static node_type *pop(atomic<storage_type> &head,
+                                  const adapter_type &adapter,
+                                  backoff_type &&backoff,
+                                  const codec_type &codec)
+            {
+                using codec_counter_type = typename codec_type::counter_type;
+
                 storage_type current_tag = head.load(memory_order_acquire);
                 size_t retries = 0;
 
-                while (tagged_ptr_type::unpack_ptr(current_tag) != nullptr)
+                while (codec.unpack_ptr(current_tag) != nullptr)
                 {
-                    node_type *current = tagged_ptr_type::unpack_ptr(current_tag);
+                    node_type *current = codec.unpack_ptr(current_tag);
 
-                    if (current == nullptr)
-                    {
-                        return nullptr;
-                    }
-
-                    storage_type next_tag = tagged_ptr_type::pack( adapter.to_node(load_link(*current)), static_cast<counter_type>(tagged_ptr_type::unpack_counter(current_tag) + 1));
+                    storage_type next_tag = codec.pack(adapter.to_node(load_link(*current)),
+                                                       static_cast<codec_counter_type>(codec.unpack_counter(current_tag) + 1));
 
                     if (head.compare_exchange_strong(
                             current_tag,
@@ -109,17 +134,25 @@ namespace MINIMAL_STD_NAMESPACE
             //      after a few pushes, and its CAS would install a stale link (ABA).  tlaplus/lockfree_tagged_stack
             static node_type *steal_all(atomic<storage_type> &head)
             {
+                return steal_all(head, tagged_ptr_type{});
+            }
+
+            template <typename codec_type>
+            static node_type *steal_all(atomic<storage_type> &head, const codec_type &codec)
+            {
+                using codec_counter_type = typename codec_type::counter_type;
+
                 storage_type stolen = head.load(memory_order_acquire);
 
                 while (!head.compare_exchange_weak(
                     stolen,
-                    tagged_ptr_type::pack(nullptr, static_cast<counter_type>(tagged_ptr_type::unpack_counter(stolen) + 1)),
+                    codec.pack(nullptr, static_cast<codec_counter_type>(codec.unpack_counter(stolen) + 1)),
                     memory_order_acq_rel,
                     memory_order_acquire))
                 {
                 }
 
-                return tagged_ptr_type::unpack_ptr(stolen);
+                return codec.unpack_ptr(stolen);
             }
         };
     }

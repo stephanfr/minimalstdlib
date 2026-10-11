@@ -16,7 +16,7 @@ otherwise.
 | Class | Coverage | Deadlock / livelock | Races (C++ and AArch64) | Use-after-free / bad access |
 |-------|----------|---------------------|-------------------------|-----------------------------|
 | `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`fixed_small_live`, `fixed_irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
-| `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes) |
+| `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
 | `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | user writes vs. a stale popper's `load_link`: benign, see below | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
 | `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `Safety` |
@@ -140,7 +140,8 @@ See `lockfree_mp_sc_queue/README.md` and `lockfree_small/README.md`.
 
 | Where | Width | Assumption |
 |-------|-------|------------|
-| `intrusive_tagged_stack` counter | 16 bits | a popper does not stall across 65,536 head changes of one stack |
+| `intrusive_tagged_stack` counter, single arena | 16 bits | a popper does not stall across 65,536 head changes of one stack |
+| `intrusive_tagged_stack` counter, static arena (`arena_tagged_ptr`) | 64 − index bits (39 for a 1 GiB arena) | a popper does not stall across 2^39 head changes of one bin |
 | `sp_mc_value_stack` generation | 32 bits | a popper does not stall across 2^32 pushes |
 | skip-list slot generation | `GENERATION_MASK` bits, seeded per block incarnation | a handle does not outlive a full wrap of its slot's generation |
 
