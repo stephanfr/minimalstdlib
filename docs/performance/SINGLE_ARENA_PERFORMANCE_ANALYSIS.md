@@ -1,6 +1,7 @@
-# `lockfree_single_arena_resource`: performance analysis
+# Single-arena and composite resources: performance analysis
 
-This is an analysis only; no allocator code has been changed.
+The single-arena sections are analysis only; no single-arena code has been changed. The composite section describes
+the changes made to statistics and the bitblock resource.
 
 **Measured state:**
 - Single-CPU throughput is about 0.3x glibc `malloc`/`free`.
@@ -109,6 +110,59 @@ costs nothing.
   reach the bins.
 - **Tests:** double free across CPUs, the drain on out-of-memory, the busy-flag fallback (simulated interrupt), and
   ASan, TSan and stress runs.
+
+## Composite resource (`lockfree_composite_single_arena_resource`) and `lockfree_bitblock_resource`
+
+The composite routes requests of up to 1000 B (alignment up to 16) to `lockfree_bitblock_resource`, and larger ones to
+the single arena, so small-allocation speed is the bitblock resource's.
+
+**Measured before this change** (per-CPU churn, Mops/s; glibc malloc about 28 in the same harness):
+
+| Composite | 1 CPU | 4 CPUs | 8 CPUs |
+|---|---|---|---|
+| statistics on (the default until now) | 10.8-11.8 | 5.3-5.7 | 6.1-7.2 |
+| statistics off | 12-15 | 49-59 | 51-56 |
+
+**Statistics were the main problem.** `memory_resource_statistics` performed:
+- per allocation: 3 shared atomic RMWs plus a seq_cst store of `peak_allocated_`;
+- per free: 3 shared atomic RMWs.
+
+Every CPU updated the same counters, so with statistics on the composite collapsed at 4 CPUs.
+
+**Changed:**
+- **Statistics default to off** in `lockfree_composite_single_arena_resource` and `lockfree_bitblock_resource`
+  (`include_statistics = false`).
+- **Statistics are sharded per CPU** (16 shards, indexed by `get_cpu_id()`).
+  - Allocation and deallocation update only the local shard.
+  - Totals, the current count and current bytes are sums over the shards.
+  - The peak stays exact for a single context, including one that migrates between CPUs: each allocation computes the
+    current count from all shards and raises the peak with a relaxed CAS-max.
+  - The trade-off: with statistics on and several CPUs allocating at once, the peak's read of every shard still costs
+    throughput. Statistics are a diagnostic option.
+- **`bitblock_set::acquire_first_available_contiguous`** no longer runs a `popcount` pre-filter. The bit-erosion test
+  already rejects words without a long enough run, and `__builtin_popcountll` is a libgcc call on baseline x86-64 (and
+  on AArch64 when built with `-mgeneral-regs-only`).
+- **The bitblock shard index** avoids a divide by a runtime value on the usual path.
+
+**After** (medians of 3 runs, Mops/s):
+
+| Composite | 1 CPU | 4 CPUs | 8 CPUs |
+|---|---|---|---|
+| default, before (statistics on) | 10.8 | 5.7 | 7.2 |
+| default, after (statistics off) | 15.0 | 47.9 | 53.4 |
+| statistics explicitly on, after (sharded) | 11.8 | 9.9 | 10.3 |
+
+The bitblock-only fixes are within this host's run-to-run noise in these medians: bitblock alone measured 14.3 → 14.2
+at 1 CPU, 48.9 → 47.6 at 4 and 52.6 → 57.2 at 8. An earlier A/B run of the same changes showed about +10-15%.
+
+**Not adopted (measured prototype):** a per-CPU cache of freed small allocations in the bitblock resource. Freed
+allocations are kept per element count behind a non-blocking try-flag, with a header state word keeping double-free
+detection.
+- **Single-CPU:** the composite (statistics off) reached 23-24 Mops/s, about 0.85x malloc. Allocate cost about 75
+  cycles and free about 85, against about 180 and 85 without the cache.
+- **4 CPUs:** about 78 Mops/s.
+- **Remaining per-allocation cost without it:** the bitmap search (about 190 instructions per allocation in
+  `acquire_next_empty_block`) and 2 atomic RMWs on allocate (bit acquire, `free_count_`), plus 2 on free.
 
 ## Appendix: prototype diff (opportunities 1-3, without the out-of-memory drain)
 
