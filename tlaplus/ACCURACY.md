@@ -23,7 +23,7 @@ otherwise.
 | `lockfree_bitblock_resource` | argument below + `bitblock_set` model | bounded retries | **fixed:** hint pointers now release/acquire (litmus E) | blocks never freed while live |
 | `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | see that README | litmus B, C, D | reader reachability, see below |
 | `skiplist` slot blocks | `lockfree_skiplist/slot_blocks/` | `Termination` | litmus I, J | **fixed:** cross-list block use-after-free |
-| `skiplist` handles | `lockfree_skiplist/handles/` | `Termination` | acquire on table → generation re-check | **fixed:** stale handle resolved to a newer node |
+| `skiplist` handles, iterators | `lockfree_skiplist/handles/` | `Termination` | acquire on table → generation re-check; retired mark + fence (litmus K) | **fixed:** stale handle resolved to a newer node; **fixed:** iterator `++` read a retired node being freed |
 | `mp_sc_growable_ring_queue` | `lockfree_mp_sc_queue/` | `Termination` | litmus G, H | no write to a freed buffer |
 | `elimination_array` | `lockfree_small/` | `Termination`, also with a same-CPU interrupt handler | release/acquire on `state_` | n/a |
 | `sp_mc_value_stack` | `lockfree_small/` | `Termination` | release sequence on `state_` | ABA: 32-bit generation |
@@ -49,7 +49,7 @@ match the code.
   and `fixed_irq_live` check that they terminate under weak fairness: no livelock.
 
 **Cross-CPU interrupts:** `fixed_irq2.cfg` is not exhaustive. `fixed_irq2_small.cfg` (one block size, smaller arena)
-is exhaustive; its result is in `lockfree_allocator/README.md`.
+is exhaustive: no error and no deadlock in 31,195,287 distinct states.
 
 **Weak memory:**
 - The relaxed header writes (`metadata_index_`, `size_including_header_`, `previous_block_`) all happen before the
@@ -125,7 +125,8 @@ reclamation, so it says nothing about use-after-free. That is covered by:
     blocks in `advance_and_reclaim` (litmus J).
 - **The reclaimer's reader check:** litmus C.
 - **`slot_blocks/`:** slot blocks shared between lists of one type (fixed).
-- **`handles/`:** stale-handle resolution (fixed).
+- **`handles/`:** stale-handle resolution (fixed), and iterators resolving a handle kept between read sections
+  (fixed: a use-after-free found by the stress test, see that README).
 
 **Lifecycle precondition:** constructing the first list of a type concurrently with destroying the last one is not
 supported. The destructor's last-instance path resets the static slot tables. This is in addition to the general rule

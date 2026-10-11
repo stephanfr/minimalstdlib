@@ -91,6 +91,7 @@ namespace MINIMAL_STD_NAMESPACE
                 array<atomic<T *>, SLOTS_PER_BLOCK> slot_table_{};
                 array<atomic<uint32_t>, SLOTS_PER_BLOCK> free_next_slot_{};
                 array<atomic<uint32_t>, SLOTS_PER_BLOCK> slot_generation_{};
+                array<atomic<uint32_t>, SLOTS_PER_BLOCK> retired_generation_{}; //  generation whose node was retired
                 atomic<uint64_t> free_list_head_{0}; //  [change counter:32][slot:32]
                 atomic<uint32_t> active_slots_{0};
 
@@ -648,6 +649,45 @@ namespace MINIMAL_STD_NAMESPACE
                 return ptr;
             }
 
+            //  Records that the node behind (slot, generation) has been retired.  The slot keeps resolving to it for
+            //      readers already inside a read section, which may still reach it through links; a handle kept
+            //      across read sections must not (see unpack_unretired_ptr()).  The caller fences before stamping
+            //      the node's retire epoch.
+            static void mark_retired(uint32_t slot, uint32_t generation)
+            {
+                if ((slot == 0) || (slot >= MAX_SLOTS))
+                    return;
+
+                slot_block *block = blocks_[slot_to_block_index(slot)].load(memory_order_acquire);
+                if (block != nullptr) //  always installed: the node's slot pins its block
+                {
+                    block->retired_generation_[slot_to_block_offset(slot)].store(generation, memory_order_relaxed);
+                }
+            }
+
+            //  unpack_ptr() for a handle saved in an earlier read section (an iterator's position): null as well when
+            //      the node has been retired, because the epoch protects a retired node only from readers whose
+            //      section began before it was retired.  The caller must be inside a read section; entering one
+            //      fences after the epoch snapshot, which pairs with the fence in retire_node(): either this load sees
+            //      the mark, or the node's retire epoch is at least this section's snapshot and it is not freed until
+            //      the section ends.  (tlaplus/lockfree_skiplist/handles)
+            static T *unpack_unretired_ptr(uint64_t v)
+            {
+                T *ptr = unpack_ptr(v);
+                if (ptr == nullptr)
+                    return nullptr;
+
+                const uint32_t slot = static_cast<uint32_t>(v & SLOT_MASK);
+                slot_block *block = blocks_[slot_to_block_index(slot)].load(memory_order_acquire);
+                if ((block == nullptr) ||
+                    (block->retired_generation_[slot_to_block_offset(slot)].load(memory_order_acquire) == unpack_generation(v)))
+                {
+                    return nullptr;
+                }
+
+                return ptr;
+            }
+
             static constexpr bool is_tombstoned_val(uint64_t v)
             {
                 return (v & TOMBSTONE_BIT) != 0;
@@ -979,7 +1019,7 @@ namespace MINIMAL_STD_NAMESPACE
                     epoch_read_section_guard read_guard(list_);
 
                     uint64_t packed_link = forward_link_type::pack_slot_generation(current_slot_, current_generation_, false);
-                    skip_node* curr_node = forward_link_type::unpack_ptr(packed_link);
+                    skip_node* curr_node = forward_link_type::unpack_unretired_ptr(packed_link);
                     bool is_tombstoned = false;
 
                     if (curr_node != nullptr)
@@ -1001,7 +1041,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                     else
                     {
-                        // Node was reclaimed, leapfrog!
+                        // Node was retired or reclaimed: its links may be freed memory, so leapfrog by key.
                         skip_node* next_n = list_->find_lower_bound_after(cached_kv()->first);
                         attach_to_node(next_n);
                         return *this;
@@ -1138,7 +1178,7 @@ namespace MINIMAL_STD_NAMESPACE
                     epoch_read_section_guard read_guard(list_);
 
                     uint64_t packed_link = forward_link_type::pack_slot_generation(current_slot_, current_generation_, false);
-                    skip_node* curr_node = forward_link_type::unpack_ptr(packed_link);
+                    skip_node* curr_node = forward_link_type::unpack_unretired_ptr(packed_link);
                     bool is_tombstoned = false;
 
                     if (curr_node != nullptr)
@@ -1160,7 +1200,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                     else
                     {
-                        // Node was reclaimed, leapfrog!
+                        // Node was retired or reclaimed: its links may be freed memory, so leapfrog by key.
                         skip_node* next_n = list_->find_lower_bound_after(cached_kv()->first);
                         attach_to_node(next_n);
                         return *this;
@@ -2054,10 +2094,13 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
-                //  The final unlink (sequenced before this) must be ordered before the epoch read: a reader that
-                //      enters in a later epoch has to see the node unlinked, or it could still hold the node once the
-                //      reclaim epoch passes this stamp.  On AArch64 the acq_rel CAS above happens to order it; C++ only
-                //      promises it with the fence.  (litmus/aarch64 D-retire-epoch)
+                //  The final unlink and the retired mark (sequenced before this) must be ordered before the epoch read:
+                //      a reader that enters in a later epoch has to see the node unlinked and an iterator has to see it
+                //      retired, or either could still hold the node once the reclaim epoch passes this stamp.  On
+                //      AArch64 the acq_rel CAS above happens to order the unlink; C++ only promises it with the fence.
+                //      (litmus/aarch64 D-retire-epoch)
+                forward_link_type::mark_retired(node->internal_slot_, node->internal_generation_);
+
                 __atomic_thread_fence(__ATOMIC_SEQ_CST);
                 node->retired_epoch_ = epoch_reclaimer_.current_epoch();
 
