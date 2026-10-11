@@ -22,7 +22,7 @@ namespace MINIMAL_STD_NAMESPACE
                   size_t ELEMENTS_PER_BLOCK = 1024,
                   size_t MAX_NUMBER_OF_ARENAS = 32,
                   size_t MAX_NUMBER_OF_BLOCKS = 48,
-                  bool include_statistics = true,
+                  bool include_statistics = false,
                   size_t LARGE_RESOURCE_MAX_BIN_BYTES = 32 * 1024 * 1024,
                   size_t LARGE_RESOURCE_MAX_WASTE_PERCENT = 5>
             requires(THRESHOLD_BYTES > 0)

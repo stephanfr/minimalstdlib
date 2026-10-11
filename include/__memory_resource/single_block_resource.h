@@ -89,7 +89,7 @@ namespace MINIMAL_STD_NAMESPACE
                 //  If the total number of deallocations is greater than 10% of the total number of allocations, then
                 //      Try to re-use some released blocks before allocating a new block.
 
-                if (total_deallocations_ > (total_allocations_ / 10))
+                if (total_deallocations() > (total_allocations() / 10))
                 {
                     //  Find the right bin deallocation bin to search for a block
 

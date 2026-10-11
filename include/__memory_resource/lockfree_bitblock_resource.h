@@ -30,7 +30,7 @@ namespace MINIMAL_STD_NAMESPACE
         //
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 
-        template <size_t ELEMENT_SIZE_IN_BYTES, size_t ELEMENTS_PER_BLOCK, size_t MAX_NUMBER_OF_ARENAS, size_t MAX_NUMBER_OF_BLOCKS, bool include_statistics = true>
+        template <size_t ELEMENT_SIZE_IN_BYTES, size_t ELEMENTS_PER_BLOCK, size_t MAX_NUMBER_OF_ARENAS, size_t MAX_NUMBER_OF_BLOCKS, bool include_statistics = false>
             requires((ELEMENT_SIZE_IN_BYTES >= 4) &&
                      ((ELEMENT_SIZE_IN_BYTES % 16) == 0) &&
                      (ELEMENT_SIZE_IN_BYTES <= 256) &&
