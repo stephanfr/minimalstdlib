@@ -201,13 +201,6 @@ namespace MINIMAL_STD_NAMESPACE
 
                                                  while (word != ~0ULL)
                                                  {
-                                                     //  Early-out: fewer free bits than needed for a contiguous run
-
-                                                     if (static_cast<size_t>(__builtin_popcountll(~word)) < num_bits)
-                                                     {
-                                                         break;
-                                                     }
-
                                                      //  Erosion technique: AND the free-bits mask with right-shifted
                                                      //  copies of itself.  A set bit at position p in the result means
                                                      //  positions p, p-1, ..., p-(num_bits-1) are all free.
