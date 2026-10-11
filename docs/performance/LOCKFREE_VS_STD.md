@@ -299,8 +299,7 @@ Each thread allocates 16-256 B blocks into a window of 64 live slots, freeing a 
 ## Reproducing
 
 ```bash
-make -f Makefile.test.mk test/build/performance/cpputest_performance.exe
-test/build/performance/cpputest_performance.exe -g LockfreeVsStdComparisonPerformanceTests
+make test-performance-comparison     #  not part of `make test-performance`, so CI does not run it (~15 minutes)
 #  CMP_REPS=<n> sets the repetitions per cell (default 5); CMP_OPS_PERCENT=<p> scales the operation counts.
 #  The report is written to test/performance/reports/LOCKFREE_VS_STD_<timestamp>.md.
 ```
@@ -313,5 +312,5 @@ Running the whole performance executable once stalled for over 45 minutes in
 - the only remaining thread was the consumer, spinning in `JiffyMpScQueue::dequeue`
   (`test/performance/external/mp_sc_growable_ring_queue/jiffy_queue.h:130`), waiting for an item it never received.
 
-Jiffy is the vendored third-party MPSC queue used only as a comparison baseline. `mp_sc_growable_ring_queue` was not
+Jiffy is the vendored third-party MPSC queue used only as a comparison baseline. Its runs in that group are now commented out. `mp_sc_growable_ring_queue` was not
 involved. The hang occurs intermittently (1 run in 2 in one trial; the test alone usually completes in about 3 s).

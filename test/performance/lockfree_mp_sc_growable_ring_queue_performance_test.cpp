@@ -512,28 +512,30 @@ TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, FixedLargeCapacity
         report.record("ring fixed (5P,1C)", ops, 6, TOTAL_ITEMS);
         CHECK_TRUE(ops > 0);
     }
-    {
-        jiffy_perf_runner<1> r;
-        jiffy_perf_runner<1>::queue_t q;
-        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
-        double jiffy = r.run(q, TOTAL_ITEMS);
-        printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
-        double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
-        report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
-                                    jiffy / ring_1p, 2, TOTAL_ITEMS);
-        CHECK_TRUE(jiffy > 0);
-    }
-    {
-        jiffy_perf_runner<5> r;
-        jiffy_perf_runner<5>::queue_t q;
-        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
-        double jiffy = r.run(q, TOTAL_ITEMS);
-        printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
-        double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
-        report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
-                                    jiffy / ring_5p, 6, TOTAL_ITEMS);
-        CHECK_TRUE(jiffy > 0);
-    }
+    //  Jiffy runs disabled: the vendored Jiffy queue (external/mp_sc_growable_ring_queue/jiffy_queue.h) intermittently
+    //      loses an item and its consumer then spins forever in JiffyMpScQueue::dequeue, hanging the suite.
+    // {
+    //     jiffy_perf_runner<1> r;
+    //     jiffy_perf_runner<1>::queue_t q;
+    //     if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+    //     double jiffy = r.run(q, TOTAL_ITEMS);
+    //     printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
+    //     double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
+    //     report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
+    //                                 jiffy / ring_1p, 2, TOTAL_ITEMS);
+    //     CHECK_TRUE(jiffy > 0);
+    // }
+    // {
+    //     jiffy_perf_runner<5> r;
+    //     jiffy_perf_runner<5>::queue_t q;
+    //     if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+    //     double jiffy = r.run(q, TOTAL_ITEMS);
+    //     printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
+    //     double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
+    //     report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
+    //                                 jiffy / ring_5p, 6, TOTAL_ITEMS);
+    //     CHECK_TRUE(jiffy > 0);
+    // }
     {
         double mc = run_moodycamel(1, TOTAL_ITEMS);
         printf("%-50s : %14.0f\n", "moodycamel (1P, 1C)", mc);
@@ -557,7 +559,7 @@ TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, FixedLargeCapacity
 //  All three queues, ring starting at capacity 64 with continuous regrowth.
 TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, SmallInitialCapacityContinuousGrowth)
 {
-    constexpr size_t WARMUP_ITEMS = DEFAULT_WARMUP_ITEMS;
+    [[maybe_unused]] constexpr size_t WARMUP_ITEMS = DEFAULT_WARMUP_ITEMS;
     constexpr size_t TOTAL_ITEMS = DEFAULT_TOTAL_ITEMS;
     constexpr size_t INITIAL_CAPACITY = 64;
 
@@ -586,28 +588,30 @@ TEST(MpScGrowableRingQueueExternalComparisonPerformanceTests, SmallInitialCapaci
         CHECK_TRUE(ops > 0);
         CHECK_TRUE(cap > 2 * INITIAL_CAPACITY);
     }
-    {
-        jiffy_perf_runner<1> r;
-        jiffy_perf_runner<1>::queue_t q;
-        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
-        double jiffy = r.run(q, TOTAL_ITEMS);
-        printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
-        double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
-        report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
-                                    jiffy / ring_1p, 2, TOTAL_ITEMS);
-        CHECK_TRUE(jiffy > 0);
-    }
-    {
-        jiffy_perf_runner<5> r;
-        jiffy_perf_runner<5>::queue_t q;
-        if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
-        double jiffy = r.run(q, TOTAL_ITEMS);
-        printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
-        double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
-        report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
-                                    jiffy / ring_5p, 6, TOTAL_ITEMS);
-        CHECK_TRUE(jiffy > 0);
-    }
+    //  Jiffy runs disabled: the vendored Jiffy queue (external/mp_sc_growable_ring_queue/jiffy_queue.h) intermittently
+    //      loses an item and its consumer then spins forever in JiffyMpScQueue::dequeue, hanging the suite.
+    // {
+    //     jiffy_perf_runner<1> r;
+    //     jiffy_perf_runner<1>::queue_t q;
+    //     if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+    //     double jiffy = r.run(q, TOTAL_ITEMS);
+    //     printf("%-50s : %14.0f\n", "jiffy (1P, 1C)", jiffy);
+    //     double delta = 100.0 * (jiffy - ring_1p) / ring_1p;
+    //     report.record_with_baseline("jiffy (1P,1C)", jiffy, ring_1p, delta,
+    //                                 jiffy / ring_1p, 2, TOTAL_ITEMS);
+    //     CHECK_TRUE(jiffy > 0);
+    // }
+    // {
+    //     jiffy_perf_runner<5> r;
+    //     jiffy_perf_runner<5>::queue_t q;
+    //     if (WARMUP_ITEMS > 0) r.run(q, WARMUP_ITEMS);
+    //     double jiffy = r.run(q, TOTAL_ITEMS);
+    //     printf("%-50s : %14.0f\n", "jiffy (5P, 1C)", jiffy);
+    //     double delta = 100.0 * (jiffy - ring_5p) / ring_5p;
+    //     report.record_with_baseline("jiffy (5P,1C)", jiffy, ring_5p, delta,
+    //                                 jiffy / ring_5p, 6, TOTAL_ITEMS);
+    //     CHECK_TRUE(jiffy > 0);
+    // }
     {
         double mc = run_moodycamel(1, TOTAL_ITEMS);
         printf("%-50s : %14.0f\n", "moodycamel (1P, 1C)", mc);
