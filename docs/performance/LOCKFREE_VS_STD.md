@@ -29,15 +29,26 @@ mutex, on identical workloads. The suite is `LockfreeVsStdComparisonPerformanceT
 | `mp_sc_growable_ring_queue` | `std::queue` + `std::mutex` | **11x** | 2.0x to 2.4x | 2.3x |
 | `spsc_queue` | bounded `std::queue` + `std::mutex` | **4.5x** (1 producer + 1 consumer) | | |
 | `bitset` | `std::bitset` + `std::mutex` | **3.1x** | 3.2x to 4.4x | 3.2x |
-| `lockfree_composite_single_arena_resource`, `lockfree_bitblock_resource` | `std::pmr` pools (synchronized, or unsynchronized + mutex) | 1.2x to 1.6x | **3.4x to 26x** | 2.8x to 20x |
-| `lockfree_single_arena_resource` | `std::pmr` pools | 0.7x to 0.8x | 2.3x to 10x | 1.9x to 9.5x |
-| `lockfree_static_arena_resource` | `std::pmr` pools | 1.0x to 1.3x | 0.9x to 8x | 0.9x to 5x |
-| all memory resources | glibc `malloc`/`free` | 0.2x to 0.5x | 0.02x to 0.6x | 0.02x to 0.5x |
 | `token_dispenser` | `uint64_t` mask + `std::mutex` | 2.0x | 1.0x to 1.6x | 0.8x |
 | `bitblock_set` | `uint64_t` words + `std::mutex` | 1.4x | 0.7x to 1.3x | 0.5x |
 | `intrusive_tagged_stack` | `std::vector<T *>` + `std::mutex` | 1.4x | 0.3x to 0.8x | 0.2x |
 | `sp_mc_value_stack` | bounded `std::vector` + `std::mutex` | 0.5x | 0.4x to 0.7x | 0.8x |
 | `elimination_array` | `std::vector` stack + `std::mutex` | n/a | 0.05x to 0.1x | 0.1x |
+
+**Memory resources.** Each resource is shown twice: against the standard library's pool resources, which are the
+mutex-protected counterparts (`std::pmr::synchronized_pool_resource`, and `std::pmr::unsynchronized_pool_resource` +
+`std::mutex`), and separately against glibc `malloc`/`free`. Each range covers both workloads (per-thread churn and
+cross-thread frees).
+
+| Resource | vs `std::pmr` pools: 1 thread | 2-4 threads | 8 threads | vs `malloc`: 1 thread | 2-4 threads | 8 threads |
+|---|---|---|---|---|---|---|
+| `lockfree_composite_single_arena_resource` | 1.2x to 1.5x | **3.4x to 26x** | 2.8x to 20x | 0.30x to 0.41x | 0.41x to 0.58x | 0.40x to 0.50x |
+| `lockfree_bitblock_resource` | 1.3x to 1.6x | **3.4x to 21x** | 2.8x to 19x | 0.31x to 0.53x | 0.34x to 0.57x | 0.38x to 0.49x |
+| `lockfree_single_arena_resource` | 0.7x to 0.8x | 2.3x to 10x | 1.9x to 9.5x | 0.17x to 0.28x | 0.07x to 0.39x | 0.15x to 0.34x |
+| `lockfree_static_arena_resource` | 1.0x to 1.3x | 0.9x to 8x | 0.9x to 5x | 0.25x to 0.42x | 0.02x to 0.42x | 0.02x to 0.18x |
+
+Once threads contend, every resource is faster than the pools, except the static arena: in per-thread churn at 4-8
+threads it falls to parity (0.9x). Every resource is slower than `malloc` in every cell, for the reason given below.
 
 ## Reading the results
 
@@ -87,6 +98,9 @@ mutex-protected.
 In several "losing" cases the lock-free class is there for that guarantee, not for throughput.
 
 ## Detailed results
+
+In the memory-resource tables, the first ratio column is against `malloc`/`free` (a thread-caching allocator, not a
+mutex-protected one) and the next two are against the `std::pmr` pool resources (the mutex-protected counterparts).
 
 ### bitblock_set<16384>, acquire first free run of 1-4 bits + release
 
