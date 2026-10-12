@@ -26,6 +26,14 @@
 (* remover unlinks the upper links it sees, then always unlinks level 0   *)
 (* and retires, so a publish that lands after that pass is missed.       *)
 (*                                                                         *)
+(* RetargetBug = TRUE models the remove() before the retarget fix: after  *)
+(* a failed level-0 mark its re-walk could land on this node (a re-insert *)
+(* of a key whose original node another thread had removed) and mark its *)
+(* level 0 without ever tombstoning its upper levels.  Those links are    *)
+(* then never unlinked, the count never drains, and the node is never     *)
+(* retired.  The fix restarts the remove, which is the normal remover     *)
+(* (RetargetBug = FALSE).                                                  *)
+(*                                                                         *)
 (* TLA+ steps are sequentially consistent: the seq_cst fences in the C++  *)
 (* are what make this hold on hardware.                                   *)
 (***************************************************************************)
@@ -35,9 +43,11 @@ CONSTANTS
     Height,         \* the node's top level; upper levels are 1..Height-1
     NumHelpers,     \* concurrent traversals (find/remove/gc) that help unlink
     MaxCasFailures, \* upper-level CAS failures the inserter tolerates per level
-    DrainGate       \* TRUE: current code; FALSE: before 68ab76f
+    DrainGate,      \* TRUE: current code; FALSE: before 68ab76f
+    RetargetBug     \* TRUE: the remover marks only level 0 (remove() before the retarget fix)
 
 ASSUME Height \in 2..4 /\ NumHelpers \in 1..3 /\ MaxCasFailures \in 0..2 /\ DrainGate \in BOOLEAN
+       /\ RetargetBug \in BOOLEAN
 
 Upper == 1..(Height - 1)
 INSERTER == 0
@@ -107,7 +117,7 @@ fair process (Remover = REMOVER)
 variables mlvl = Height - 1, rl = 0;
 {
  R_mark:
-    while (mlvl >= 1) {                                      \* tombstone own upper links, top-down
+    while (mlvl >= 1 /\ ~RetargetBug) {                     \* tombstone own upper links, top-down
         ownMark[mlvl] := TRUE;
         mlvl := mlvl - 1;
     };
@@ -257,7 +267,7 @@ I_done == /\ pc[INSERTER] = "I_done"
 Inserter == I_level \/ I_reserve \/ I_own \/ I_cas \/ I_done
 
 R_mark == /\ pc[REMOVER] = "R_mark"
-          /\ IF mlvl >= 1
+          /\ IF mlvl >= 1 /\ ~RetargetBug
                 THEN /\ ownMark' = [ownMark EXCEPT ![mlvl] = TRUE]
                      /\ mlvl' = mlvl - 1
                      /\ pc' = [pc EXCEPT ![REMOVER] = "R_mark"]

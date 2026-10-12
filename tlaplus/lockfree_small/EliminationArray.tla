@@ -250,7 +250,7 @@ G6(self) == /\ pc[self] = "G6"
             /\ CanRun(self)
             /\ state' = "EMPTY"
             /\ Assert(got[self] # 0 /\ got[self] \notin received, 
-                      "Failure of assertion at line 79, column 17.")
+                      "Failure of assertion at line 81, column 17.")
             /\ received' = (received \cup {got[self]})
             /\ pc' = [pc EXCEPT ![self] = "Done1"]
             /\ UNCHANGED << element, transferred, irqActive, k, v, got >>
@@ -272,7 +272,7 @@ G9(self) == /\ pc[self] = "G9"
             /\ CanRun(self)
             /\ state' = "ELIMINATED"
             /\ Assert(got[self] # 0 /\ got[self] \notin received, 
-                      "Failure of assertion at line 87, column 17.")
+                      "Failure of assertion at line 89, column 17.")
             /\ received' = (received \cup {got[self]})
             /\ pc' = [pc EXCEPT ![self] = "Done1"]
             /\ UNCHANGED << element, transferred, irqActive, k, v, got >>

@@ -11,3 +11,6 @@ states/
 
 # OS files
 .DS_Store
+
+# PlusCal translator backups
+*.old

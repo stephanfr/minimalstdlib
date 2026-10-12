@@ -19,9 +19,9 @@ otherwise.
 | `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
 | `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | user writes vs. a stale popper's `load_link`: benign, see below | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
-| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `Safety` |
+| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `MutualExclusion` from the RMW results, with interrupts; a load/store mutation fails it |
 | `lockfree_bitblock_resource` | argument below + `bitblock_set` model | bounded retries | **fixed:** hint pointers now release/acquire (litmus E) | blocks never freed while live |
-| `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | see that README | litmus B, C, D | reader reachability, see below |
+| `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | `GlobalProgress` (lock-freedom) with 2 threads; per-operation completion with 1 | litmus B, C, D | reader reachability, see below; **fixed:** `remove()` re-walk retargeting a re-inserted node |
 | `skiplist` slot blocks | `lockfree_skiplist/slot_blocks/` | `Termination` | litmus I, J | **fixed:** cross-list block use-after-free |
 | `skiplist` handles, iterators | `lockfree_skiplist/handles/` | `Termination` | acquire on table → generation re-check; retired mark + fence (litmus K) | **fixed:** stale handle resolved to a newer node; **fixed:** iterator `++` read a retired node being freed |
 | `mp_sc_growable_ring_queue` | `lockfree_mp_sc_queue/` | `Termination` | litmus G, H | no write to a freed buffer |
@@ -81,12 +81,15 @@ out-of-memory for large blocks, not a safety issue. It is documented in the head
 
 ## `bitblock_set` (`lockfree_bitblock_set/`) and `bitset` (`lockfree_bitset/`)
 
-- **`bitset`:** the model matches the code (single-word atomic set/clear/test).
+- **`bitset`:** each acquire/release is one RMW whose returned value decides ownership; every context (CPU ×
+  interrupt depth) may try any bit, and failed acquires are modelled. `MutualExclusion` holds; splitting the RMW into a
+  load and a store (`LockfreeBitset_nonatomic_bug.cfg`) breaks it.
 - **`bitblock_set`:** the model covers acquire and release of any range of at most 16 bits across at most two words.
   That includes the unconditional `fetch_or` with rollback of only the newly set bits.
   - The scan paths (`acquire_first_available`, `acquire_first_available_contiguous`) pick a candidate range from
     relaxed loads and then run exactly that acquire, so they are covered by the model's arbitrary choice of range.
-  - The search hint is only an index, so a stale value costs a longer scan and nothing else.
+  - The search hint is only an index (now: the position after the last acquire, or the last freed position), so a
+    stale or racing value costs a longer scan and nothing else.
 
 ## `lockfree_bitblock_resource` (argument; no separate model)
 
@@ -113,8 +116,12 @@ out-of-memory for large blocks, not a safety issue. It is documented in the head
 
 ## Skip list
 
-**`LockfreeSkiplist.tla`** models control flow, the key set, epochs and tombstone helping. It does not model memory
-reclamation, so it says nothing about use-after-free. That is covered by:
+**`LockfreeSkiplist.tla`** models control flow, the key set, epochs and tombstone helping, at the level of keys. It
+was re-derived from the current `remove()`: the level-0 mark is the deletion, bounded retries return `false`, and a
+CAS fails only after another thread changed a link (so two threads cannot fail each other forever without either
+changing anything). With two threads it checks lock-freedom (`GlobalProgress`: some operation keeps completing) and
+that a `remove()` call deletes at most one node. It does not model memory reclamation, so it says nothing about
+use-after-free. That is covered by:
 - **The retire point.** `retire_node` is called only by the thread whose CAS removes the node from level 0, after the
   upper levels have drained (`upper_levels/` and litmus B). So a node is unreachable from the list when it is stamped.
 - **The stamp ordering.** The final unlink must be ordered before the `retired_epoch_` read. Otherwise a reader that
@@ -124,6 +131,11 @@ reclamation, so it says nothing about use-after-free. That is covered by:
   - C++ promises it only with a seq_cst fence, which `retire_node` now issues. The same holds for stamping retired slot
     blocks in `advance_and_reclaim` (litmus J).
 - **The reclaimer's reader check:** litmus C.
+- **`remove()` retargeting (fixed):** after a failed level-0 mark, `remove()`'s re-walk could land on a node that
+  re-inserted its key after another thread removed the original, and mark only its level 0. That node then either
+  leaked (never drained) or, if its inserter was still publishing, was retired and then published at an upper level
+  (use-after-free). `remove()` now restarts instead (`upper_levels/`, `RetargetBug`; regression test
+  `RemoveThatLandsOnAReinsertedNodeReclaimsIt`).
 - **`slot_blocks/`:** slot blocks shared between lists of one type (fixed).
 - **`handles/`:** stale-handle resolution (fixed), and iterators resolving a handle kept between read sections
   (fixed: a use-after-free found by the stress test, see that README).

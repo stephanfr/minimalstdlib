@@ -15,7 +15,7 @@
 TLA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TLA_JAR="${TLA_JAR:-$TLA_DIR/tla2tools.jar}"
 FILTER="${1:-}"
-SLOW="fixed_irq2.cfg fixed_irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeBitset_stress.cfg"
+SLOW="fixed_irq2.cfg fixed_irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeSkiplist_safety_2t.cfg"
 
 if [ ! -f "$TLA_JAR" ]; then
     wget -q "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar" -O "$TLA_JAR" || exit 1
