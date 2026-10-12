@@ -34,6 +34,23 @@ namespace MINIMAL_STD_NAMESPACE
     namespace skiplist_internal
     {
 #ifdef __MINIMAL_STD_TEST__
+        //  Test-only, one-shot hooks that let a test force an interleaving inside remove().  Each is cleared before
+        //      it runs, so operations the hook performs do not re-trigger it.
+        struct remove_test_hooks
+        {
+            static inline void (*before_bottom_mark)() = nullptr;          //  just before the level-0 mark CAS
+            static inline void (*after_bottom_retry_backoff)() = nullptr;  //  after a failed mark, before the re-walk
+
+            static void run(void (*&hook)())
+            {
+                if (auto h = hook)
+                {
+                    hook = nullptr;
+                    h();
+                }
+            }
+        };
+
         template <typename value_type_t>
         class malloc_backed_allocator
         {
@@ -1790,6 +1807,9 @@ namespace MINIMAL_STD_NAMESPACE
 
                         while (true)
                         {
+#ifdef __MINIMAL_STD_TEST__
+                            skiplist_internal::remove_test_hooks::run(skiplist_internal::remove_test_hooks::before_bottom_mark);
+#endif
                             bool success = node_to_remove->next_node[0].compare_exchange_strong(succ, succ, true);
                             succ = node_to_remove->next_node[0].get(is_tombstoned);
 
@@ -1836,6 +1856,9 @@ namespace MINIMAL_STD_NAMESPACE
 
                             backoff(bottom_retry_backoff, read_guard.cpu_slot_);
 
+#ifdef __MINIMAL_STD_TEST__
+                            skiplist_internal::remove_test_hooks::run(skiplist_internal::remove_test_hooks::after_bottom_retry_backoff);
+#endif
                             bool soft_deleted = false;
                             uint32_t local_assist_failures = 0;
                             skip_node *curr = pred->next_node[0].get_reference();
@@ -1901,7 +1924,16 @@ namespace MINIMAL_STD_NAMESPACE
                             {
                                 return false;
                             }
-                            node_to_remove = curr;
+
+                            //  A different node with this key means ours was removed (and unlinked) by another thread and
+                            //      the key re-inserted.  This call never marked that node's upper levels: marking only its
+                            //      level 0 would leave it linked above, so it would never drain, be unlinked or be retired.
+                            //      Start over, as for a stale handle.  (tlaplus/lockfree_skiplist/upper_levels, retarget)
+                            if (curr != node_to_remove)
+                            {
+                                goto RETRY_REMOVE;
+                            }
+
                             succ = curr->next_node[0].get(is_tombstoned);
                         }
                     }

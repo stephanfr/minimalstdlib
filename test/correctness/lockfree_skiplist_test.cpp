@@ -850,6 +850,83 @@ namespace
         CHECK_EQUAL(inserted.load(), list.nodes_reclaimed()); //  before: fewer (stranded nodes)
     }
 
+    TEST(SkiplistTests, RemoveThatLandsOnAReinsertedNodeReclaimsIt)
+    {
+        //  remove(10) targets node A.  Its level-0 mark fails because A's successor changes (insert 15); while it
+        //      backs off, another remove takes A and unlinks it, and an insert adds key 10 again as node B.  The
+        //      re-walk then finds B.  remove() used to mark B at level 0 without marking B's upper levels, so a B
+        //      taller than one level was never unlinked, retired or reclaimed.  The hooks run those operations on
+        //      this thread at exactly those points; the filler inserts vary B's height across trials.
+
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14, minstd::skiplist_extensions::skiplist_statistics>;
+        using hooks = minstd::skiplist_internal::remove_test_hooks;
+
+        static list_type *current_list;
+        static uint32_t hook_inserts;
+
+        for (uint32_t trial = 0; trial < 48; ++trial)
+        {
+            list_type list;
+            list.reset_statistics();
+            current_list = &list;
+            hook_inserts = 0;
+
+            uint32_t inserted = 0;
+
+            for (uint32_t filler = 0; filler < trial; ++filler)
+            {
+                inserted += list.insert(1000 + filler, filler) ? 1 : 0;
+            }
+
+            inserted += list.insert(5, 5) ? 1 : 0;
+            inserted += list.insert(10, 10) ? 1 : 0;
+            inserted += list.insert(20, 20) ? 1 : 0;
+
+            hooks::before_bottom_mark = []
+            {
+                hook_inserts += current_list->insert(15, 15) ? 1 : 0;
+            };
+
+            hooks::after_bottom_retry_backoff = []
+            {
+                CHECK_TRUE(current_list->remove(10));
+                hook_inserts += current_list->insert(10, 10) ? 1 : 0;
+            };
+
+            CHECK_TRUE(list.remove(10)); //  removes B
+            CHECK_TRUE(hooks::before_bottom_mark == nullptr);
+            CHECK_TRUE(hooks::after_bottom_retry_backoff == nullptr);
+            CHECK_EQUAL(2u, hook_inserts);
+            inserted += hook_inserts;
+
+            CHECK_FALSE(list.find(10) != list.end());
+
+            list.remove(5);
+            list.remove(15);
+            list.remove(20);
+
+            for (uint32_t filler = 0; filler < trial; ++filler)
+            {
+                list.remove(1000 + filler);
+            }
+
+            //  Help every level unlink, and let every CPU slot reclaim what it retired.
+            for (uint32_t round = 0; round < 64; ++round)
+            {
+                list.find(10);
+                list.find(0xFFFFFFFF);
+
+                for (size_t slot = 0; slot < SKIPLIST_STRESS_MAX_THREADS; ++slot)
+                {
+                    list.advance_and_reclaim(slot);
+                }
+            }
+
+            CHECK_EQUAL(0u, list.size());
+            CHECK_EQUAL(inserted, list.nodes_reclaimed()); //  before the fix: one fewer whenever B was taller than one level
+        }
+    }
+
     TEST(SkiplistTests, SharedSlotReclaimThrottleIsRaceFree)
     {
         //  Several threads drive the throttle of ONE slot, as threads on one CPU (or an interrupt handler and
