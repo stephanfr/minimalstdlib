@@ -1,7 +1,8 @@
 # Single-arena and composite resources: performance analysis
 
-The single-arena sections are analysis only; no single-arena code has been changed. The composite section describes
-the changes made to statistics and the bitblock resource.
+The single-arena sections are analysis; of their opportunities, 1 (size-class lookup) and 2 (no divides) have since
+been adopted (see "Low-intrusion changes"). The composite section describes the changes made to statistics and the
+bitblock resource.
 
 **Measured state:**
 - Single-CPU throughput is about 0.3x glibc `malloc`/`free`.
@@ -69,8 +70,8 @@ cause is cross-shard scanning:
 
 | # | Change | Behaviour change | Single CPU | 4 CPUs | Notes |
 |---|--------|------------------|------------|--------|-------|
-| 1 | Size-class lookup table (`constexpr`, 1024 entries, sizes up to 64 KiB) instead of binary search | none | | | |
-| 2 | No divides on the fast path: `cpu_id < shards ? cpu_id : cpu_id % shards`; power-of-two alignment check | none | 1+2: about 1.3x (11 vs 8.5) | 1+2: 14.7 vs 12.5 | no model change needed |
+| 1 | Size-class lookup table (`constexpr`, 1024 entries, sizes up to 64 KiB) instead of binary search | none | | | **adopted** |
+| 2 | No divides on the fast path: `cpu_id < shards ? cpu_id : cpu_id % shards`; power-of-two alignment check | none | 1+2: about 1.3x (11 vs 8.5) | 1+2: 14.7 vs 12.5 | no model change needed; **adopted** |
 | 3 | Per-CPU cache of recently freed small blocks (below) | new block state | 1+2+3: about 2.5x (20-24 vs 8.5), about 0.7-1.0x malloc | 1+2+3: 58.8 vs 12.5 (4.7x); 8 CPUs 69.0 vs 21.4 | cross-CPU frees 3-4x (21.8 / 11.7 / 14.2 vs 5.5 / 4.1 / 4.1 at 1 / 4 / 8) |
 | 4 | Search own shard, then the frontier, then other shards | allocation order | about +15-30% | about +30-60% | costs arena memory under multi-CPU churn (+14% at 4 CPUs, +37% at 8); largely superseded by 3 |
 
@@ -163,6 +164,59 @@ detection.
 - **4 CPUs:** about 78 Mops/s.
 - **Remaining per-allocation cost without it:** the bitmap search (about 190 instructions per allocation in
   `acquire_next_empty_block`) and 2 atomic RMWs on allocate (bit acquire, `free_count_`), plus 2 on free.
+
+## Low-intrusion changes (adopted)
+
+**Workload:** `LockfreeCompositeSingleArenaResourcePerformanceTests::ThreadScalabilitySensitivityAnalysis`, run
+standalone with the request sizes generated before timing, so only allocator work is counted.
+- Each thread keeps 2000 live allocations of lognormal(5.4, 1.2) bytes, capped at 16 KiB (median about 220 B; about
+  1.4% are over the composite's 3072 B threshold).
+- Each thread then frees and re-allocates every one, 500 times over.
+
+**A. The bitblock search hint follows frees (`bitblock_set`).**
+- **Before:** `search_hint_` only moved forward (a CAS-max). Once it reached the end of the bitmap it stayed there, so
+  in steady state every allocation started at the last chunk and wrapped through full words.
+- **Now:**
+  - `release()` stores the freed position;
+  - an acquire stores the position after its bits (next fit, a plain store).
+- **Correctness:** the hint only chooses where a scan starts. The `bitblock_set` model leaves the start bit
+  unconstrained, so it covers this.
+
+**B. Single arena: a `constexpr` size-class table and no fast-path divides** (opportunities 1 and 2 above).
+- The table replaces the binary search for sizes up to 64 KiB, and a `static_assert` proves it is exact.
+- `cpu_shard_index()` skips the modulo when the CPU id is below the shard count.
+- The alignment check is a power-of-two test.
+
+**Instructions per free+allocate pair** (callgrind, 1 thread):
+
+| | before | after |
+|---|---|---|
+| composite (A) | 421 | 344 |
+| single arena (B) | 532 | 391 |
+| glibc malloc | 148 | |
+
+**Throughput** (Mops/s, medians of interleaved runs, 4-vCPU host):
+
+| | 1 thread | 4 threads |
+|---|---|---|
+| composite, before → after | 8.8 → 13.0 | 29.0 → 40.2 |
+| single arena, before → after | 5.5 → 8.0 | 14.4 → 17.3 |
+| glibc malloc | 16.9 | 59.4 |
+
+In the scalability test itself, which includes the size generation in its timing, the composite now runs at about
+0.75-1.0x malloc (it was 0.66-0.89x).
+
+**Tried and not adopted:**
+- dropping the bitblock `free_count_` pre-check: +5-20%, but slow-path scans of full blocks would read each bitmap
+  instead of one counter;
+- making `minstd::optional` trivially copyable: no change, because a 16-byte optional is already returned in
+  registers;
+- removing the per-core scan offset: no change;
+- skipping unchanged hint stores: within noise.
+
+**Open finding:** the single arena encodes block offsets relative to the caller's buffer and asserts that each offset is
+a multiple of 64. A buffer that is not 64-byte aligned therefore trips the assertion on the first allocation, although
+the encoding itself (a full 48-bit offset) is fine.
 
 ## Appendix: prototype diff (opportunities 1-3, without the out-of-memory drain)
 
