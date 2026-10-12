@@ -507,6 +507,72 @@ namespace MINIMAL_STD_NAMESPACE
 
             static constexpr array<size_t, NUM_FREE_BLOCK_BINS> FREE_BLOCK_BIN_SIZES = build_free_block_bin_sizes();
 
+            //  First bin whose size is >= bytes, searching from bin 'lo'.
+
+            static constexpr size_t search_free_block_bin(size_t bytes, size_t lo)
+            {
+                size_t hi = NUM_FREE_BLOCK_BINS - 1;
+
+                while (lo < hi)
+                {
+                    size_t mid = lo + (hi - lo) / 2;
+
+                    if (FREE_BLOCK_BIN_SIZES[mid] < bytes)
+                    {
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        hi = mid;
+                    }
+                }
+
+                return lo;
+            }
+
+            //  Size-class lookup for requests up to 64 KiB, indexed by the size in DEFAULT_ALIGNMENT units (rounded
+            //      up).  Replaces the binary search on the allocation and maintenance paths.
+
+            static constexpr size_t SMALL_BIN_LOOKUP_UNITS = 1024;
+
+            static constexpr array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> build_small_bin_lookup()
+            {
+                array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> lookup{};
+
+                for (size_t units = 0; units <= SMALL_BIN_LOOKUP_UNITS; ++units)
+                {
+                    lookup[units] = static_cast<uint16_t>(search_free_block_bin(units * DEFAULT_ALIGNMENT, 0));
+                }
+
+                return lookup;
+            }
+
+            static constexpr array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> SMALL_BIN_LOOKUP = build_small_bin_lookup();
+
+            //  The lookup is exact only if every size within one DEFAULT_ALIGNMENT unit maps to the same bin.  The
+            //      search is monotonic, so checking both ends of each unit covers every size in it.
+
+            static constexpr bool small_bin_lookup_is_exact()
+            {
+                if (search_free_block_bin(0, 0) != SMALL_BIN_LOOKUP[0])
+                {
+                    return false;
+                }
+
+                for (size_t units = 1; units <= SMALL_BIN_LOOKUP_UNITS; ++units)
+                {
+                    if ((search_free_block_bin(((units - 1) * DEFAULT_ALIGNMENT) + 1, 0) != SMALL_BIN_LOOKUP[units]) ||
+                        (search_free_block_bin(units * DEFAULT_ALIGNMENT, 0) != SMALL_BIN_LOOKUP[units]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            static_assert(small_bin_lookup_is_exact(), "Size-class lookup table must match the bin search for every size");
+
             static_assert(NUM_NON_SENTINEL_FREE_BLOCK_BINS >= 2,
                           "Uniform bin policy must generate at least two non-sentinel bins");
 
@@ -576,7 +642,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t cpu_shard_index() const
             {
-                return static_cast<size_t>(platform_provider_type::get_cpu_id()) % cpu_shards_;
+                const size_t cpu_id = static_cast<size_t>(platform_provider_type::get_cpu_id());
+                return (cpu_id < cpu_shards_) ? cpu_id : (cpu_id % cpu_shards_); //  no divide on the usual path
             }
 
             const block_header &as_block_header(void *block) const
@@ -643,24 +710,14 @@ namespace MINIMAL_STD_NAMESPACE
                     return NUM_FREE_BLOCK_BINS - 1;
                 }
 
-                size_t lo = 0;
-                size_t hi = NUM_FREE_BLOCK_BINS - 1;
+                const size_t units = (bytes + DEFAULT_ALIGNMENT - 1) / DEFAULT_ALIGNMENT;
 
-                while (lo < hi)
+                if (units <= SMALL_BIN_LOOKUP_UNITS)
                 {
-                    size_t mid = lo + (hi - lo) / 2;
-
-                    if (FREE_BLOCK_BIN_SIZES[mid] < bytes)
-                    {
-                        lo = mid + 1;
-                    }
-                    else
-                    {
-                        hi = mid;
-                    }
+                    return SMALL_BIN_LOOKUP[units];
                 }
 
-                return lo;
+                return search_free_block_bin(bytes, SMALL_BIN_LOOKUP[SMALL_BIN_LOOKUP_UNITS]);
             }
 
             void back_off(size_t &retries)
@@ -1080,7 +1137,9 @@ namespace MINIMAL_STD_NAMESPACE
                 //  We cannot throw and exception which is what the standard requires if we cannot allocate the memory
                 //      of either the desired size or alignment, so we will just return nullptr.
 
-                if ((bytes == 0) || (DEFAULT_ALIGNMENT % alignment != 0))
+                //  Alignment must be a power of two no larger than DEFAULT_ALIGNMENT (no divide on the fast path).
+
+                if ((bytes == 0) || (alignment == 0) || (alignment > DEFAULT_ALIGNMENT) || ((alignment & (alignment - 1)) != 0))
                 {
                     return nullptr;
                 }
