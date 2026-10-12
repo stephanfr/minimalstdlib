@@ -257,19 +257,51 @@ namespace
         blocks.release(150);
         blocks.release(200);
 
-        auto r1 = blocks.acquire_first_available();
-        CHECK_TRUE(r1.has_value());
-        CHECK_EQUAL(50u, r1.value());
+        //  The search starts at a hint (the most recently freed position), so the gaps can come back in any
+        //      order; each must come back exactly once.
 
-        auto r2 = blocks.acquire_first_available();
-        CHECK_TRUE(r2.has_value());
-        CHECK_EQUAL(150u, r2.value());
+        bool found_50 = false, found_150 = false, found_200 = false;
 
-        auto r3 = blocks.acquire_first_available();
-        CHECK_TRUE(r3.has_value());
-        CHECK_EQUAL(200u, r3.value());
+        for (size_t i = 0; i < 3; ++i)
+        {
+            auto r = blocks.acquire_first_available();
+            CHECK_TRUE(r.has_value());
+
+            found_50 |= (r.value() == 50);
+            found_150 |= (r.value() == 150);
+            found_200 |= (r.value() == 200);
+        }
+
+        CHECK_TRUE(found_50 && found_150 && found_200);
 
         CHECK_FALSE(blocks.acquire_first_available().has_value());
+    }
+
+    TEST(BitblockSetTests, AcquireAfterReleaseReusesFreedBits)
+    {
+        minstd::bitblock_set<1024> blocks;
+
+        for (size_t i = 0; i < 1024; ++i)
+        {
+            CHECK_TRUE(blocks.acquire_first_available().has_value());
+        }
+
+        //  Free a single bit and a run low in the set; the next acquisitions start where space was freed.
+
+        blocks.release(130);
+
+        auto single = blocks.acquire_first_available();
+        CHECK_TRUE(single.has_value());
+        CHECK_EQUAL(130u, single.value());
+
+        blocks.release(260, 4);
+
+        auto run = blocks.acquire_first_available_contiguous(4);
+        CHECK_TRUE(run.has_value());
+        CHECK_EQUAL(260u, run.value());
+
+        CHECK_FALSE(blocks.acquire_first_available().has_value());
+        CHECK_EQUAL(1024u, blocks.total_bits_set());
     }
 
     TEST(BitblockSetTests, AcquireFirstAvailableNonMultipleOf64)

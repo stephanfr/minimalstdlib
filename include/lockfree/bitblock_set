@@ -111,6 +111,11 @@ namespace MINIMAL_STD_NAMESPACE
             const size_t end_bit = start_bit + num_bits - 1;
             const size_t end_word = end_bit / BITS_PER_WORD;
 
+            //  Start the next search where space was just freed.  The hint only picks where a scan starts (every
+            //      scan still wraps over the whole set), so a stale or racing value costs time, never correctness.
+
+            search_hint_.store(start_bit, minstd::memory_order_relaxed);
+
             if (start_word == end_word)
             {
                 return release_single_word(start_word, start_bit_in_word, num_bits);
@@ -326,17 +331,10 @@ namespace MINIMAL_STD_NAMESPACE
 
         void advance_search_hint(const size_t proposed_hint)
         {
-            size_t current_hint = search_hint_.load(minstd::memory_order_relaxed);
+            //  Next fit: continue after the bits just acquired.  A plain store (not a CAS-max) so that a release can
+            //      move the hint back to freed space; see release().
 
-            while (proposed_hint > current_hint)
-            {
-                if (search_hint_.compare_exchange_weak(current_hint, proposed_hint,
-                                                       minstd::memory_order_relaxed,
-                                                       minstd::memory_order_relaxed))
-                {
-                    break;
-                }
-            }
+            search_hint_.store(proposed_hint, minstd::memory_order_relaxed);
         }
 
         bitblock_set_result acquire_single_word(const size_t word_idx, const size_t start_bit_in_word, const size_t num_bits)
