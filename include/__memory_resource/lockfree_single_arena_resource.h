@@ -191,8 +191,8 @@ namespace MINIMAL_STD_NAMESPACE
             explicit lockfree_single_arena_resource_impl(void *block,
                                                          size_t block_size,
                                                          size_t cpu_shards = DEFAULT_CPU_SHARDS)
-                : block_(block),
-                  block_size_(block_size),
+                : block_(internal::align_pointer(block, DEFAULT_ALIGNMENT)),
+                  block_size_(aligned_block_size(block, block_size)),
                   metadata_start_(reinterpret_cast<block_metadata *>(((uintptr_t)block + block_size) & ~(uintptr_t)(ALLOCATION_METADATA_SIZE - 1)) - 1), //  round the end DOWN: the top record must lie inside the arena
                   next_empty_memory_block_(0), // Will be set after allocating per-CPU arrays
                   current_metadata_record_count_(0),
@@ -207,11 +207,16 @@ namespace MINIMAL_STD_NAMESPACE
                 //  Allocate the per-CPU shard arrays from the start of the managed block.
                 //  Layout: [pending_shards][free_block_bins][metadata_block_managers][64-byte align][allocations...]
 
+                //  The arena starts at the first DEFAULT_ALIGNMENT boundary of the caller's block: block_ and block_size_
+                //      describe that aligned region, and block offsets (block_state_ptr) are relative to it, so they are
+                //      multiples of DEFAULT_ALIGNMENT whatever the caller's buffer alignment.
+
                 MINIMAL_STD_ASSERT(block_ != nullptr);
+                MINIMAL_STD_ASSERT(block_size_ > 0);
                 MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
                 MINIMAL_STD_ASSERT((block_size_ / DEFAULT_ALIGNMENT) < NO_PREDECESSOR); //  frontier words hold 32-bit unit offsets (256 GiB)
 
-                uint8_t *current_ptr = static_cast<uint8_t *>(internal::align_pointer(block, DEFAULT_ALIGNMENT));
+                uint8_t *current_ptr = static_cast<uint8_t *>(const_cast<void *>(block_));
 
                 //  Allocate pending_shards_ array (cpu_shards_ elements)
                 pending_shards_ = reinterpret_cast<pending_shard *>(current_ptr);
@@ -333,7 +338,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             // Packed block offset + state + version for atomic state transitions.
             // Layout: [offset:48][state:4][version:12] = 64 bits.
-            // Offsets are relative to block_ and avoid canonical-address assumptions.
+            // Offsets are relative to block_ (the arena's 64-byte-aligned start) and avoid canonical-address assumptions.
             struct block_state_ptr
             {
                 using pointer = block_header *;
@@ -580,8 +585,16 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL;
 
         private:
-            const void *const block_;
-            const size_t block_size_;
+            const void *const block_;   //  first DEFAULT_ALIGNMENT boundary of the caller's block
+            const size_t block_size_;   //  bytes from block_ to the end of the caller's block
+
+            static size_t aligned_block_size(void *block, size_t block_size)
+            {
+                const size_t adjustment = static_cast<size_t>(reinterpret_cast<uintptr_t>(internal::align_pointer(block, DEFAULT_ALIGNMENT)) -
+                                                              reinterpret_cast<uintptr_t>(block));
+
+                return (block_size > adjustment) ? (block_size - adjustment) : 0;
+            }
             block_metadata *const metadata_start_;
 
             alignas(64) atomic<uint64_t> next_empty_memory_block_;

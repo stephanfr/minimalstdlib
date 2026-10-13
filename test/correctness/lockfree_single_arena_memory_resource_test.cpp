@@ -64,6 +64,66 @@ TEST_GROUP(LockfreeSingleArenaMemoryResourceTests)
 {
 };
 
+TEST(LockfreeSingleArenaMemoryResourceTests, UnalignedArenaBuffer)
+{
+    //  The arena starts at the first 64-byte boundary of the caller's block.  It used to encode block offsets
+    //      relative to the raw pointer and assert they were multiples of 64, so any buffer that was not
+    //      64-byte aligned failed that assertion on its first allocation.  (Test builds report contract
+    //      violations through the failure hook instead of trapping, so count every report.)
+
+    static size_t contract_violations;
+    contract_violations = 0;
+
+    auto previous_hook = minstd::set_failure_hook([](const char *, const char *, const char *, int)
+                                                  {
+                                                      ++contract_violations;
+                                                  });
+
+    constexpr size_t ARENA_BYTES = 4 * 1048576;
+    constexpr size_t NUM_ALLOCATIONS = 256;
+
+    char *aligned_buffer = static_cast<char *>(aligned_alloc(4096, ARENA_BYTES + 4096));
+    CHECK(aligned_buffer != nullptr);
+
+    for (size_t offset : {size_t{1}, size_t{8}, size_t{16}, size_t{48}, size_t{63}})
+    {
+        char *arena = aligned_buffer + offset;
+        lockfree_single_arena_resource_without_stats resource(arena, ARENA_BYTES);
+
+        void *allocations[NUM_ALLOCATIONS];
+        size_t sizes[NUM_ALLOCATIONS];
+
+        for (size_t round = 0; round < 2; ++round)
+        {
+            for (size_t i = 0; i < NUM_ALLOCATIONS; ++i)
+            {
+                sizes[i] = 1 + ((i * 37 + round * 11) % 2000);
+                const size_t alignment = (i % 2 == 0) ? 16 : 64;
+
+                allocations[i] = resource.allocate(sizes[i], alignment);
+                CHECK(allocations[i] != nullptr);
+
+                const uintptr_t address = reinterpret_cast<uintptr_t>(allocations[i]);
+                CHECK_EQUAL(0u, address % alignment);
+                CHECK(address >= reinterpret_cast<uintptr_t>(arena));
+                CHECK(address + sizes[i] <= reinterpret_cast<uintptr_t>(arena) + ARENA_BYTES);
+
+                memset(allocations[i], static_cast<int>(i), sizes[i]);
+            }
+
+            for (size_t i = 0; i < NUM_ALLOCATIONS; ++i)
+            {
+                resource.deallocate(allocations[i], sizes[i], (i % 2 == 0) ? 16 : 64);
+            }
+        }
+    }
+
+    minstd::set_failure_hook(previous_hook);
+    free(aligned_buffer);
+
+    CHECK_EQUAL(0u, contract_violations);
+}
+
 TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionality)
 {
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);

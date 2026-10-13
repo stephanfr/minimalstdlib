@@ -214,9 +214,9 @@ In the scalability test itself, which includes the size generation in its timing
 - removing the per-core scan offset: no change;
 - skipping unchanged hint stores: within noise.
 
-**Open finding:** the single arena encodes block offsets relative to the caller's buffer and asserts that each offset is
-a multiple of 64. A buffer that is not 64-byte aligned therefore trips the assertion on the first allocation, although
-the encoding itself (a full 48-bit offset) is fine.
+**Fixed since:** the single arena encoded block offsets relative to the caller's raw pointer and asserted that each was
+a multiple of 64, so a buffer that was not 64-byte aligned tripped the assertion on every allocation. It now treats
+the first 64-byte boundary of the caller's block as its start (`UnalignedArenaBuffer`).
 
 ## Appendix: prototype diff (opportunities 1-3, without the out-of-memory drain)
 
