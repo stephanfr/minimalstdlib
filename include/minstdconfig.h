@@ -130,46 +130,46 @@ namespace MINIMAL_STD_NAMESPACE
 }
 
 #define MINIMAL_STD_ASSERT(expression)                                                  \
-    {                                                                                   \
+    do {                                                                                \
         if (!(expression))                                                              \
         {                                                                               \
             ::MINIMAL_STD_NAMESPACE::contract_violation(#expression, __FILE__, __LINE__); \
         }                                                                               \
-    }
+    } while (0)
 
 #define MINIMAL_STD_FAIL(message)                                                   \
-    {                                                                               \
+    do {                                                                            \
         ::MINIMAL_STD_NAMESPACE::contract_violation(#message, __FILE__, __LINE__); \
-    }
+    } while (0)
 
 #if MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_LEGACY
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...) \
-    {                                                               \
+    do {                                                            \
         (void)(requested_bytes);                                    \
         (void)(alignment);                                          \
         __VA_ARGS__;                                                \
-    }
+    } while (0)
 #elif MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_TRAP
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...)                    \
-    {                                                                                 \
+    do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
-    }
+    } while (0)
 #elif MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_THROW
 #if defined(__cpp_exceptions)
 #include <new>
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...) \
-    {                                                               \
+    do {                                                            \
         (void)(requested_bytes);                                    \
         (void)(alignment);                                          \
         throw ::std::bad_alloc();                                  \
-    }
+    } while (0)
 #else
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...)                    \
-    {                                                                                 \
+    do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
-    }
+    } while (0)
 #endif
 #else
 #error "Invalid MINIMAL_STD_ALLOCATION_FAILURE_POLICY value"

@@ -35,6 +35,13 @@ namespace MINIMAL_STD_NAMESPACE
         template <typename T>
         void deallocate_block(T *ptr, size_t num_elements)
         {
+            //  Freeing nothing is a no-op, as for delete and free()
+
+            if (ptr == nullptr)
+            {
+                return;
+            }
+
             MINIMAL_STD_ASSERT(validate_pointer(ptr));
             MINIMAL_STD_ASSERT(num_elements_in_block(ptr) == num_elements);
 

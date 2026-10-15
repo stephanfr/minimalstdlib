@@ -249,7 +249,8 @@ namespace MINIMAL_STD_NAMESPACE
                     if (block_space == nullptr)
                     {
                         //  Leave this arena empty; do_allocate() adds a block when memory becomes available.
-                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block), continue);
+                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block));
+                        continue;
                     }
 
                     auto initial_block = new (block_space) block();

@@ -1058,4 +1058,116 @@ namespace
 
         CHECK_EQUAL(0u, resource.bytes_in_use());
     }
+
+    using avl_tree_int = minstd::avl_tree<uint32_t, uint32_t>;
+    using avl_tree_intAllocator = minstd::pmr::polymorphic_allocator<avl_tree_int::node_type>;
+
+    static_assert(minstd::is_same_v<avl_tree_int::value_type, minstd::pair<const uint32_t, uint32_t>>, "keys must not be changeable through iterators");
+
+    TEST(avl_treeTests, EraseLeavesOtherElementsInPlace)
+    {
+        //  Before the fix, erasing a node with two children moved its successor's value into it, so iterators,
+        //      pointers and references to the successor then referred to a different element.
+
+        static char heap_buffer[TEST_BUFFER_SIZE];
+        minstd::single_block_memory_heap heap(heap_buffer, TEST_BUFFER_SIZE);
+        minstd::pmr::memory_heap_resource_adapter heap_resource(heap);
+        avl_tree_intAllocator allocator(&heap_resource);
+
+        constexpr uint32_t NUM_KEYS = 256;
+
+        avl_tree_int tree(allocator);
+        const avl_tree_int::value_type *addresses[NUM_KEYS] = {};
+        bool present[NUM_KEYS] = {};
+
+        //  Insert in a scrambled order so the tree has plenty of interior nodes
+
+        for (uint32_t i = 0; i < NUM_KEYS; i++)
+        {
+            uint32_t key = (i * 37) % NUM_KEYS;
+
+            auto result = tree.insert(key, key * 10);
+            CHECK(result.second);
+            addresses[key] = &(*result.first);
+            present[key] = true;
+        }
+
+        //  Erase in another scrambled order, checking after each erase that every survivor is where it was
+
+        for (uint32_t i = 0; i < NUM_KEYS; i++)
+        {
+            uint32_t key = (i * 101 + 7) % NUM_KEYS;
+
+            auto itr = tree.find(key);
+            CHECK(itr != tree.end());
+
+            auto next = itr;
+            ++next;
+
+            auto returned = tree.erase(itr);
+            CHECK(returned == next);
+            present[key] = false;
+
+            uint32_t count = 0;
+            uint32_t previous_key = 0;
+
+            for (auto survivor = tree.begin(); survivor != tree.end(); ++survivor)
+            {
+                const uint32_t survivor_key = survivor->first;
+
+                CHECK(present[survivor_key]);
+                CHECK(&(*survivor) == addresses[survivor_key]);
+                CHECK_EQUAL(survivor_key * 10, survivor->second);
+                CHECK((count == 0) || (survivor_key > previous_key));
+
+                previous_key = survivor_key;
+                count++;
+            }
+
+            CHECK_EQUAL(tree.size(), count);
+
+            //  And backward
+
+            if (!tree.empty())
+            {
+                auto backward = tree.end();
+                uint32_t backward_count = 0;
+
+                do
+                {
+                    --backward;
+                    CHECK(&(*backward) == addresses[backward->first]);
+                    backward_count++;
+                } while (backward != tree.begin());
+
+                CHECK_EQUAL(count, backward_count);
+            }
+        }
+
+        CHECK(tree.empty());
+        CHECK_EQUAL(0, heap.bytes_in_use());
+    }
+
+    TEST(avl_treeTests, InsertLvaluePairAndConstFind)
+    {
+        static char heap_buffer[TEST_BUFFER_SIZE];
+        minstd::single_block_memory_heap heap(heap_buffer, TEST_BUFFER_SIZE);
+        minstd::pmr::memory_heap_resource_adapter heap_resource(heap);
+        avl_tree_intAllocator allocator(&heap_resource);
+
+        avl_tree_int tree(allocator);
+
+        //  insert(const value_type &) did not compile: it passed a const value to an rvalue parameter
+
+        const avl_tree_int::value_type entry(5, 50);
+        CHECK(tree.insert(entry).second);
+        CHECK_FALSE(tree.insert(entry).second);
+
+        const avl_tree_int &const_tree = tree;
+
+        avl_tree_int::const_iterator found = const_tree.find(5);
+        CHECK(found != const_tree.end());
+        CHECK_EQUAL(50, found->second);
+        CHECK(const_tree.find(6) == const_tree.end());
+    }
 }

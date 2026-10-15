@@ -51,21 +51,16 @@ namespace MINIMAL_STD_NAMESPACE
         //      have one inbound branch, though it may have one or two outbound branches.
         //
 
+        //
+        //  A node keeps its value for its whole life: erase relinks nodes rather than moving values
+        //      between them, so iterators and references to other elements stay valid.
+        //
+
         struct avl_node
         {
-
-            explicit avl_node(const minstd::pair<Key, T> &&value)
-                : value_(minstd::move(value))
-            {
-            }
-
-            explicit avl_node(const Key &key, const T &value)
-                : value_(key, value)
-            {
-            }
-
-            explicit avl_node(const Key &key, T &&value)
-                : value_(key, minstd::move(value))
+            template <typename V>
+            explicit avl_node(const Key &key, V &&value)
+                : value_(key, minstd::forward<V>(value))
             {
             }
 
@@ -73,22 +68,8 @@ namespace MINIMAL_STD_NAMESPACE
             {
             }
 
-            avl_node operator=(avl_node &) = delete;
-            avl_node operator=(const avl_node &) = delete;
-
-            avl_node &operator=(const avl_node &&value)
-            {
-                value_ = minstd::move(value.value_);
-
-                return *this;
-            }
-
-            avl_node &operator=(avl_node &&value)
-            {
-                value_ = minstd::move(value.value_);
-
-                return *this;
-            }
+            avl_node(const avl_node &) = delete;
+            avl_node &operator=(const avl_node &) = delete;
 
             const Key &key() const
             {
@@ -130,7 +111,7 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             }
 
-            minstd::pair<Key, T> value_;
+            minstd::pair<const Key, T> value_; //  the key cannot change while the node is in the tree
 
             avl_node *left_ = nullptr;
             avl_node *left_reverse_ = nullptr;
@@ -143,7 +124,7 @@ namespace MINIMAL_STD_NAMESPACE
     public:
         using key_type = Key;
         using mapped_type = T;
-        using value_type = minstd::pair<key_type, T>;
+        using value_type = minstd::pair<const key_type, T>;
         using reference = value_type &;
         using pointer = value_type *;
         using const_reference = const value_type &;
@@ -198,23 +179,16 @@ namespace MINIMAL_STD_NAMESPACE
             return allocator_traits_type::max_size(allocator_);
         }
 
-        size_t erase(key_type key)
+        size_t erase(const key_type &key)
         {
             size_t initial_size = size_;
 
-            node_type *new_root = erase_recursive(root_, key);
+            root_ = erase_recursive(root_, key);
 
-            if (new_root != nullptr)
+            if (root_ != nullptr)
             {
-                root_ = new_root;
-
                 root_->left_reverse_ = nullptr;
                 root_->right_reverse_ = nullptr;
-            }
-
-            if (size_ == 0)
-            {
-                root_ = nullptr;
             }
 
             return initial_size - size_;
@@ -230,7 +204,8 @@ namespace MINIMAL_STD_NAMESPACE
         iterator end() noexcept;
         const_iterator end() const noexcept;
 
-        iterator find(key_type key_to_find);
+        iterator find(const key_type &key_to_find);
+        const_iterator find(const key_type &key_to_find) const;
         minstd::pair<iterator, bool> insert(const key_type &key, const T &value);
         minstd::pair<iterator, bool> insert(const key_type &key, T &&value);
         minstd::pair<iterator, bool> insert(const value_type &value);
@@ -238,6 +213,9 @@ namespace MINIMAL_STD_NAMESPACE
         iterator erase(iterator element_to_erase);
 
     private:
+        template <typename V>
+        minstd::pair<iterator, bool> insert_value(const key_type &key, V &&value);
+
         allocator_type &allocator_;
 
         node_type *root_ = nullptr;
@@ -342,7 +320,32 @@ namespace MINIMAL_STD_NAMESPACE
             return node_right;
         }
 
-        node_type *insert_recursive(node_type *subtree_root, const key_type &key, mapped_type &&value)
+        node_type *find_node(const key_type &key_to_find) const
+        {
+            node_type *current_node = root_;
+
+            while (current_node != nullptr)
+            {
+                if (key_to_find == current_node->key())
+                {
+                    return current_node;
+                }
+
+                if (key_to_find > current_node->key())
+                {
+                    current_node = current_node->right_; //  Key is larger, go right
+                }
+                else
+                {
+                    current_node = current_node->left_; //  Key is smaller, go left
+                }
+            }
+
+            return nullptr;
+        }
+
+        template <typename V>
+        node_type *insert_recursive(node_type *subtree_root, const key_type &key, V &&value)
         {
             if (subtree_root == nullptr)
             {
@@ -356,7 +359,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 size_++;
 
-                allocator_traits_type::construct(allocator_, new_node_block, key, minstd::move(value));
+                allocator_traits_type::construct(allocator_, new_node_block, key, minstd::forward<V>(value));
                 return new_node_block;
             }
 
@@ -365,11 +368,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (key < subtree_root->key())
             {
-                subtree_root->set_left(insert_recursive(subtree_root->left_, key, minstd::move(value)));
+                subtree_root->set_left(insert_recursive(subtree_root->left_, key, minstd::forward<V>(value)));
             }
             else if (key > subtree_root->key())
             {
-                subtree_root->set_right(insert_recursive(subtree_root->right_, key, minstd::move(value)));
+                subtree_root->set_right(insert_recursive(subtree_root->right_, key, minstd::forward<V>(value)));
             }
             else
             {
@@ -416,98 +419,8 @@ namespace MINIMAL_STD_NAMESPACE
             return subtree_root;
         }
 
-        node_type *erase_recursive(node_type *subtree_root, const key_type &key)
+        node_type *rebalance_after_erase(node_type *subtree_root)
         {
-            if (subtree_root == nullptr) //  Tree is empty
-            {
-                return nullptr;
-            }
-
-            //  Delete mirrors insert.  Remove the node and then rebalance if necessary.
-            //
-            //  The recursions search the tree for the node to remove.
-
-            if (key < subtree_root->key())
-            {
-                subtree_root->set_left(erase_recursive(subtree_root->left_, key));
-            }
-            else if (key > subtree_root->key())
-            {
-                subtree_root->set_right(erase_recursive(subtree_root->right_, key));
-            }
-            else
-            {
-                //  Found the node to delete
-
-                //  First, handle the case of zero or one branch leaving the node (i.e. no children or one child)
-
-                if ((subtree_root->left_ == nullptr) || (subtree_root->right_ == nullptr))
-                {
-                    //  Save the left or right node, whichever is non-null.  We use this for determining
-                    //      the new subtree_root after we delete the current subtree root
-
-                    node_type *temp = subtree_root->left_ ? subtree_root->left_ : subtree_root->right_;
-
-                    //  If both left and right are null, then this is a leaf node and can simply be deleted.
-                    //      There is no need for a rebalance, so the method can return a nullptr.
-                    //
-                    //  If there is one child, then copy that child into the current subtree_root and
-                    //      then delete the copied node.
-
-                    if (temp == nullptr)
-                    {
-                        temp = subtree_root;
-                        subtree_root = nullptr;
-                    }
-                    else
-                    {
-                        //  We need to move the value for the linked node into the current subtree_root
-                        //      and then fixup the outbound link.
-
-                        *subtree_root = minstd::move(*temp);
-
-                        subtree_root->left_ = temp->left_;
-                        subtree_root->right_ = temp->right_;
-
-                        if (subtree_root->left_ != nullptr)
-                        {
-                            subtree_root->left_->left_reverse_ = subtree_root;
-                        }
-
-                        if (subtree_root->right_ != nullptr)
-                        {
-                            subtree_root->right_->right_reverse_ = subtree_root;
-                        }
-                    }
-
-                    allocator_traits_type::destroy(allocator_, temp);
-                    allocator_traits_type::deallocate(allocator_, temp, 1);
-                    size_--;
-                }
-                else
-                {
-                    //  Two branches leaving the node
-
-                    node_type *subtree_front = find_front(subtree_root->right_);
-
-                    //  Keep the successor's key intact until its node is gone: the erase below finds it by key.
-                    //      Take a copy of the key and only move the mapped value out.
-
-                    key_type successor_key = subtree_front->key();
-                    mapped_type successor_value = minstd::move(get<1>(subtree_front->value_));
-
-                    //  Delete the ordered successor
-
-                    subtree_root->set_right(erase_recursive(subtree_root->right_, successor_key));
-
-                    subtree_root->value_ = value_type(minstd::move(successor_key), minstd::move(successor_value));                }
-            }
-
-            if (subtree_root == nullptr)
-            {
-                return nullptr;
-            }
-
             //  Update the depth of the subtree root node
 
             subtree_root->depth_ = 1 + minstd::max(depth(subtree_root->left_), depth(subtree_root->right_));
@@ -539,6 +452,82 @@ namespace MINIMAL_STD_NAMESPACE
             }
 
             return subtree_root;
+        }
+
+        //  Unlinks the smallest node of a subtree, which is handed back through 'front', and returns the
+        //      rebalanced remainder of the subtree.
+
+        node_type *unlink_front(node_type *subtree_root, node_type *&front)
+        {
+            if (subtree_root->left_ == nullptr)
+            {
+                front = subtree_root;
+                return subtree_root->right_;
+            }
+
+            subtree_root->set_left(unlink_front(subtree_root->left_, front));
+
+            return rebalance_after_erase(subtree_root);
+        }
+
+        node_type *erase_recursive(node_type *subtree_root, const key_type &key)
+        {
+            if (subtree_root == nullptr) //  Tree is empty or the key is not present
+            {
+                return nullptr;
+            }
+
+            //  Delete mirrors insert.  Remove the node and then rebalance if necessary.
+            //
+            //  The recursions search the tree for the node to remove.
+
+            if (key < subtree_root->key())
+            {
+                subtree_root->set_left(erase_recursive(subtree_root->left_, key));
+            }
+            else if (key > subtree_root->key())
+            {
+                subtree_root->set_right(erase_recursive(subtree_root->right_, key));
+            }
+            else
+            {
+                //  Found the node to delete.  Its place is taken by another node, never by another node's
+                //      value, so no other element moves.
+
+                node_type *erased = subtree_root;
+
+                if ((erased->left_ == nullptr) || (erased->right_ == nullptr))
+                {
+                    //  Zero or one child: the child (or nothing) takes the erased node's place.  The caller's
+                    //      set_left()/set_right() fixes the child's reverse link.
+
+                    subtree_root = erased->left_ ? erased->left_ : erased->right_;
+                }
+                else
+                {
+                    //  Two children: the in-order successor, the front of the right subtree, is unlinked
+                    //      and takes the erased node's place.
+
+                    node_type *successor = nullptr;
+                    node_type *right_remainder = unlink_front(erased->right_, successor);
+
+                    successor->set_left(erased->left_);
+                    successor->set_right(right_remainder);
+
+                    subtree_root = successor;
+                }
+
+                allocator_traits_type::destroy(allocator_, erased);
+                allocator_traits_type::deallocate(allocator_, erased, 1);
+                size_--;
+            }
+
+            if (subtree_root == nullptr)
+            {
+                return nullptr;
+            }
+
+            return rebalance_after_erase(subtree_root);
         }
     };
 
@@ -853,86 +842,49 @@ namespace MINIMAL_STD_NAMESPACE
     }
 
     template <typename Key, typename T>
-    avl_tree<Key, T>::iterator avl_tree<Key, T>::find(key_type key_to_find)
+    avl_tree<Key, T>::iterator avl_tree<Key, T>::find(const key_type &key_to_find)
     {
-        if (root_ == nullptr)
-        {
-            return end();
-        }
+        return iterator(this, find_node(key_to_find));
+    }
 
-        node_type *current_node = root_;
-
-        while (current_node != nullptr)
-        {
-            if (key_to_find == current_node->key())
-            {
-                return iterator(this, current_node);
-            }
-
-            if (key_to_find > current_node->key())
-            {
-                current_node = current_node->right_; //  Key is larger, go right
-            }
-            else
-            {
-                current_node = current_node->left_; //  Key is smaller, go left
-            }
-        }
-
-        //  If we are here, we did not find the key
-
-        return end();
+    template <typename Key, typename T>
+    avl_tree<Key, T>::const_iterator avl_tree<Key, T>::find(const key_type &key_to_find) const
+    {
+        return const_iterator(this, find_node(key_to_find));
     }
 
     template <typename Key, typename T>
     minstd::pair<typename avl_tree<Key, T>::iterator, bool> avl_tree<Key, T>::insert(const key_type &key, const T &value)
     {
-        return insert(value_type(key, value));
+        return insert_value(key, value);
     }
 
     template <typename Key, typename T>
     minstd::pair<typename avl_tree<Key, T>::iterator, bool> avl_tree<Key, T>::insert(const key_type &key, T &&value)
     {
-        return insert(minstd::move(value_type(key, minstd::move(value))));
+        return insert_value(key, minstd::move(value));
     }
 
     template <typename Key, typename T>
     minstd::pair<typename avl_tree<Key, T>::iterator, bool> avl_tree<Key, T>::insert(const value_type &value)
     {
-        //  First, insure the element does not already exist.  If it does,
-        //      return the iterator to the element and 'false'.
-
-        iterator existing_element = find(get<0>(value));
-
-        if (existing_element != end())
-        {
-            return minstd::pair<iterator, bool>(existing_element, false);
-        }
-
-        size_t initial_size = size_;
-
-        root_ = insert_recursive(root_, get<0>(value), get<1>(value));
-
-        if (root_ == nullptr || size_ == initial_size)
-        {
-            return minstd::pair<iterator, bool>(end(), false);
-        }
-
-        root_->left_reverse_ = nullptr;
-        root_->right_reverse_ = nullptr;
-
-        //  Insert succeeded, return an iterator to the new element
-
-        return minstd::pair<iterator, bool>(find(get<0>(value)), true);
+        return insert_value(get<0>(value), get<1>(value));
     }
 
     template <typename Key, typename T>
     minstd::pair<typename avl_tree<Key, T>::iterator, bool> avl_tree<Key, T>::insert(value_type &&value)
     {
+        return insert_value(get<0>(value), minstd::move(get<1>(value)));
+    }
+
+    template <typename Key, typename T>
+    template <typename V>
+    minstd::pair<typename avl_tree<Key, T>::iterator, bool> avl_tree<Key, T>::insert_value(const key_type &key, V &&value)
+    {
         //  First, insure the element does not already exist.  If it does,
         //      return the iterator to the element and 'false'.
 
-        iterator existing_element = find(get<0>(value));
+        iterator existing_element = find(key);
 
         if (existing_element != end())
         {
@@ -941,7 +893,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t initial_size = size_;
 
-        root_ = insert_recursive(root_, get<0>(value), minstd::move(get<1>(value)));
+        root_ = insert_recursive(root_, key, minstd::forward<V>(value));
 
         if (root_ == nullptr || size_ == initial_size)
         {
@@ -953,7 +905,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         //  Insert succeeded, return an iterator to the new element
 
-        return minstd::pair<iterator, bool>(find(get<0>(value)), true);
+        return minstd::pair<iterator, bool>(find(key), true);
     }
 
     template <typename Key, typename T>
@@ -966,21 +918,15 @@ namespace MINIMAL_STD_NAMESPACE
 
         //  We want to return the element following the one to be deleted
 
+        //  Nodes do not move during an erase, so the iterator to the next element stays valid.
+
         iterator next_element = element_to_erase;
 
         ++next_element;
 
-        if (next_element == end())
-        {
-            erase(get<0>(*element_to_erase));
-            return end();
-        }
-
-        key_type next_key = get<0>(*next_element);
-
         erase(get<0>(*element_to_erase));
 
-        return find(next_key);
+        return next_element;
     }
 
 }

@@ -20,6 +20,15 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
+    //
+    //  A vector with a fixed capacity: it does not grow.  The capacity is fixed when the vector is
+    //      constructed: the constructor's initial_size argument if given, else INITIAL_SIZE, else
+    //      DEFAULT_INITIAL_SIZE (12), and never more than MAX_SIZE.  Adding an element to a full vector
+    //      (push_back, emplace_back, insert, emplace, or an initializer list longer than the capacity)
+    //      is a contract violation: it traps under the default failure policy, and under the test
+    //      policy the element is dropped.  A copy assignment reallocates to fit the source.
+    //
+
     template <typename T, size_t INITIAL_SIZE = 0, size_t MAX_SIZE = __SIZE_MAX__>
     class vector
     {
@@ -48,7 +57,7 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (current_allocated_size_ != 0 && begin_ == nullptr)
             {
-                //  An empty, full vector: push_back() is a no-op and emplace_back() traps.
+                //  An empty, full vector: adding an element is a contract violation.
                 const size_t requested = current_allocated_size_;
                 current_allocated_size_ = 0;
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * requested, alignof(T));
@@ -65,11 +74,15 @@ namespace MINIMAL_STD_NAMESPACE
         {
             if (current_allocated_size_ != 0 && begin_ == nullptr)
             {
-                //  An empty, full vector: push_back() is a no-op and emplace_back() traps.
+                //  An empty, full vector: adding an element is a contract violation.
                 const size_t requested = current_allocated_size_;
                 current_allocated_size_ = 0;
                 MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * requested, alignof(T));
             }
+
+            //  The list must fit in the capacity.  When the allocation failed, that has already been reported.
+
+            MINIMAL_STD_ASSERT((begin_ == nullptr) || (initial_values.size() <= current_allocated_size_));
 
             for (const T& element : initial_values)
             {
@@ -181,28 +194,28 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr reference front()
         {
-            MINIMAL_STD_ASSERT(end_ > begin_)
+            MINIMAL_STD_ASSERT(end_ > begin_);
 
             return *begin_;
         }
 
         constexpr const_reference front() const
         {
-            MINIMAL_STD_ASSERT(end_ > begin_)
+            MINIMAL_STD_ASSERT(end_ > begin_);
 
             return *begin_;
         }
 
         constexpr reference back()
         {
-            MINIMAL_STD_ASSERT(end_ > begin_)
+            MINIMAL_STD_ASSERT(end_ > begin_);
 
             return *(end_ - 1);
         }
 
         constexpr const_reference back() const
         {
-            MINIMAL_STD_ASSERT(end_ > begin_)
+            MINIMAL_STD_ASSERT(end_ > begin_);
 
             return *(end_ - 1);
         }
@@ -247,6 +260,11 @@ namespace MINIMAL_STD_NAMESPACE
 
         constexpr void push_back(const T &new_element)
         {
+            //  The capacity is fixed, so a full vector cannot take another element
+
+            MINIMAL_STD_ASSERT(size() < max_size());
+            MINIMAL_STD_ASSERT(size() < current_allocated_size_);
+
             if (size() >= max_size() || size() >= current_allocated_size_)
             {
                 return;

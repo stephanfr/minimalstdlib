@@ -175,7 +175,13 @@ namespace MINIMAL_STD_NAMESPACE
             //  Add the new entry to the front of the list and the front of the list to the map
 
             cache_entries_.emplace_front(key, value);
-            cache_entry_map_.insert(key, cache_entries_.begin());
+            if (!cache_entry_map_.insert(key, cache_entries_.begin()).second)
+            {
+                //  The map could not take the entry (out of memory), so the list must not keep it either
+
+                cache_entries_.pop_front();
+                return false;
+            }
 
             return true;
         }
@@ -203,7 +209,13 @@ namespace MINIMAL_STD_NAMESPACE
             //  Add the new entry to the front of the list and the front of the list to the map
 
             cache_entries_.emplace_front(key, minstd::move(value));
-            cache_entry_map_.insert(key, cache_entries_.begin());
+            if (!cache_entry_map_.insert(key, cache_entries_.begin()).second)
+            {
+                //  The map could not take the entry (out of memory), so the list must not keep it either
+
+                cache_entries_.pop_front();
+                return false;
+            }
 
             return true;
         }
