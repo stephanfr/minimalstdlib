@@ -24,6 +24,37 @@ static_assert(__cplusplus >= 202002L, "Minimal C++ Stdlib requires C++ 20 or lat
 #define MINIMAL_STD_FAILURE_POLICY_DEFAULT 0
 #define MINIMAL_STD_FAILURE_POLICY_TEST 1
 
+//
+//  How lockfree::tagged_ptr restores the address bits its counter displaces (the top 16 with the
+//      default 16-bit counter).  Pick the rule that matches where the tagged objects live:
+//
+//      ZERO            the top bits are zero: user space, identity-mapped low memory, TTBR0.
+//      ONES            the top bits are ones: the upper (TTBR1) half on AArch64, kernel space on x86-64.
+//      SIGN_EXTEND_47  the top bits copy bit 47: right for both halves when addresses are canonical
+//                      48-bit, but a TTBR1 address with bit 47 clear (0xFFFF0000'00000000 to
+//                      0xFFFF7FFF'FFFFFFFF, reachable with 48-bit VAs) decodes into the lower half.
+//
+//  The default is SIGN_EXTEND_47, and ZERO for the hosted test build.
+//
+
+#define MINIMAL_STD_POINTER_TOP_BITS_ZERO 0
+#define MINIMAL_STD_POINTER_TOP_BITS_ONES 1
+#define MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47 2
+
+#if !defined(MINIMAL_STD_POINTER_TOP_BITS)
+#if defined(__MINIMAL_STD_TEST__)
+#define MINIMAL_STD_POINTER_TOP_BITS MINIMAL_STD_POINTER_TOP_BITS_ZERO
+#else
+#define MINIMAL_STD_POINTER_TOP_BITS MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47
+#endif
+#endif
+
+#if (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_ZERO) && \
+    (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_ONES) &&  \
+    (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47)
+#error "Invalid MINIMAL_STD_POINTER_TOP_BITS value"
+#endif
+
 extern "C" void __assert(const char *msg, const char *file, int line);
 
 #define MINIMAL_STD_NAMESPACE minstd

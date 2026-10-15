@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "minstdconfig.h"
+
 #include <stdint.h>
 #include <limits>
 
@@ -11,7 +13,19 @@ namespace MINIMAL_STD_NAMESPACE
 {
     namespace lockfree
     {
-        template <typename T, typename CounterT = uint16_t>
+        //  How unpack_ptr() restores the address bits the counter displaces: see MINIMAL_STD_POINTER_TOP_BITS
+        //      in minstdconfig.h.
+
+        enum class pointer_top_bits
+        {
+            zero = MINIMAL_STD_POINTER_TOP_BITS_ZERO,
+            ones = MINIMAL_STD_POINTER_TOP_BITS_ONES,
+            sign_extend_47 = MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47
+        };
+
+        inline constexpr pointer_top_bits default_pointer_top_bits = static_cast<pointer_top_bits>(MINIMAL_STD_POINTER_TOP_BITS);
+
+        template <typename T, typename CounterT = uint16_t, pointer_top_bits TOP_BITS = default_pointer_top_bits>
         struct tagged_ptr
         {
             using pointer = T *;
@@ -39,17 +53,30 @@ namespace MINIMAL_STD_NAMESPACE
                 return (static_cast<storage_type>(counter) << POINTER_BITS) | (p & POINTER_MASK);
             }
 
+            //  sign_extend_47 needs bit 47 in the stored pointer, so the counter may displace at most 16 bits
+            static_assert((TOP_BITS != pointer_top_bits::sign_extend_47) || (POINTER_BITS >= 48), "sign_extend_47 needs a counter of at most 16 bits");
+
+            static constexpr uintptr_t restore_top_bits(uintptr_t raw)
+            {
+                if constexpr (TOP_BITS == pointer_top_bits::ones)
+                {
+                    return raw | static_cast<uintptr_t>(~POINTER_MASK);
+                }
+                else if constexpr (TOP_BITS == pointer_top_bits::sign_extend_47)
+                {
+                    //  Canonical AArch64 / x86-64 48-bit addresses: the top bits copy bit 47
+
+                    return (raw & (uintptr_t{1} << 47)) ? (raw | static_cast<uintptr_t>(~POINTER_MASK)) : raw;
+                }
+                else
+                {
+                    return raw;
+                }
+            }
+
             static constexpr pointer unpack_ptr(storage_type value)
             {
-                uintptr_t raw = static_cast<uintptr_t>(value & POINTER_MASK);
-                // Sign-extend from bit 47 for AArch64 canonical addresses
-#ifndef __MINIMAL_STD_TEST__
-                if (raw & (1ULL << 47))
-                {
-                    raw |= ~POINTER_MASK;
-                }
-#endif
-                return reinterpret_cast<pointer>(raw);
+                return reinterpret_cast<pointer>(restore_top_bits(static_cast<uintptr_t>(value & POINTER_MASK)));
             }
 
             static constexpr counter_type unpack_counter(storage_type value)
