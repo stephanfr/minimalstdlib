@@ -215,7 +215,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, CurrentAllocatedIsTrackedOnTemplate
 
 TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanceWindowAtTen)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 512;
     constexpr size_t NUM_BLOCKS = 10;
@@ -254,7 +256,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanc
 
 TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataCountStable)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 1024;
     constexpr size_t NUM_BLOCKS = 10;
@@ -299,7 +303,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataC
 
 TEST(LockfreeSingleArenaMemoryResourceTests, LargePendingBatchDrainsAndOpensMultipleMaintenanceWindows)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 512;
     constexpr size_t NUM_BLOCKS = 100;
@@ -325,7 +331,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, LargePendingBatchDrainsAndOpensMult
 
 TEST(LockfreeSingleArenaMemoryResourceTests, TailFreeingRestoresFrontierAfterMaintenance)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 2048;
     constexpr size_t NUM_BLOCKS = 20;
@@ -1112,7 +1120,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, MetadataTrimStress)
     //  Repeatedly exhaust and release all blocks to stress the metadata trim
     //  path.  Metadata count should remain bounded.
 
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 2048;
     constexpr size_t NUM_BLOCKS = 500;
