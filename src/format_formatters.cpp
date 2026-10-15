@@ -41,6 +41,7 @@ namespace FMT_FORMATTERS_NAMESPACE
         size_t fraction_start = 0; //  digits[fraction_start..length) follow the integer zeros
         size_t integer_zeros = 0;  //  zeros at the end of the integer part
         size_t trailing_zeros = 0; //  zeros at the end of the fraction
+        bool finite = true;        //  inf and nan are padded with spaces, never zeros
 
         void push_back(char c)
         {
@@ -117,6 +118,21 @@ namespace FMT_FORMATTERS_NAMESPACE
     //  Function to align, pad and emit a rendered number
     //
 
+    //
+    //  Appends a character count times, but no more than the buffer can still hold: a width or precision near
+    //      UINT32_MAX would otherwise loop billions of times on a full buffer.
+    //
+
+    void AppendRepeated(minstd::string &buffer, char c, size_t count)
+    {
+        const size_t room = (buffer.max_size() > buffer.size()) ? buffer.max_size() - buffer.size() : 0;
+
+        for (size_t i = minstd::min(count, room); i > 0; i--)
+        {
+            buffer.push_back(c);
+        }
+    }
+
     void EmitNumber(minstd::string &buffer, const numeric_text &number, const arg_format_options &format)
     {
         const size_t sign_length = strnlen(number.sign, 2);
@@ -132,9 +148,13 @@ namespace FMT_FORMATTERS_NAMESPACE
         {
             const size_t fill_count = format.width().value() - number_length;
 
-            if (format.is_zero_fill())
+            if (format.is_zero_fill() && number.finite)
             {
                 zero_fill = fill_count;
+            }
+            else if (format.is_zero_fill() || format.is_right_aligned())
+            {
+                fill_before = fill_count; //  zero fill does not apply to inf and nan, which pad with spaces
             }
             else if (format.is_center_aligned())
             {
@@ -151,20 +171,14 @@ namespace FMT_FORMATTERS_NAMESPACE
             }
         }
 
-        const char fill = format.fill().has_value() ? format.fill().value() : ' ';
+        const char fill = (format.fill().has_value() && !format.is_zero_fill()) ? format.fill().value() : ' ';
 
-        for (size_t i = 0; i < fill_before; i++)
-        {
-            buffer.push_back(fill);
-        }
+        AppendRepeated(buffer, fill, fill_before);
 
         buffer += number.sign;
         buffer += number.prefix;
 
-        for (size_t i = 0; i < zero_fill; i++)
-        {
-            buffer.push_back('0');
-        }
+        AppendRepeated(buffer, '0', zero_fill);
 
         const size_t fraction_start = number.fraction_start > 0 ? number.fraction_start : number.length;
 
@@ -173,25 +187,16 @@ namespace FMT_FORMATTERS_NAMESPACE
             buffer.push_back(number.digits[i]);
         }
 
-        for (size_t i = 0; i < number.integer_zeros; i++)
-        {
-            buffer.push_back('0');
-        }
+        AppendRepeated(buffer, '0', number.integer_zeros);
 
         for (size_t i = fraction_start; i < number.length; i++)
         {
             buffer.push_back(number.digits[i]);
         }
 
-        for (size_t i = 0; i < number.trailing_zeros; i++)
-        {
-            buffer.push_back('0');
-        }
+        AppendRepeated(buffer, '0', number.trailing_zeros);
 
-        for (size_t i = 0; i < fill_after; i++)
-        {
-            buffer.push_back(fill);
-        }
+        AppendRepeated(buffer, fill, fill_after);
     }
 
     //
@@ -227,11 +232,16 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         numeric_text number;
 
-        //  NaN compares unequal to itself.  It has no sign we can rely on, so print it bare.
+        //  The sign bit, not value < 0, so -0.0 and -nan keep their sign as they do in std::format
+
+        const bool is_negative = __builtin_signbit(value);
+
+        //  NaN compares unequal to itself
 
         if (value != value)
         {
-            number.sign = DetermineSign(false, format);
+            number.sign = DetermineSign(is_negative, format);
+            number.finite = false;
             number.push_back('n');
             number.push_back('a');
             number.push_back('n');
@@ -240,13 +250,13 @@ namespace FMT_FORMATTERS_NAMESPACE
             return;
         }
 
-        const bool is_negative = value < 0;
         const double magnitude = is_negative ? -(double)value : (double)value;
 
         number.sign = DetermineSign(is_negative, format);
 
         if (magnitude > 1.7976931348623157e308)
         {
+            number.finite = false;
             number.push_back('i');
             number.push_back('n');
             number.push_back('f');
@@ -256,24 +266,48 @@ namespace FMT_FORMATTERS_NAMESPACE
         }
 
         const uint32_t precision = format.precision().has_value() ? format.precision().value() : 0;
-        const uint32_t computed_digits = minstd::min(precision, (uint32_t)8);
 
-        const uint64_t decimal_multiplier = pow10[computed_digits];
+        //  Below 2^64 the integer part fits a uint64_t and the fraction (magnitude - units) is exact, so the
+        //      decimals come from the fraction alone: the integer part takes no rounding error however large it
+        //      is.  A double carries about 17 significant digits, so up to 17 decimals are computed and any
+        //      further ones are zeros.
 
-        //  Round to the requested precision in one integer, when it fits in one.  1.8e19 is just under 2^64.
-
-        if (magnitude < 1.8e19 / (double)decimal_multiplier)
+        if (magnitude < 18446744073709551616.0)
         {
-            const uint64_t total = (uint64_t)(magnitude * (double)decimal_multiplier + 0.5);
+            static uint64_t const pow10[] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
+                                             100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
+                                             1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+                                             1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL};
 
-            AppendDigits(number, total / decimal_multiplier, 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
+            const uint32_t computed_digits = minstd::min(precision, (uint32_t)17);
+            const uint64_t decimal_multiplier = pow10[computed_digits];
+
+            uint64_t units = (uint64_t)magnitude;
+            const double fraction = magnitude - (double)units;
+
+            const double scaled = fraction * (double)decimal_multiplier;
+            uint64_t decimals = (uint64_t)scaled;
+            const double remainder = scaled - (double)decimals;
+
+            //  Round half to even, as std::format does for an exact tie (2.5 -> "2", 0.125 -> "0.12")
+
+            const uint64_t last_digit = (computed_digits > 0) ? decimals : units;
+
+            if ((remainder > 0.5) || ((remainder == 0.5) && ((last_digit & 1) != 0)))
+            {
+                if (++decimals == decimal_multiplier)
+                {
+                    decimals = 0;
+                    units++; //  cannot wrap: doubles this close to 2^64 have no fraction
+                }
+            }
+
+            AppendDigits(number, units, 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
 
             if (precision > 0)
             {
                 number.fraction_start = number.length;
                 number.push_back('.');
-
-                const uint64_t decimals = total % decimal_multiplier;
 
                 for (uint32_t i = computed_digits; i > 0; i--)
                 {
@@ -426,17 +460,11 @@ namespace FMT_FORMATTERS_NAMESPACE
             }
         }
 
-        for (size_t i = 0; i < fill_before_count; i++)
-        {
-            buffer.push_back(format_options.fill().value());
-        }
+        AppendRepeated(buffer, format_options.fill().value(), fill_before_count);
 
         buffer.append(value, length);
 
-        for (size_t i = 0; i < fill_after_count; i++)
-        {
-            buffer.push_back(format_options.fill().value());
-        }
+        AppendRepeated(buffer, format_options.fill().value(), fill_after_count);
     }
 
     //

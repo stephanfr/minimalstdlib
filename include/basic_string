@@ -130,6 +130,13 @@ namespace MINIMAL_STD_NAMESPACE
             return buffer_;
         }
 
+        //  The most characters the string can hold
+
+        size_t max_size() const
+        {
+            return max_size_;
+        }
+
         size_t size() const
         {
             return length_;
