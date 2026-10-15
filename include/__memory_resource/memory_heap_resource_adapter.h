@@ -25,6 +25,14 @@ namespace MINIMAL_STD_NAMESPACE
             void *do_allocate(size_t bytes, size_t alignment) override
             {
                 size_t effective_alignment = alignment == 0 ? 1 : alignment;
+
+                //  Rounding up to whole elements would wrap for a size this close to SIZE_MAX
+
+                if (bytes > SIZE_MAX - (effective_alignment - 1))
+                {
+                    return nullptr;
+                }
+
                 size_t element_count = (bytes + effective_alignment - 1) / effective_alignment;
 
                 uint8_t *block = heap_.allocate_block<uint8_t>(element_count, effective_alignment);
@@ -44,7 +52,7 @@ namespace MINIMAL_STD_NAMESPACE
             void do_deallocate(void *block, size_t bytes, size_t alignment) override
             {
                 size_t effective_alignment = alignment == 0 ? 1 : alignment;
-                size_t element_count = (bytes + effective_alignment - 1) / effective_alignment;
+                size_t element_count = (bytes > SIZE_MAX - (effective_alignment - 1)) ? 0 : (bytes + effective_alignment - 1) / effective_alignment;
 
                 heap_.deallocate_block(reinterpret_cast<uint8_t *>(block), element_count);
             }

@@ -86,6 +86,13 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 const size_t effective_alignment = (alignment > DEFAULT_ALIGNMENT) ? alignment : DEFAULT_ALIGNMENT;
 
+                //  Both paths add the header and alignment to the size, so a request that close to SIZE_MAX would wrap
+
+                if (bytes > SIZE_MAX - BLOCK_HEADER_SIZE - effective_alignment)
+                {
+                    return nullptr;
+                }
+
                 //  If the total number of deallocations is greater than 10% of the total number of allocations, then
                 //      Try to re-use some released blocks before allocating a new block.
 
@@ -184,7 +191,9 @@ namespace MINIMAL_STD_NAMESPACE
                     const uintptr_t returned_int = (uintptr_t)returned_pointer;
                     const uintptr_t end_int = (uintptr_t)end_of_block_;
 
-                    if ((returned_int >= end_int) || (bytes > (end_int - returned_int) - DEFAULT_ALIGNMENT))
+                    if ((returned_int >= end_int) ||
+                        ((end_int - returned_int) < DEFAULT_ALIGNMENT) ||
+                        (bytes > (end_int - returned_int) - DEFAULT_ALIGNMENT))
                     {
                         break;
                     }

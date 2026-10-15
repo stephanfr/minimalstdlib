@@ -462,6 +462,8 @@ namespace MINIMAL_STD_NAMESPACE
                           "max_waste_percent must be in the range [1, 25]");
             static_assert(max_bin_bytes >= 1024,
                           "max_bin_bytes must be at least 1024 bytes");
+            static_assert(max_bin_bytes < (size_t{1} << 32),
+                          "max_bin_bytes must be below 4 GiB: block sizes are kept in 32-bit metadata fields");
 
             static constexpr size_t MIN_BIN_BYTES = DEFAULT_ALIGNMENT;
             static constexpr size_t MAX_BIN_BYTES = max_bin_bytes;
@@ -604,7 +606,9 @@ namespace MINIMAL_STD_NAMESPACE
                           "Uniform bin policy must generate at least two non-sentinel bins");
 
         public:
-            static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL;
+            //  The largest request that can succeed: the biggest bin also holds the allocation header
+
+            static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL - ALLOCATION_HEADER_SIZE;
 
         private:
             const void *const block_;   //  first DEFAULT_ALIGNMENT boundary of the caller's block
@@ -746,7 +750,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             uint64_t free_block_bin_index(size_t bytes) const
             {
-                if (bytes > MAX_ALLOCATION_SIZE)
+                if (bytes > MAX_ALLOCATION_SIZE_INTERNAL)
                 {
                     return NUM_FREE_BLOCK_BINS - 1;
                 }
@@ -1192,7 +1196,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 uint64_t total_size = internal::lockfree_aligned_size(bytes + ALLOCATION_HEADER_SIZE, DEFAULT_ALIGNMENT);
 
-                if (total_size > MAX_ALLOCATION_SIZE)
+                if (total_size > MAX_ALLOCATION_SIZE_INTERNAL)
                 {
                     return nullptr;
                 }
@@ -1338,6 +1342,13 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool do_try_deallocate(void *block, size_t bytes, size_t alignment)
             {
+                //  Freeing nothing is a no-op; there is no header in front of nullptr to read
+
+                if (block == nullptr)
+                {
+                    return true;
+                }
+
                 extended_metrics_sync_guard sync_guard{*this};
 
                 //  Insure that the block is valid and in use.
@@ -1399,7 +1410,10 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                 {
-                    extensions::memory_resource_statistics::deallocation_made(bytes);
+                    //  Count the size the block was allocated with, not the caller's claim, so a mismatched size
+                    //      cannot make the statistics drift
+
+                    extensions::memory_resource_statistics::deallocation_made(block_to_deallocate->requested_size_.load(memory_order_relaxed));
                 }
 
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)

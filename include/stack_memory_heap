@@ -23,6 +23,6 @@ namespace MINIMAL_STD_NAMESPACE
 
     private :
 
-        char heap_[FIXED_SIZE]; //  Storage on the stack
+        alignas(ALIGNMENT) char heap_[FIXED_SIZE]; //  Storage on the stack, aligned as the heap promises its blocks
     };
 }

@@ -15,8 +15,12 @@
 #include <__memory_resource/lockfree_static_arena_resource.h>
 #include <__memory_resource/malloc_free_wrapper_memory_resource.h>
 #include <__memory_resource/monotonic_buffer_resource.h>
+#include <__memory_resource/memory_heap_resource_adapter.h>
 #include <__memory_resource/single_block_resource.h>
+#include <__memory_resource/tracking_memory_resource.h>
+#include <__memory_resource/__extensions/memory_resource_statistics.h>
 #include <single_block_memory_heap>
+#include <stack_memory_heap>
 
 #include "../shared/process_isolation.h"
 
@@ -332,4 +336,162 @@ TEST(MemoryResourceLimitsTests, MonotonicBufferSurvivesUpstreamExhaustion)
                                                                  });
 
     CHECK_TRUE(completed);
+}
+
+TEST(MemoryResourceLimitsTests, SingleBlockResourceNearlyFullRejectsRequestsThatWouldWrap)
+{
+    //  The remaining-space check subtracted the alignment from the space left; with under 16 bytes left that wrapped,
+    //      and a near-SIZE_MAX request was granted and moved the bump pointer backwards.  Try every tail size.
+    alignas(64) static char block[512];
+
+    for (size_t size = 96; size <= sizeof(block); size++)
+    {
+        minstd::pmr::single_block_resource resource(block, size);
+
+        while (resource.allocate(16) != nullptr)
+        {
+        }
+
+        for (size_t k = 0; k < 256; k++)
+        {
+            POINTERS_EQUAL(nullptr, resource.allocate(SIZE_MAX - k));
+        }
+    }
+}
+
+TEST(MemoryResourceLimitsTests, SingleBlockResourceReusePathRejectsRequestsThatWouldWrap)
+{
+    //  With enough frees the resource searches its free lists first; bytes + header wrapped there and matched a
+    //      small freed block.
+    alignas(64) static char block[64 * 1024];
+    minstd::pmr::single_block_resource resource(block, sizeof(block));
+
+    void *blocks[8];
+
+    for (auto &b : blocks)
+    {
+        b = resource.allocate(64);
+        CHECK(b != nullptr);
+    }
+
+    for (auto &b : blocks)
+    {
+        resource.deallocate(b, 64);
+    }
+
+    for (size_t k = 0; k < 128; k++)
+    {
+        POINTERS_EQUAL(nullptr, resource.allocate(SIZE_MAX - k));
+    }
+}
+
+TEST(MemoryResourceLimitsTests, MonotonicBufferFastPathRejectsRequestsThatWouldWrap)
+{
+    //  padding + bytes wrapped on the fast path, so a near-SIZE_MAX request was granted from the current buffer.
+    alignas(16) static char buffer[1024];
+    minstd::pmr::monotonic_buffer_resource resource(buffer, sizeof(buffer), nullptr);
+
+    CHECK(resource.allocate(8, 8) != nullptr); //  the next free byte is now 8 mod 16
+
+    for (size_t k = 0; k < 32; k++)
+    {
+        POINTERS_EQUAL(nullptr, resource.allocate(SIZE_MAX - k, 16));
+    }
+
+    //  Alignments the mask arithmetic cannot handle are refused rather than producing garbage
+
+    POINTERS_EQUAL(nullptr, resource.allocate(16, 0));
+    POINTERS_EQUAL(nullptr, resource.allocate(16, 24));
+
+    void *p = resource.allocate(16, 16);
+    CHECK(p != nullptr);
+    CHECK(inside(p, buffer, sizeof(buffer)));
+}
+
+TEST(MemoryResourceLimitsTests, HeapAdapterRejectsRequestsThatWouldWrap)
+{
+    //  Rounding bytes up to whole elements wrapped to zero elements, and the heap returned a header-only block.
+    alignas(64) static char heap_buffer[16 * 1024];
+    minstd::single_block_memory_heap heap(heap_buffer, sizeof(heap_buffer), 16);
+    minstd::pmr::memory_heap_resource_adapter resource(heap);
+
+    for (size_t k = 0; k < 16; k++)
+    {
+        POINTERS_EQUAL(nullptr, resource.allocate(SIZE_MAX - k, 16));
+    }
+
+    CHECK_EQUAL(0, heap.bytes_in_use());
+}
+
+TEST(MemoryResourceLimitsTests, StackMemoryHeapHonoursItsAlignment)
+{
+    //  The storage followed the base class's fields with no alignment of its own, so blocks were not aligned as the
+    //      ALIGNMENT parameter promised.
+    struct holder
+    {
+        char misalign;
+        minstd::stack_memory_heap<4096, 64> heap;
+    };
+
+    static holder h;
+
+    CHECK_EQUAL(64u, alignof(minstd::stack_memory_heap<4096, 64>)); //  before: 8, whatever the heap promised
+
+    for (size_t i = 0; i < 4; i++)
+    {
+        char *block = h.heap.allocate_block<char>(10 + i);
+        CHECK(block != nullptr);
+        CHECK_EQUAL(0u, reinterpret_cast<uintptr_t>(block) % 64);
+    }
+}
+
+TEST(MemoryResourceLimitsTests, TrackingResourceIgnoresDeallocateOfNull)
+{
+    minstd::pmr::malloc_free_wrapper_memory_resource upstream;
+    minstd::pmr::tracking_memory_resource resource(&upstream);
+
+    resource.deallocate(nullptr, 64); //  before: bytes_in_use wrapped below zero
+
+    CHECK_EQUAL(0u, resource.bytes_in_use());
+    CHECK_EQUAL(0u, resource.deallocation_count());
+}
+
+namespace
+{
+    using small_bin_arena_type = minstd::pmr::lockfree_single_arena_resource_impl<minstd::platform::default_interrupt_policy,
+                                                                                  minstd::platform::default_platform_provider,
+                                                                                  64 * 1024,
+                                                                                  5,
+                                                                                  128,
+                                                                                  minstd::pmr::extensions::memory_resource_statistics>;
+}
+
+TEST(MemoryResourceLimitsTests, SingleArenaBoundaryBehaviour)
+{
+    constexpr size_t ARENA_BYTES = 4 * 1024 * 1024;
+    char *arena = static_cast<char *>(aligned_alloc(4096, ARENA_BYTES));
+
+    {
+        small_bin_arena_type resource(arena, ARENA_BYTES);
+
+        //  MAX_ALLOCATION_SIZE is now a size that can succeed (it used to leave no room for the header)
+
+        void *largest = resource.allocate(small_bin_arena_type::MAX_ALLOCATION_SIZE, 16);
+        CHECK(largest != nullptr);
+        POINTERS_EQUAL(nullptr, resource.allocate(small_bin_arena_type::MAX_ALLOCATION_SIZE + 1, 16));
+        resource.deallocate(largest, small_bin_arena_type::MAX_ALLOCATION_SIZE, 16);
+
+        //  deallocate(nullptr) read a header at address -64
+
+        resource.deallocate(nullptr, 64, 16);
+
+        //  The statistics count the size the block was allocated with, not the caller's claim
+
+        void *p = resource.allocate(100, 16);
+        CHECK(p != nullptr);
+        resource.deallocate(p, 50, 16);
+        CHECK_EQUAL(0u, resource.current_bytes_allocated());
+    }
+
+    free(arena);
 }

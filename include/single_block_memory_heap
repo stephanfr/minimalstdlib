@@ -27,6 +27,10 @@ namespace MINIMAL_STD_NAMESPACE
               minimum_size_block_for_split_(header_size_ + aligned_size(sizeof(uint32_t))),
               current_end_(static_cast<char *>(location))
         {
+            //  Blocks are rounded to the alignment with a mask, and each starts with a header of size_t fields
+
+            MINIMAL_STD_ASSERT((block_alignment != 0) && ((block_alignment & (block_alignment - 1)) == 0));
+            MINIMAL_STD_ASSERT(block_alignment >= alignof(block_header));
         }
 
         const size_t max_size() const noexcept
@@ -215,7 +219,9 @@ namespace MINIMAL_STD_NAMESPACE
 
         size_t aligned_size(size_t unaligned_block_size_in_bytes)
         {
-            return (((unaligned_block_size_in_bytes / block_alignment_) + ((unaligned_block_size_in_bytes % block_alignment_) == 0 ? 0 : 1)) * block_alignment_);
+            const size_t alignment = (block_alignment_ != 0) ? block_alignment_ : 1; //  0 is reported by the constructor
+
+            return (((unaligned_block_size_in_bytes / alignment) + ((unaligned_block_size_in_bytes % alignment) == 0 ? 0 : 1)) * alignment);
         }
 
         void *search_for_unused_block(size_t block_size_in_bytes, size_t num_elements_in_block)

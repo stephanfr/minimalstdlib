@@ -89,6 +89,13 @@ namespace MINIMAL_STD_NAMESPACE
                     return nullptr;
                 }
 
+                //  The alignment arithmetic below needs a power of two
+
+                if ((alignment == 0) || ((alignment & (alignment - 1)) != 0))
+                {
+                    return nullptr;
+                }
+
                 // Align the current buffer pointer to the requested alignment
                 size_t padding = 0;
                 if (current_buffer_ != nullptr)
@@ -97,7 +104,7 @@ namespace MINIMAL_STD_NAMESPACE
                     uintptr_t aligned_ptr = (current_ptr + alignment - 1) & ~(alignment - 1);
                     padding = aligned_ptr - current_ptr;
 
-                    if (padding + bytes <= current_buffer_size_)
+                    if ((padding <= current_buffer_size_) && (bytes <= current_buffer_size_ - padding)) //  no wrap for huge sizes
                     {
                         void* result = current_buffer_ + padding;
                         current_buffer_ += padding + bytes;
