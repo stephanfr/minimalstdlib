@@ -71,4 +71,89 @@ namespace
         CHECK_EQUAL( value(sixty), 60 );
         CHECK_EQUAL( fifth(sixty), 12 );
     }
+
+    struct counted_functor
+    {
+        int id;
+
+        explicit counted_functor(int functor_id)
+            : id(functor_id)
+        {
+            live++;
+        }
+
+        counted_functor(const counted_functor &other)
+            : id(other.id)
+        {
+            live++;
+        }
+
+        ~counted_functor()
+        {
+            live--;
+        }
+
+        int operator()() const
+        {
+            return id;
+        }
+
+        inline static int live = 0;
+    };
+
+    TEST(FunctionTests, AssignmentDestroysTheOldFunctorAndCopiesTheNewOne)
+    {
+        //  There was no assignment operator: the implicit one copied the stored functor bytewise, so the old functor
+        //      was never destroyed and the new one was destroyed twice.
+        counted_functor::live = 0;
+
+        {
+            minstd::function<int()> f(counted_functor(1));
+            minstd::function<int()> g(counted_functor(2));
+            CHECK_EQUAL(2, counted_functor::live);
+
+            f = g;
+            CHECK_EQUAL(2, f());
+            CHECK_EQUAL(2, g());
+            CHECK_EQUAL(2, counted_functor::live); //  f's old functor destroyed, a copy of g's constructed
+
+            f = minstd::function<int()>(counted_functor(3));
+            CHECK_EQUAL(3, f());
+            CHECK_EQUAL(2, counted_functor::live);
+
+            f = f;
+            CHECK_EQUAL(3, f());
+            CHECK_EQUAL(2, counted_functor::live);
+
+            minstd::function<int()> empty;
+            f = empty;
+            CHECK_FALSE(static_cast<bool>(f));
+            CHECK_EQUAL(1, counted_functor::live);
+        }
+
+        CHECK_EQUAL(0, counted_functor::live);
+    }
+
+    TEST(FunctionTests, ByValueSignatureAcceptsLvalues)
+    {
+        minstd::function<int(int)> twice = [](int x) { return 2 * x; };
+        int argument = 21;
+        CHECK_EQUAL(42, twice(argument)); //  operator()(Args&&...) rejected lvalues
+    }
+
+    TEST(FunctionTests, StorageIsAlignedForAnyFunctor)
+    {
+        struct alignas(16) aligned_capture
+        {
+            long double value;
+
+            long double operator()() const
+            {
+                return value;
+            }
+        };
+
+        minstd::function<long double()> f = aligned_capture{2.5L};
+        CHECK(f() == 2.5L);
+    }
 }

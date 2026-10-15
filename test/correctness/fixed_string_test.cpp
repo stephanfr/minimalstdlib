@@ -386,4 +386,53 @@ namespace
         CHECK_EQUAL(6u, partial.length());
         STRCMP_EQUAL("abcdef", partial.c_str());
     }
+
+    TEST(FixedStringTests, AppendAndAssignFromItself)
+    {
+        //  The copy was a strlcpy between overlapping ranges.
+        minstd::fixed_string<64> s("ab");
+        s += s;
+        CHECK_EQUAL(4u, s.size());
+        STRCMP_EQUAL("abab", s.c_str());
+
+        s = s.c_str() + 1;
+        CHECK_EQUAL(3u, s.size());
+        STRCMP_EQUAL("bab", s.c_str());
+
+        s.append(s.c_str(), 2);
+        STRCMP_EQUAL("babba", s.c_str());
+    }
+
+    TEST(FixedStringTests, AppendReadsNoFurtherThanItsLength)
+    {
+        //  append(value, length) tested value[length] before the count, so it read one past the range.
+        const char unterminated[4] = {'x', 'y', 'z', '!'};
+        minstd::fixed_string<64> s("a");
+        s.append(unterminated, 3);
+        CHECK_EQUAL(4u, s.size());
+        STRCMP_EQUAL("axyz", s.c_str());
+    }
+
+    TEST(FixedStringTests, NposLengthCopiesTheWholeString)
+    {
+        //  length + 1 wrapped to 0 for npos, so nothing was copied and the buffer was left unterminated.
+        minstd::fixed_string<64> s("hello", minstd::fixed_string<64>::npos);
+        CHECK_EQUAL(5u, s.size());
+        STRCMP_EQUAL("hello", s.c_str());
+    }
+
+    TEST(FixedStringTests, AssignmentFromALongerStringIsClipped)
+    {
+        minstd::fixed_string<8> small;
+        minstd::fixed_string<64> long_string("0123456789abcdef");
+
+        small = long_string;
+        CHECK_EQUAL(8u, small.size());
+        STRCMP_EQUAL("01234567", small.c_str());
+
+        minstd::string &as_base = small;
+        as_base = long_string;
+        CHECK_EQUAL(8u, small.size());
+        STRCMP_EQUAL("01234567", small.c_str());
+    }
 }

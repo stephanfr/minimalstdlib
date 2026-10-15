@@ -70,11 +70,14 @@ namespace MINIMAL_STD_NAMESPACE
 
         unique_ptr &operator=(const unique_ptr &pointer_to_copy) = delete;
 
+        //  Take the new object before destroying the old one: the source may be owned by the old object (for example
+        //      head = move(head->next)), and destroying first would free it before it is read.
+
         unique_ptr &operator=(unique_ptr &&pointer_to_move)
         {
             if (this != &pointer_to_move)
             {
-                destroy_wrapped_pointer();
+                unique_ptr previous(minstd::move(*this));
                 take_from(pointer_to_move);
             }
 
@@ -87,13 +90,13 @@ namespace MINIMAL_STD_NAMESPACE
             requires is_convertible_v<U *, T *>
         unique_ptr &operator=(unique_ptr<U> &&other)
         {
-            destroy_wrapped_pointer();
+            unique_ptr previous(minstd::move(*this));
             take_from(other);
 
             return *this;
         }
 
-        operator bool() const
+        explicit operator bool() const
         {
             return wrapped_pointer_ != nullptr;
         }

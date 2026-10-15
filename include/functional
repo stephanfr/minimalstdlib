@@ -12,7 +12,10 @@
 #include "__functional/unary_function.h"
 #include "__functional/weak_result_type.h"
 
+#include "new"
 #include "type_traits"
+
+#include <stddef.h>
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -33,13 +36,15 @@ namespace MINIMAL_STD_NAMESPACE
         }
 
         template <typename Functor>
+            requires(!is_same_v<remove_cvref_t<Functor>, function>)
         function(Functor f)
-            : invoke_(reinterpret_cast<InvocationFunctionType>(invoke_function<Functor>)),
-              construct_(reinterpret_cast<ConstructorFunctionType>(construct_function<Functor>)),
-              destroy_(reinterpret_cast<DestructorFunctionType>(destroy_function<Functor>)),
+            : invoke_(invoke_function<Functor>),
+              construct_(construct_function<Functor>),
+              destroy_(destroy_function<Functor>),
               buffer_size_(sizeof(Functor))
         {
-            static_assert(MAX_FUNCTOR_SIZE > sizeof(Functor));
+            static_assert(MAX_FUNCTOR_SIZE >= sizeof(Functor), "functor too large for this function's storage");
+            static_assert(alignof(Functor) <= alignof(max_align_t), "functor alignment exceeds max_align_t");
 
             //  Save the functor
 
@@ -58,18 +63,57 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
+        //  The stored functor is copy-constructed, so a move is a copy (the source is left as it was).
+
+        function(function &&rhs)
+            : function(static_cast<function const &>(rhs))
+        {
+        }
+
+        //  Assignment destroys the stored functor and copy-constructs the new one: a byte copy (the implicit
+        //      operator) would destroy a bit-copied object twice and never destroy the old one.
+
+        function &operator=(function const &rhs)
+        {
+            if (this != &rhs)
+            {
+                reset();
+
+                invoke_ = rhs.invoke_;
+                construct_ = rhs.construct_;
+                destroy_ = rhs.destroy_;
+                buffer_size_ = rhs.buffer_size_;
+
+                if (invoke_)
+                {
+                    construct_(storage_buffer_, const_cast<char *>(rhs.storage_buffer_));
+                }
+            }
+
+            return *this;
+        }
+
+        function &operator=(function &&rhs)
+        {
+            return *this = static_cast<function const &>(rhs);
+        }
+
         ~function()
         {
-            if (destroy_ != nullptr)
-            {
-                destroy_(storage_buffer_);
-            }
+            reset();
+        }
+
+        explicit operator bool() const noexcept
+        {
+            return invoke_ != nullptr;
         }
 
         // other constructors, from nullptr, from function pointers
 
-        ReturnType operator()(Args &&...args)
+        ReturnType operator()(Args... args)
         {
+            MINIMAL_STD_ASSERT(invoke_ != nullptr); //  calling an empty function
+
             return this->invoke_(this->storage_buffer_, minstd::forward<Args>(args)...);
         }
 
@@ -85,30 +129,42 @@ namespace MINIMAL_STD_NAMESPACE
         ConstructorFunctionType construct_;
         DestructorFunctionType destroy_;
 
-        char storage_buffer_[MAX_FUNCTOR_SIZE];
+        alignas(max_align_t) char storage_buffer_[MAX_FUNCTOR_SIZE];
         size_t buffer_size_;
 
-        //  Generic methods for invoking the invocation, construction and destrcution functions.
-        //      These are used to wrap the Functor and are then cast to a char array for
-        //      type erasure and stored in the data buffer.
+        void reset()
+        {
+            if (destroy_ != nullptr)
+            {
+                destroy_(storage_buffer_);
+            }
+
+            invoke_ = nullptr;
+            construct_ = nullptr;
+            destroy_ = nullptr;
+            buffer_size_ = 0;
+        }
+
+        //  Type-erased helpers for invoking, constructing and destroying the stored functor.  They take the storage
+        //      as char* and cast inside, so they are always called through their own function type.
 
         template <typename Functor>
-        static ReturnType invoke_function(Functor *fn, Args &&...args)
+        static ReturnType invoke_function(char *fn, Args &&...args)
         {
-            return (*fn)(minstd::forward<Args>(args)...);
+            return (*reinterpret_cast<Functor *>(fn))(minstd::forward<Args>(args)...);
         }
 
         template <typename Functor>
-        static void construct_function(Functor *construct_dst, const Functor *construct_src)
+        static void construct_function(char *construct_dst, char *construct_src)
         {
             // the functor type must be copy-constructible
-            new (construct_dst) Functor(*construct_src);
+            new (construct_dst) Functor(*reinterpret_cast<const Functor *>(construct_src));
         }
 
         template <typename Functor>
-        static void destroy_function(Functor *f)
+        static void destroy_function(char *f)
         {
-            f->~Functor();
+            reinterpret_cast<Functor *>(f)->~Functor();
         }
     };
 }

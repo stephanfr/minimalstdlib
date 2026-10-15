@@ -57,35 +57,32 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
+        //  Assignment goes through basic_string::assign_range(), which grows the buffer keeping its contents, so the
+        //      source may be this string or point into it.
+
         basic_dynamic_string &operator=(const basic_dynamic_string &string_to_copy)
         {
-            size_t new_length = minstd::min(strnlen(string_to_copy.data(), basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
-
-            replace_buffer_if_too_small(new_length);
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
+            if (this != &string_to_copy)
+            {
+                basic_string<T>::assign_range(0, string_to_copy.data(), string_to_copy.length());
+            }
 
             return *this;
         }
 
         basic_dynamic_string &operator=(const basic_string<T> &string_to_copy)
         {
-            size_t new_length = minstd::min(strnlen(string_to_copy.data(), basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
-
-            replace_buffer_if_too_small(new_length);
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
+            if (static_cast<const basic_string<T> *>(this) != &string_to_copy)
+            {
+                basic_string<T>::assign_range(0, string_to_copy.data(), string_to_copy.length());
+            }
 
             return *this;
         }
 
         basic_dynamic_string &operator=(const T *string_to_copy)
         {
-            size_t new_length = minstd::min(strnlen(string_to_copy, basic_string<T>::max_size_ ) + 1, basic_string<T>::max_size_ + 1);
-
-            replace_buffer_if_too_small(new_length);
-
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy, basic_string<T>::buffer_size_ ), basic_string<T>::buffer_size_ - 1);
+            basic_string<T>::assign_range(0, string_to_copy, strnlen(string_to_copy, basic_string<T>::max_size_));
 
             return *this;
         }
@@ -107,30 +104,7 @@ namespace MINIMAL_STD_NAMESPACE
             return buffer;
         }
 
-        //  For assignment: the old contents are discarded, so nothing is copied.  On failure the old buffer is
-        //      kept and the caller copies what fits.
-        void replace_buffer_if_too_small(size_t new_buffer_size)
-        {
-            if (new_buffer_size <= basic_string<T>::buffer_size_)
-            {
-                return;
-            }
-
-            T *new_buffer = allocator_traits_type::allocate(allocator_, new_buffer_size);
-
-            if (new_buffer == nullptr)
-            {
-                MINIMAL_STD_OUT_OF_MEMORY(sizeof(T) * new_buffer_size, alignof(T), return);
-            }
-
-            allocator_traits_type::deallocate(allocator_, basic_string<T>::buffer_, basic_string<T>::buffer_size_);
-
-            basic_string<T>::buffer_ = new_buffer;
-            basic_string<T>::buffer_size_ = new_buffer_size;
-        }
-
-
-        static size_t compute_buffer_size( const char* value, size_t length = DEFAULT_DYNAMIC_STRING_MAX_SIZE)
+        static size_t compute_buffer_size( const char* value, size_t length = MAX_SIZE)
         {
             return compute_buffer_size(strnlen(value, length));
         }
@@ -181,9 +155,12 @@ namespace MINIMAL_STD_NAMESPACE
     template <size_t OTHER_MAX_SIZE>
     basic_string<T> &basic_string<T>::operator=(const basic_dynamic_string<T, OTHER_MAX_SIZE> &string_to_copy)
     {
-        basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.buffer_, basic_string<T>::buffer_size_), basic_string<T>::max_size_);
+        if (static_cast<const basic_string<T> *>(&string_to_copy) == this)
+        {
+            return *this;
+        }
 
-        return *this;
+        return assign_range(0, string_to_copy.data(), string_to_copy.length());
     }
 
     //  Declare a dynamic string class with the char data type

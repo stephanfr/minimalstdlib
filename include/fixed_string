@@ -51,21 +51,34 @@ namespace MINIMAL_STD_NAMESPACE
         template <size_t OTHER_MAX_SIZE>
         basic_fixed_string<T, MAX_SIZE> &operator=(const basic_fixed_string<T, OTHER_MAX_SIZE> &string_to_copy)
         {
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), MAX_SIZE + 1), MAX_SIZE);
+            basic_string<T>::assign_range(0, string_to_copy.data(), string_to_copy.length());
+
+            return *this;
+        }
+
+        basic_fixed_string &operator=(const basic_fixed_string &string_to_copy)
+        {
+            if (this != &string_to_copy)
+            {
+                basic_string<T>::assign_range(0, string_to_copy.data(), string_to_copy.length());
+            }
 
             return *this;
         }
 
         basic_fixed_string &operator=(const basic_string<T> &string_to_copy)
         {
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.data(), MAX_SIZE + 1), MAX_SIZE);
+            if (static_cast<const basic_string<T> *>(this) != &string_to_copy)
+            {
+                basic_string<T>::assign_range(0, string_to_copy.data(), string_to_copy.length());
+            }
 
             return *this;
         }
 
         basic_fixed_string &operator=(const T *string_to_copy)
         {
-            basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy, MAX_SIZE + 1), MAX_SIZE);
+            basic_string<T>::assign_range(0, string_to_copy, strnlen(string_to_copy, MAX_SIZE));
 
             return *this;
         }
@@ -88,9 +101,12 @@ namespace MINIMAL_STD_NAMESPACE
     template <size_t OTHER_MAX_SIZE>
     basic_string<T> &basic_string<T>::operator=(const basic_fixed_string<T, OTHER_MAX_SIZE> &string_to_copy)
     {
-        basic_string<T>::length_ = minstd::min(strlcpy(basic_string<T>::buffer_, string_to_copy.buffer_, basic_string<T>::buffer_size_), basic_string<T>::max_size_);
+        if (static_cast<const basic_string<T> *>(&string_to_copy) == this)
+        {
+            return *this;
+        }
 
-        return *this;
+        return assign_range(0, string_to_copy.data(), string_to_copy.length());
     }
 
     //  Declare a fixed string class with the char data type
