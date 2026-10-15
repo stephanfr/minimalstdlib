@@ -292,3 +292,31 @@ namespace
     }
 
 } // anonymous namespace
+
+//  The integer types without a fixed-width typedef fell back to the unspecialised template (digits 0, max 0).
+TEST_GROUP(NumericLimitsOtherIntegerTypes)
+{
+};
+
+TEST(NumericLimitsOtherIntegerTypes, LongLongAndCharacterTypes)
+{
+    CHECK_EQUAL(64, minstd::numeric_limits<unsigned long long>::digits);
+    CHECK(minstd::numeric_limits<unsigned long long>::max() == 18446744073709551615ULL);
+    CHECK(minstd::numeric_limits<long long>::max() == 9223372036854775807LL);
+    CHECK(minstd::numeric_limits<long long>::min() == (-9223372036854775807LL - 1));
+    CHECK_TRUE(minstd::numeric_limits<long long>::is_specialized);
+    CHECK_TRUE(minstd::numeric_limits<unsigned long long>::is_modulo);
+
+    CHECK_EQUAL(static_cast<int>(__SCHAR_MAX__ == 127 ? 127 : 0), static_cast<int>(minstd::numeric_limits<signed char>::max()));
+    CHECK_EQUAL(65535, static_cast<int>(minstd::numeric_limits<char16_t>::max()));
+    CHECK(minstd::numeric_limits<char32_t>::max() == 4294967295u);
+    CHECK_TRUE(minstd::numeric_limits<char>::is_specialized);
+    CHECK_EQUAL(minstd::numeric_limits<char>::is_signed ? 127 : 255, static_cast<int>(minstd::numeric_limits<char>::max()));
+
+    CHECK_TRUE(minstd::numeric_limits<bool>::max());
+    CHECK_FALSE(minstd::numeric_limits<bool>::min());
+    CHECK_EQUAL(1, minstd::numeric_limits<bool>::digits);
+
+    CHECK_EQUAL(32, minstd::numeric_limits<const unsigned int>::digits);
+    CHECK(minstd::numeric_limits<long double>::max() > 0.0L);
+}

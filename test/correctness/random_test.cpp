@@ -77,3 +77,87 @@ namespace
         }
     }
 }
+
+namespace
+{
+    //  A 32-bit engine (xorshift), narrower than a 64-bit distribution range.
+    struct engine32
+    {
+        using result_type = uint32_t;
+        static constexpr result_type min() { return 0; }
+        static constexpr result_type max() { return 0xFFFFFFFFu; }
+
+        uint64_t state = 88172645463325252ULL;
+
+        result_type operator()()
+        {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return static_cast<uint32_t>(state);
+        }
+    };
+}
+
+TEST_GROUP(RandomWideRanges)
+{
+};
+
+TEST(RandomWideRanges, NarrowEngineCoversAWideRange)
+{
+    //  The rejection threshold assumed the engine was at least as wide as the range: (0, 2^40) returned only
+    //      values in [4278190080, 2^32), and (0, 2^64 - 2) never returned.
+    engine32 engine;
+    minstd::uniform_int_distribution<uint64_t> wide(0, uint64_t{1} << 40);
+
+    uint64_t smallest = UINT64_MAX;
+    uint64_t largest = 0;
+    size_t above_32_bits = 0;
+
+    for (int i = 0; i < 20000; ++i)
+    {
+        const uint64_t v = wide(engine);
+        CHECK(v <= (uint64_t{1} << 40));
+        smallest = (v < smallest) ? v : smallest;
+        largest = (v > largest) ? v : largest;
+        above_32_bits += (v > 0xFFFFFFFFull) ? 1 : 0;
+    }
+
+    CHECK(smallest < (uint64_t{1} << 32));        //  low values appear
+    CHECK(largest > (uint64_t{1} << 39));         //  and the top half of the range
+    CHECK(above_32_bits > 19000);                 //  ~99.6% of [0, 2^40] lies above 2^32
+
+    const bool returns = minstd::pmr::test::runs_to_completion([]
+                                                               {
+                                                                   engine32 e;
+                                                                   minstd::uniform_int_distribution<uint64_t> nearly_full(0, UINT64_MAX - 1);
+                                                                   for (int i = 0; i < 1000; ++i)
+                                                                   {
+                                                                       (void)nearly_full(e);
+                                                                   }
+                                                               });
+    CHECK_TRUE(returns);
+}
+
+TEST(RandomWideRanges, SeedSeqMatchesTheStandardAlgorithm)
+{
+    //  Reference values from std::seed_seq (libstdc++); the previous implementation differed in every word.
+    uint32_t out[4];
+    minstd::seed_seq three{1u, 2u, 3u};
+    three.generate(out, out + 4);
+    CHECK_EQUAL(2494033729u, out[0]);
+    CHECK_EQUAL(3915881101u, out[1]);
+    CHECK_EQUAL(1602617867u, out[2]);
+    CHECK_EQUAL(764004082u, out[3]);
+
+    uint32_t one[1];
+    minstd::seed_seq five{0xdeadbeefu, 7u, 0u, 99u, 1234567u};
+    five.generate(one, one + 1);
+    CHECK_EQUAL(1160567067u, one[0]);
+
+    uint32_t eight[8];
+    minstd::seed_seq empty;
+    empty.generate(eight, eight + 8);
+    CHECK_EQUAL(3071959997u, eight[0]);
+    CHECK_EQUAL(2235109613u, eight[7]);
+}

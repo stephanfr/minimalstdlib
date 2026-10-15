@@ -81,3 +81,16 @@ namespace
         }
     }
 } // namespace
+
+TEST_GROUP(BitRotateUnsignedLongLong)
+{
+};
+
+TEST(BitRotateUnsignedLongLong, RotatesLikeUint64)
+{
+    //  numeric_limits<unsigned long long> was unspecialised, so rotl computed shift % 0 (SIGFPE on x86).
+    volatile int shift = 1;
+    CHECK(minstd::rotl(1ULL, shift) == 2ULL);
+    CHECK(minstd::rotr(1ULL, shift) == 0x8000000000000000ULL);
+    CHECK(minstd::rotl(0x8000000000000001ULL, 65) == 0x0000000000000003ULL);
+}

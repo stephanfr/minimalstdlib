@@ -1,6 +1,12 @@
 #pragma once
 #include <stdint.h>
 #include "minstdconfig.h"
+
+#include <__type_traits/integral_constant.h>
+#include <__type_traits/is_integral.h>
+#include <__type_traits/is_same.h>
+#include <__type_traits/is_signed.h>
+#include <__type_traits/remove_cv.h>
 namespace MINIMAL_STD_NAMESPACE {
 
     //  Primary (unspecialized) template — matches any type for which no
@@ -195,5 +201,76 @@ namespace MINIMAL_STD_NAMESPACE {
         static constexpr uint64_t max()    noexcept { return 18446744073709551615ULL; }
         static constexpr uint64_t lowest() noexcept { return min(); }
     };
+
+    // -----------------------------------------------------------------------
+    //  Every other integer type (char, signed/unsigned char where they are not
+    //  int8_t/uint8_t, long long, unsigned long long, wchar_t, char8_t,
+    //  char16_t, char32_t, bool): derived from size and signedness.  The
+    //  explicit specializations above take precedence for the types they name.
+    // -----------------------------------------------------------------------
+    template <typename T>
+        requires(is_integral_v<T> && !is_same_v<T, bool> && is_same_v<T, remove_cv_t<T>>)
+    struct numeric_limits<T>
+    {
+        static constexpr bool is_specialized = true;
+        static constexpr bool is_integer     = true;
+        static constexpr bool is_signed      = is_signed_v<T>;
+        static constexpr bool is_exact       = true;
+        static constexpr bool is_modulo      = !is_signed_v<T>;
+        static constexpr bool is_iec559      = false;
+        static constexpr int  radix          = 2;
+        static constexpr int  digits         = static_cast<int>(sizeof(T) * 8) - (is_signed_v<T> ? 1 : 0);
+        static constexpr int  digits10       = (digits * 301) / 1000; //  floor(digits * log10(2))
+
+        static constexpr T max() noexcept
+        {
+            return static_cast<T>((((T(1) << (digits - 1)) - T(1)) << 1) + T(1)); //  2^digits - 1 without overflow
+        }
+
+        static constexpr T min() noexcept
+        {
+            return is_signed_v<T> ? static_cast<T>(-max() - T(1)) : T(0);
+        }
+
+        static constexpr T lowest() noexcept { return min(); }
+    };
+
+    template <> struct numeric_limits<bool>
+    {
+        static constexpr bool is_specialized = true;
+        static constexpr bool is_integer     = true;
+        static constexpr bool is_signed      = false;
+        static constexpr bool is_exact       = true;
+        static constexpr bool is_modulo      = false;
+        static constexpr bool is_iec559      = false;
+        static constexpr int  radix          = 2;
+        static constexpr int  digits         = 1;
+        static constexpr int  digits10       = 0;
+        static constexpr bool min()    noexcept { return false; }
+        static constexpr bool max()    noexcept { return true; }
+        static constexpr bool lowest() noexcept { return false; }
+    };
+
+    template <> struct numeric_limits<long double>
+    {
+        static constexpr bool        is_specialized = true;
+        static constexpr bool        is_integer     = false;
+        static constexpr bool        is_signed      = true;
+        static constexpr bool        is_exact       = false;
+        static constexpr bool        is_modulo      = false;
+        static constexpr bool        is_iec559      = true;
+        static constexpr int         radix          = 2;
+        static constexpr int         digits         = __LDBL_MANT_DIG__;
+        static constexpr int         digits10       = __LDBL_DIG__;
+        static constexpr long double min()     noexcept { return __LDBL_MIN__; }
+        static constexpr long double max()     noexcept { return __LDBL_MAX__; }
+        static constexpr long double lowest()  noexcept { return -__LDBL_MAX__; }
+        static constexpr long double epsilon() noexcept { return __LDBL_EPSILON__; }
+    };
+
+    //  cv-qualified types have the limits of the unqualified type (as std).
+    template <typename T> struct numeric_limits<const T> : numeric_limits<T> {};
+    template <typename T> struct numeric_limits<volatile T> : numeric_limits<T> {};
+    template <typename T> struct numeric_limits<const volatile T> : numeric_limits<T> {};
 
 }
