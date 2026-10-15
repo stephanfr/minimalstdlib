@@ -20,8 +20,8 @@ namespace MINIMAL_STD_NAMESPACE
     //
     //  Non-standard extensions:
     //    - seed_type struct for explicit 128-bit initialisation
-    //    - fork(): advances state by 2^64 steps and returns an independent instance,
-    //      suitable for creating non-overlapping parallel streams.
+    //    - fork(): returns an engine at the current state and moves this one 2^64
+    //      steps ahead, so successive forks are non-overlapping parallel streams.
     //
 
     class xoroshiro128_plus_plus
@@ -132,11 +132,15 @@ namespace MINIMAL_STD_NAMESPACE
             return !(*this == other);
         }
 
-        //  Non-standard extension.  Returns an independent engine whose state is
-        //  2^64 output values ahead of the current state, ensuring non-overlapping
-        //  streams when used in parallel.
+        //  Non-standard extension, the reference jump() idiom: returns an engine at the
+        //  current state, then moves this engine 2^64 steps ahead.  Each fork therefore
+        //  owns the next 2^64 outputs, and successive forks never overlap.  This engine's
+        //  own output after a fork is the start of the next fork's stream, so use the
+        //  parent only to fork when the streams must be disjoint.
         xoroshiro128_plus_plus fork() noexcept
         {
+            const xoroshiro128_plus_plus child(*this);
+
             static constexpr uint64_t JUMP[] = {0x2bd7a6a6e99c2ddc, 0x0992ccaf6a6fca05};
 
             uint64_t s0 = 0;
@@ -156,7 +160,11 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             }
 
-            return xoroshiro128_plus_plus(seed_type(s0, s1));
+            //  The loop above stepped this engine only 128 times; the jumped state is (s0, s1)
+
+            state_ = seed_type(s0, s1);
+
+            return child;
         }
 
     private:

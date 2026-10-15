@@ -1477,4 +1477,48 @@ namespace
                                                         if (list.size() != 0) _exit(5);
                                                         if (!list.validate_ordering()) _exit(6); })); //  before: the child segfaults
     }
+
+    TEST(SkiplistTests, SentinelsWithoutSlotsFailSafely)
+    {
+        //  A resource with room for the sentinel nodes but not for a slot block gave the sentinels slot 0, so every
+        //      link to NIL_ decoded as nullptr: validate_ordering() dereferenced it and inserts retried and failed.
+
+        class small_requests_only : public minstd::pmr::memory_resource
+        {
+        private:
+            minstd::pmr::malloc_free_wrapper_memory_resource upstream_;
+
+            void *do_allocate(size_t bytes, size_t alignment) override
+            {
+                return (bytes <= 4096) ? upstream_.allocate(bytes, alignment) : nullptr; //  slot blocks are far larger
+            }
+
+            void do_deallocate(void *p, size_t bytes, size_t alignment) override
+            {
+                upstream_.deallocate(p, bytes, alignment);
+            }
+
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+            {
+                return this == &other;
+            }
+        };
+
+        struct slotless_tag
+        {
+        };
+
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        small_requests_only resource;
+
+                                                        minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14,
+                                                                          minstd::skiplist_extensions::null_skiplist_statistics, slotless_tag>
+                                                            list(&resource);
+
+                                                        if (!list.validate_ordering()) _exit(1);
+                                                        if (list.insert(1, 1)) _exit(2);
+                                                        if (list.size() != 0) _exit(3);
+                                                        if (list.begin() != list.end()) _exit(4); })); //  before: the child segfaults
+    }
 }

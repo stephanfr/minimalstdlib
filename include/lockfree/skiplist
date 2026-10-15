@@ -141,8 +141,11 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr uint32_t PARTIALLY_FREE_WORDS = (MAX_BLOCKS + 63) / 64;
             static inline array<atomic<uint64_t>, PARTIALLY_FREE_WORDS> partially_free_blocks_{};
 
-            //  Bumped every time a block is installed at an index, so a new block's generations never repeat
-            //      those of an earlier block at the same index (a stale handle must not resolve to a new node).
+            //  Bumped every time a block is installed at an index, and seeds the block's generations
+            //      (incarnation << 16), so a stale handle does not resolve to a node of a later block at the same index.
+            //      The separation is finite: a slot reused 2^16 times within one incarnation reaches the next
+            //      incarnation's range, and the 15-bit incarnation wraps.  A handle held across that many reuses of
+            //      its slot (an iterator kept far longer than any read section) may resolve to an unrelated node.
             static inline array<atomic<uint32_t>, MAX_BLOCKS> block_incarnation_{};
 
             static inline atomic<slot_block *> unlinked_blocks_{nullptr};
@@ -156,23 +159,24 @@ namespace MINIMAL_STD_NAMESPACE
             //      instantiation, so every live skip_list of one type (including its Tag) shares this resource: the
             //      first instance sets it and the last one clears it.
             //  When null (test-only default constructor path), falls back to malloc/free.
-            static inline pmr::memory_resource* block_memory_resource_ = nullptr;
+            //  Atomic: one list's constructor publishes it while other lists of the type may be allocating blocks.
+            static inline atomic<pmr::memory_resource *> block_memory_resource_{nullptr};
 
             static void set_block_memory_resource(pmr::memory_resource* mr)
             {
-                block_memory_resource_ = mr;
+                block_memory_resource_.store(mr, memory_order_release);
             }
 
             static pmr::memory_resource *block_memory_resource()
             {
-                return block_memory_resource_;
+                return block_memory_resource_.load(memory_order_acquire);
             }
 
             static slot_block* new_block()
             {
-                if (block_memory_resource_ != nullptr)
+                if (pmr::memory_resource *const resource = block_memory_resource(); resource != nullptr)
                 {
-                    slot_block_allocator_type allocator(block_memory_resource_);
+                    slot_block_allocator_type allocator(resource);
                     slot_block *block = slot_block_allocator_traits_type::allocate(allocator, 1);
 
                     if (block == nullptr)
@@ -209,9 +213,9 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
-                if (block_memory_resource_ != nullptr)
+                if (pmr::memory_resource *const resource = block_memory_resource(); resource != nullptr)
                 {
-                    slot_block_allocator_type allocator(block_memory_resource_);
+                    slot_block_allocator_type allocator(resource);
                     slot_block_allocator_traits_type::destroy(allocator, block);
                     slot_block_allocator_traits_type::deallocate(allocator, block, 1);
                 }
@@ -826,6 +830,11 @@ namespace MINIMAL_STD_NAMESPACE
         //          struct index_tag {};
         //          skip_list<uint32_t, uint32_t, 4, 16, 14, null_skiplist_statistics, cache_tag> cache(&cache_resource);
         //          skip_list<uint32_t, uint32_t, 4, 16, 14, null_skiplist_statistics, index_tag> index(&index_resource);
+        //
+        //      Because the tables are shared, constructing or destroying a list must not run concurrently with
+        //      constructing or destroying another list of the same type: the last list to be destroyed frees the
+        //      shared slot blocks, which a list being constructed at the same moment would be allocating from.
+        //      Operations on live lists may run concurrently with each other as usual.
 
         template <typename KeyType, typename ValueType, size_t NumCPUs, int32_t MAX_LEVELS = DEFAULT_MAX_LEVELS, uint32_t SlotsPerBlockShift = 14, typename Statistics = skiplist_extensions::null_skiplist_statistics, typename Tag = void>
         class skip_list : public Statistics
@@ -1341,9 +1350,14 @@ namespace MINIMAL_STD_NAMESPACE
 
                 head_ = allocate_skip_node(KeyType{}, MAX_LEVELS + 1, NIL_);
 
-                if (head_ == nullptr)
+                //  A sentinel without a slot (slot 0: no slot block could be allocated) cannot be linked to,
+                //      since links to it would decode as nullptr.  Treat it like a failed node allocation.
+
+                if ((head_ == nullptr) || (NIL_->internal_slot_ == 0) || (head_->internal_slot_ == 0))
                 {
+                    destroy_skip_node(head_);
                     destroy_skip_node(NIL_);
+                    head_ = nullptr;
                     NIL_ = nullptr;
                 }
             }

@@ -161,3 +161,40 @@ TEST(RandomWideRanges, SeedSeqMatchesTheStandardAlgorithm)
     CHECK_EQUAL(3071959997u, eight[0]);
     CHECK_EQUAL(2235109613u, eight[7]);
 }
+
+TEST_GROUP(XoroshiroFork){};
+
+TEST(XoroshiroFork, SuccessiveForksDoNotOverlap)
+{
+    //  fork() stepped the parent only 128 times and returned a copy jumped 2^64 ahead, so a second fork returned
+    //      the first fork's stream shifted by 128 outputs.
+    minstd::xoroshiro128_plus_plus parent(2024);
+    const minstd::xoroshiro128_plus_plus original = parent;
+
+    minstd::xoroshiro128_plus_plus first = parent.fork();
+    minstd::xoroshiro128_plus_plus second = parent.fork();
+
+    CHECK(first == original); //  the first fork starts where the parent was
+    CHECK(first != second);
+    CHECK(second != parent);
+
+    constexpr int SAMPLES = 1024;
+    static uint64_t first_values[SAMPLES];
+
+    for (auto &v : first_values)
+    {
+        v = first();
+    }
+
+    //  None of the second fork's first outputs (well past the old 128-step shift) appears in the first fork's
+
+    for (int i = 0; i < SAMPLES + 256; i++)
+    {
+        const uint64_t v = second();
+
+        for (const uint64_t f : first_values)
+        {
+            CHECK(v != f);
+        }
+    }
+}

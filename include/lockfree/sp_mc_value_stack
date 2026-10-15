@@ -47,6 +47,7 @@ namespace MINIMAL_STD_NAMESPACE
             static_assert(Capacity > 0, "sp_mc_value_stack: Capacity must be > 0");
             static_assert(Capacity <= 0xFFFFFFFFu, "sp_mc_value_stack: Capacity must fit in 32 bits");
             static_assert(is_trivially_copyable_v<T>, "sp_mc_value_stack: T must be trivially copyable");
+            static_assert(is_integral_v<T> || is_pointer_v<T>, "sp_mc_value_stack: T must be an integral or pointer type (what minstd::atomic supports)");
             static_assert(atomic<T>::is_always_lock_free, "sp_mc_value_stack: T must fit a lock-free atomic (<= 8 bytes)");
 
             using value_type = T;
