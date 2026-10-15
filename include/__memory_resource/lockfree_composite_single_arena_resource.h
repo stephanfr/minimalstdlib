@@ -31,6 +31,10 @@ namespace MINIMAL_STD_NAMESPACE
         public:
             static constexpr size_t DEFAULT_CPU_SHARDS = 8;
 
+            //  The small pool serves at most 16 elements per allocation, each with a HEADER_SIZE (16 byte) header.
+            static_assert(THRESHOLD_BYTES + 16 <= 16 * ELEMENT_SIZE_IN_BYTES,
+                          "THRESHOLD_BYTES must fit in 16 elements of ELEMENT_SIZE_IN_BYTES (including the 16-byte header)");
+
             static_assert(LARGE_RESOURCE_MAX_BIN_BYTES >= 1024,
                           "LARGE_RESOURCE_MAX_BIN_BYTES must be at least 1024 bytes");
             static_assert(LARGE_RESOURCE_MAX_WASTE_PERCENT > 0 && LARGE_RESOURCE_MAX_WASTE_PERCENT <= 25,

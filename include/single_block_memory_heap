@@ -116,6 +116,14 @@ namespace MINIMAL_STD_NAMESPACE
     protected:
         void *allocate_raw_block(size_t element_size_in_bytes, size_t num_elements_in_block)
         {
+            //  Reject sizes larger than the heap first, so the multiplication, the alignment rounding and the
+            //      addition of the header below cannot wrap.
+
+            if ((num_elements_in_block != 0) && (element_size_in_bytes > max_size_ / num_elements_in_block))
+            {
+                return nullptr;
+            }
+
             //  Compute the block size in bytes adjusting for alignment
 
             size_t block_size_in_bytes = aligned_size(element_size_in_bytes * num_elements_in_block);
@@ -124,7 +132,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             //  If the heap is exhausted, search for an unused block
 
-            if (bytes_allocated_ + block_size_in_bytes > max_size_)
+            if (block_size_in_bytes > max_size_ - bytes_allocated_)
             {
                 return search_for_unused_block(block_size_in_bytes, num_elements_in_block);
             }

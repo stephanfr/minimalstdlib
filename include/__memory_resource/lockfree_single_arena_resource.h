@@ -216,6 +216,15 @@ namespace MINIMAL_STD_NAMESPACE
                 MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
                 MINIMAL_STD_ASSERT((block_size_ / DEFAULT_ALIGNMENT) < NO_PREDECESSOR); //  frontier words hold 32-bit unit offsets (256 GiB)
 
+                //  The per-CPU arrays and one metadata block must fit, or the layout below would write past the caller's
+                //      block.  A block that is too small leaves the resource unusable: every allocation returns nullptr.
+
+                if (block_size_ < minimum_block_size(cpu_shards_))
+                {
+                    MINIMAL_STD_FAIL("lockfree_single_arena_resource: block smaller than minimum_block_size()");
+                    return;
+                }
+
                 uint8_t *current_ptr = static_cast<uint8_t *>(const_cast<void *>(block_));
 
                 //  Allocate pending_shards_ array (cpu_shards_ elements)
@@ -276,10 +285,23 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                 }
 
+                usable_ = true;
+
                 refresh_extended_metrics_diagnostics();
             }
 
             ~lockfree_single_arena_resource_impl() = default;
+
+            //  Smallest caller block that holds the per-CPU arrays, one metadata block and its manager (plus up to
+            //      DEFAULT_ALIGNMENT - 1 bytes lost to aligning the start, and room for a first allocation).
+            static constexpr size_t minimum_block_size(size_t cpu_shards = DEFAULT_CPU_SHARDS)
+            {
+                return (2 * DEFAULT_ALIGNMENT) +
+                       (cpu_shards * sizeof(pending_shard)) +
+                       (NUM_FREE_BLOCK_BINS * cpu_shards * sizeof(free_block_bin)) +
+                       sizeof(metadata_block_manager) + METADATA_BLOCK_BYTES +
+                       (2 * DEFAULT_ALIGNMENT);
+            }
 
             const extensions::lockfree_single_arena_resource_extended_statistics &extended_metrics() const noexcept
                 requires(is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
@@ -618,6 +640,7 @@ namespace MINIMAL_STD_NAMESPACE
             size_t cpu_shards_;
             const void *allocation_base_;
             size_t address_bin_size_;
+            bool usable_ = false; //  false when the caller's block was too small (see minimum_block_size())
 
             struct extended_metrics_sync_guard
             {
@@ -633,6 +656,11 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
                 {
+                    if (!usable_)
+                    {
+                        return;
+                    }
+
                     auto frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
                     size_t frontier_offset = reinterpret_cast<uintptr_t>(frontier) - reinterpret_cast<uintptr_t>(block_);
 
@@ -1152,7 +1180,9 @@ namespace MINIMAL_STD_NAMESPACE
 
                 //  Alignment must be a power of two no larger than DEFAULT_ALIGNMENT (no divide on the fast path).
 
-                if ((bytes == 0) || (alignment == 0) || (alignment > DEFAULT_ALIGNMENT) || ((alignment & (alignment - 1)) != 0))
+                //  bytes is bounded before the header is added, so the sum below cannot wrap.
+
+                if (!usable_ || (bytes == 0) || (bytes > MAX_ALLOCATION_SIZE) || (alignment == 0) || (alignment > DEFAULT_ALIGNMENT) || ((alignment & (alignment - 1)) != 0))
                 {
                     return nullptr;
                 }

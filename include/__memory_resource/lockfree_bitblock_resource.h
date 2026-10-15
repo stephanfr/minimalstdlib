@@ -380,7 +380,12 @@ namespace MINIMAL_STD_NAMESPACE
 
             void *do_allocate(size_t num_bytes, size_t alignment) override
             {
-                //  Ignore the alignment as alignment will be 16 bytes based on the template requirements
+                //  Every allocation is an element boundary + HEADER_SIZE, so only alignments up to 16 can be honoured.
+
+                if (alignment > HEADER_SIZE)
+                {
+                    return nullptr;
+                }
 
                 size_t num_elements = elements_for_bytes(num_bytes);
 
@@ -469,6 +474,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             void do_deallocate(void *block, size_t num_bytes, size_t alignment) override
             {
+                if (block == nullptr)
+                {
+                    return;
+                }
+
                 //  Find the block from which the allocation was made
 
                 uint8_t *payload = static_cast<uint8_t *>(block);

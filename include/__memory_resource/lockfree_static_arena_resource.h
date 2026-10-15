@@ -84,6 +84,36 @@ namespace MINIMAL_STD_NAMESPACE
                 free_block_node* to_node(free_block_node* ptr) const { return ptr; }
             };
 
+            //  Return [block, block + bytes) to the free bins as pieces that are each a whole size class (or, above
+            //      LARGEST_CLASS, one bin-7 block).  bytes is a multiple of MIN_ALIGNMENT.  Used for the remainder when a
+            //      larger free block is split, so a block is always handed out at exactly block_size_for(request):
+            //      deallocate() only knows the request size, and a larger block would otherwise shrink for good.
+            void free_pieces(uint8_t* block, size_t bytes)
+            {
+                adapter_type adapter;
+                backoff_type backoff;
+
+                if (bytes > LARGEST_CLASS)
+                {
+                    free_block_node* node = reinterpret_cast<free_block_node*>(block);
+                    node->size = bytes;
+                    stack_type::push(free_stack_heads_[NUM_BINS - 1], *node, adapter, backoff, head_codec_);
+                    return;
+                }
+
+                for (size_t class_size = LARGEST_CLASS; bytes > 0; class_size >>= 1)
+                {
+                    if (bytes >= class_size)
+                    {
+                        free_block_node* node = reinterpret_cast<free_block_node*>(block);
+                        node->size = class_size;
+                        stack_type::push(free_stack_heads_[get_bin(class_size)], *node, adapter, backoff, head_codec_);
+                        block += class_size;
+                        bytes -= class_size;
+                    }
+                }
+            }
+
             // backoff adapter for intrusive stack
             struct backoff_type {
                 void operator()(size_t& retries) const {
@@ -112,6 +142,11 @@ namespace MINIMAL_STD_NAMESPACE
                     return nullptr;
                 }
 
+                //  Larger than the arena (this also keeps block_size_for()'s rounding from wrapping)
+                if (bytes > static_cast<size_t>(arena_end_ - arena_start_)) {
+                    return nullptr;
+                }
+
                 const size_t alloc_size = block_size_for(bytes);
 
                 // Bump pointer allocation
@@ -120,13 +155,15 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     uintptr_t ptr_as_int = reinterpret_cast<uintptr_t>(expected);
                     uintptr_t aligned_int = (ptr_as_int + MIN_ALIGNMENT - 1) & ~(MIN_ALIGNMENT - 1);
-                    uint8_t* aligned_expected = reinterpret_cast<uint8_t*>(aligned_int);
+                    const uintptr_t end_int = reinterpret_cast<uintptr_t>(arena_end_);
 
-                    uint8_t* new_ptr = aligned_expected + alloc_size;
-
-                    if (new_ptr > arena_end_) {
+                    //  Compare remaining space, not end pointers, so a large request cannot wrap the address
+                    if ((aligned_int > end_int) || (alloc_size > end_int - aligned_int)) {
                         break;
                     }
+
+                    uint8_t* aligned_expected = reinterpret_cast<uint8_t*>(aligned_int);
+                    uint8_t* new_ptr = aligned_expected + alloc_size;
 
                     if (current_ptr_.compare_exchange_weak(expected, new_ptr, memory_order_acquire, memory_order_relaxed))
                     {
@@ -146,6 +183,12 @@ namespace MINIMAL_STD_NAMESPACE
                 for (size_t bin = start_bin; bin < NUM_BINS - 1; ++bin)
                 {
                     if (free_block_node* node = stack_type::pop(free_stack_heads_[bin], adapter, backoff, head_codec_)) {
+                        //  A block from a larger class: hand out the requested class and free the rest as smaller
+                        //      classes, so the whole block is returned whatever size deallocate() is given.
+                        const size_t node_size = MIN_ALIGNMENT << bin;
+                        if (node_size > alloc_size) {
+                            free_pieces(reinterpret_cast<uint8_t*>(node) + alloc_size, node_size - alloc_size);
+                        }
                         return node;
                     }
                 }
@@ -173,6 +216,8 @@ namespace MINIMAL_STD_NAMESPACE
                     prev = current;
                 }
 
+                size_t best_fit_remainder = 0;
+
                 if (best_fit) {
                     if (best_fit_prev) {
                         stack_type::store_link(*best_fit_prev, best_fit->next);
@@ -180,6 +225,7 @@ namespace MINIMAL_STD_NAMESPACE
                         stolen_list = best_fit->next;
                     }
                     stack_type::store_link(*best_fit, nullptr);
+                    best_fit_remainder = best_fit->size - alloc_size;
                 }
 
                 // Put remainder back into the same bin
@@ -188,6 +234,11 @@ namespace MINIMAL_STD_NAMESPACE
                     free_block_node* next = current->next;
                     stack_type::push(free_stack_heads_[bin], *current, adapter, backoff, head_codec_);
                     current = next;
+                }
+
+                //  Hand out exactly alloc_size and free the tail (see free_pieces())
+                if (best_fit_remainder > 0) {
+                    free_pieces(reinterpret_cast<uint8_t*>(best_fit) + alloc_size, best_fit_remainder);
                 }
 
                 return best_fit;

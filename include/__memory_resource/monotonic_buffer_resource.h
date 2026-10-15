@@ -113,26 +113,28 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 // The next size must hold the requested bytes + alignment overhead + our block header
-                if (bytes > SIZE_MAX / 4)
+                if ((bytes > SIZE_MAX / 4) || (alignment > SIZE_MAX / 4))
                 {
                     return nullptr; //  the doubling below would wrap around and never end
                 }
 
                 size_t required_size = bytes + sizeof(block_header) + alignment;
-                size_t next_size = next_buffer_size_;
+                size_t next_size = (next_buffer_size_ > 0) ? next_buffer_size_ : sizeof(block_header);
                 while (next_size < required_size)
                 {
                     next_size *= 2;
                 }
-                
-                // For geometric growth on subsequent allocations
-                next_buffer_size_ = next_size * 2;
 
                 void* new_block = upstream_resource_->allocate(next_size, alignof(block_header));
                 if (!new_block)
                 {
+                    //  Leave next_buffer_size_ alone: growing it on every failure would make it wrap to 0 (and the loop
+                    //      above never end) once upstream is exhausted.
                     return nullptr;
                 }
+
+                // Geometric growth on subsequent allocations, only once this size was obtained
+                next_buffer_size_ = (next_size <= SIZE_MAX / 4) ? next_size * 2 : next_size;
 
                 // Prepend to the allocated blocks list (using placement new would require <new>, 
                 // but we can just initialize it since trivial types)
