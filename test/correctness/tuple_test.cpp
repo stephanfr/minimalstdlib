@@ -983,7 +983,7 @@ namespace
                    "10\n"                //
                    "x\n"                 //
                    "20\n"                //
-                   "3.1415\n");
+                   "3.1416\n"); //  rounded, as std::format does
     }
 
     TEST(TupleTests, TestThatfor_eachMovesValuesWhenGivenMoved)

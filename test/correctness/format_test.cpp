@@ -335,4 +335,84 @@ namespace
         STRCMP_EQUAL("a{b}c 1 }", minstd::format(buffer, "a{{b}}c {} }}", (int32_t)1).c_str());
         STRCMP_EQUAL("end{", minstd::format(buffer, "end{{").c_str());
     }
+
+    TEST(FormatTests, FloatsRoundAtThePrecision)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("1.15", minstd::format(buffer, "{:.2}", 1.15).c_str());              //  before: "1.14"
+        STRCMP_EQUAL("2.0000", minstd::format(buffer, "{}", 1.99999).c_str());            //  before: "1.9999"
+        STRCMP_EQUAL("-2.0000", minstd::format(buffer, "{}", -1.99999).c_str());
+        STRCMP_EQUAL("10", minstd::format(buffer, "{:.0}", 9.7).c_str());
+    }
+
+    TEST(FormatTests, FloatsOutsideTheIntegerRange)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("inf -inf", minstd::format(buffer, "{} {}", __builtin_inf(), -__builtin_inf()).c_str());
+        STRCMP_EQUAL("nan", minstd::format(buffer, "{}", __builtin_nan("")).c_str());
+        STRCMP_EQUAL("  inf", minstd::format(buffer, "{:5}", __builtin_inff()).c_str());
+        STRCMP_EQUAL("2000000000000000.0000", minstd::format(buffer, "{}", 2e15).c_str());
+        STRCMP_EQUAL("100000000000000000000.00", minstd::format(buffer, "{:.2}", 1e20).c_str());
+        STRCMP_EQUAL("-30000000000000000000000000000000.0", minstd::format(buffer, "{:.1}", -3e31).c_str());
+    }
+
+    TEST(FormatTests, FullBufferKeepsTheSignAndLeadingDigits)
+    {
+        minstd::fixed_string<8> buffer;
+
+        //  Before the fix the digits were written least significant first, so a full buffer kept "87654321"
+
+        STRCMP_EQUAL("-1234567", minstd::format(buffer, "{}", (int32_t)-12345678).c_str());
+        STRCMP_EQUAL("0xabcdef", minstd::format(buffer, "{:#x}", (uint64_t)0xabcdef0123ULL).c_str());
+    }
+
+    TEST(FormatTests, UnsignedHonoursTheSignOption)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("+5", minstd::format(buffer, "{:+}", (uint32_t)5).c_str());           //  before: "5"
+        STRCMP_EQUAL(" 5", minstd::format(buffer, "{: }", (uint64_t)5).c_str());
+        STRCMP_EQUAL("+0x0a", minstd::format(buffer, "{:+#05x}", (uint8_t)10).c_str());
+    }
+
+    TEST(FormatTests, AlternateOctalZero)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("0", minstd::format(buffer, "{:#o}", (uint32_t)0).c_str());           //  before: "00"
+        STRCMP_EQUAL("010", minstd::format(buffer, "{:#o}", (uint32_t)8).c_str());
+        STRCMP_EQUAL("0x0", minstd::format(buffer, "{:#x}", (uint32_t)0).c_str());
+    }
+
+    TEST(FormatTests, FillThatIsAnAlignmentCharacter)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("ab<<<", minstd::format(buffer, "{:<<5}", "ab").c_str());
+        STRCMP_EQUAL(">>>ab", minstd::format(buffer, "{:>>5}", "ab").c_str());
+        STRCMP_EQUAL("^^7^^", minstd::format(buffer, "{:^^5}", (int32_t)7).c_str());
+    }
+
+    TEST(FormatTests, StringPrecisionTruncates)
+    {
+        minstd::fixed_string<128> buffer;
+        minstd::fixed_string<16> hello("hello");
+
+        STRCMP_EQUAL("he", minstd::format(buffer, "{:.2}", "hello").c_str());              //  before: "hello"
+        STRCMP_EQUAL("hel  |", minstd::format(buffer, "{:5.3}|", hello).c_str());
+        STRCMP_EQUAL("hello", minstd::format(buffer, "{:.9}", "hello").c_str());
+    }
+
+    TEST(FormatTests, OversizedIdsAndWidthsAreInvalid)
+    {
+        minstd::fixed_string<128> buffer;
+
+        //  4294967296 wrapped to argument 0 before the fix
+
+        STRCMP_EQUAL("{Invalid format string: '4294967296'}", minstd::format(buffer, "{4294967296}", (int32_t)1).c_str());
+        STRCMP_EQUAL("{Invalid format string: ':4294967297'}", minstd::format(buffer, "{:4294967297}", (int32_t)1).c_str());
+        STRCMP_EQUAL("{Invalid format string: ':.99999999999'}", minstd::format(buffer, "{:.99999999999}", 1.0).c_str());
+    }
 }
