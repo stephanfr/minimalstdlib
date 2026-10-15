@@ -90,12 +90,13 @@ Standard C++ allocator for managing segment buffers. Any compliant allocator wor
 Starting number of elements per segment. All segments begin with equal capacity.
 
 #### `growth_numerator/denominator`
-Control organic growth ratio. Effective multiplier: `(numerator + denominator - 1) / denominator`
+Control organic growth ratio. The next capacity is `ceil(capacity × numerator / denominator)`, and at least `capacity + 1`
+(see `compute_new_capacity()`), then clamped to `max_capacity`.
 
 **Examples:**
 - Default (5/4): ~1.25× growth per regrow
 - Aggressive (3/2): 1.5× growth
-- Conservative (1/1): 2× growth
+- Minimal (1/1): one more element per regrow
 
 #### `idle_rotation_interval`
 Every N successful pops, check if active segment is <50% utilized. If so, close it early to enable shrink-on-next-open. Value of 0 disables this feature entirely.

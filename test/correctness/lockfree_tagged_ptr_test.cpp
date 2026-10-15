@@ -39,7 +39,7 @@ namespace
     }
 
     constexpr uintptr_t LOW = 0x0000'1234'5678'9ab0ULL;              //  user space / identity mapped
-    constexpr uintptr_t LOW_BIT_47 = 0x0000'8000'0000'1000ULL;       //  low half, bit 47 set (not canonical)
+    constexpr uintptr_t LOW_BIT_47 = 0x0000'8000'0000'1000ULL;       //  low half, bit 47 set (TTBR0 with 48-bit VAs)
     constexpr uintptr_t HIGH = 0xFFFF'8000'0001'2340ULL;             //  canonical upper half
     constexpr uintptr_t HIGH_BIT_47_CLEAR = 0xFFFF'0000'0001'2340ULL; //  TTBR1 with 48-bit VAs, bit 47 clear
 

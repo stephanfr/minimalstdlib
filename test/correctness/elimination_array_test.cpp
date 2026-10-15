@@ -71,6 +71,8 @@ namespace
         size_t failed_operations;
     };
 
+    constexpr uint64_t TEST_SEED = 0x5eed'1234'abcdULL; //  fixed rather than time(nullptr), so runs repeat
+
     TEST(EliminationArrayTests, BasicConstruction)
     {
         test_elimination_array elimination_array(12345);
@@ -210,7 +212,7 @@ namespace
     {
         static const size_t NUM_OPERATIONS = 10000;
         
-        test_elimination_array elimination_array(time(nullptr));
+        test_elimination_array elimination_array(TEST_SEED); //  fixed, so a failure can be reproduced
         
         // Create test elements
         test_element elements[NUM_OPERATIONS];
@@ -273,7 +275,7 @@ namespace
         static const size_t NUM_CONSUMER_THREADS = 32;
         static const size_t NUM_OPERATIONS_PER_THREAD = 10000;
         
-        test_elimination_array elimination_array(time(nullptr));
+        test_elimination_array elimination_array(TEST_SEED); //  fixed, so a failure can be reproduced
         
         // Create test elements for all producer threads
         test_element elements[NUM_PRODUCER_THREADS * NUM_OPERATIONS_PER_THREAD];
@@ -422,6 +424,19 @@ namespace
         
         // Test with thread counts from 1 to 32 (powers of 2 plus some intermediate values)
         size_t thread_counts[] = {2, 4, 6, 8, 12, 16, 20, 24, 28, 32};
+
+        //  Sized for the largest thread count and kept off the stack: these ran to several MB as variable-length
+        //      arrays, enough to overflow the stack under ASan
+
+        static constexpr size_t MAX_PRODUCERS = 16;
+        static constexpr size_t MAX_CONSUMERS = 16;
+
+        static test_element elements[MAX_PRODUCERS * OPERATIONS_PER_THREAD];
+        static test_element *element_ptrs[MAX_PRODUCERS][OPERATIONS_PER_THREAD];
+        static thread_test_args producer_args[MAX_PRODUCERS];
+        static thread_test_args consumer_args[MAX_CONSUMERS];
+        static pthread_t producer_threads[MAX_PRODUCERS];
+        static pthread_t consumer_threads[MAX_CONSUMERS];
         size_t num_test_points = sizeof(thread_counts) / sizeof(thread_counts[0]);
         
         for (size_t test_idx = 0; test_idx < num_test_points; ++test_idx)
@@ -429,6 +444,8 @@ namespace
             size_t num_threads = thread_counts[test_idx];
             size_t num_producer_threads = num_threads / 2;
             size_t num_consumer_threads = num_threads - num_producer_threads;
+
+            CHECK((num_producer_threads <= MAX_PRODUCERS) && (num_consumer_threads <= MAX_CONSUMERS));
             
             // Skip single thread test (no elimination possible)
             if (num_threads == 1)
@@ -437,11 +454,9 @@ namespace
                 continue;
             }
             
-            test_elimination_array elimination_array(time(nullptr) + test_idx);
+            test_elimination_array elimination_array(TEST_SEED + test_idx);
             
             // Create test elements for all producer threads
-            test_element elements[num_producer_threads * OPERATIONS_PER_THREAD];
-            test_element *element_ptrs[num_producer_threads][OPERATIONS_PER_THREAD];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {
@@ -454,8 +469,6 @@ namespace
             }
             
             // Setup thread arguments
-            thread_test_args producer_args[num_producer_threads];
-            thread_test_args consumer_args[num_consumer_threads];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {
@@ -478,8 +491,6 @@ namespace
             stop_threads = false;
             
             // Create threads
-            pthread_t producer_threads[num_producer_threads];
-            pthread_t consumer_threads[num_consumer_threads];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {

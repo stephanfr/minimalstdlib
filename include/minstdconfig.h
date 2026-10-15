@@ -30,9 +30,11 @@ static_assert(__cplusplus >= 202002L, "Minimal C++ Stdlib requires C++ 20 or lat
 //
 //      ZERO            the top bits are zero: user space, identity-mapped low memory, TTBR0.
 //      ONES            the top bits are ones: the upper (TTBR1) half on AArch64, kernel space on x86-64.
-//      SIGN_EXTEND_47  the top bits copy bit 47: right for both halves when addresses are canonical
-//                      48-bit, but a TTBR1 address with bit 47 clear (0xFFFF0000'00000000 to
-//                      0xFFFF7FFF'FFFFFFFF, reachable with 48-bit VAs) decodes into the lower half.
+//      SIGN_EXTEND_47  the top bits copy bit 47: right for x86-64 canonical addresses and for AArch64
+//                      with VAs of at most 47 bits.  With 48-bit VAs on AArch64 each half spans bit 47:
+//                      a TTBR0 address with bit 47 set (0x00008000'00000000 and up) decodes into the upper
+//                      half, and a TTBR1 address with bit 47 clear (0xFFFF0000'00000000 to
+//                      0xFFFF7FFF'FFFFFFFF) into the lower half.  Use ZERO or ONES there.
 //
 //  The default is SIGN_EXTEND_47, and ZERO for the hosted test build.
 //

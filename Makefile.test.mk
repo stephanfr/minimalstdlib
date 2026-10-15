@@ -177,12 +177,12 @@ test-coverage:
 	$(MAKE) -f Makefile.test.mk clean_test
 	$(MAKE) -f Makefile.test.mk $(COVERAGE_EXE)
 	cd $(COVERAGE_OBJ_DIR) && \
-	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . -o /tmp > /dev/null ; \
-	lcov --capture --directory . --output-file /tmp/test_coverage.info --ignore-errors mismatch,negative ; \
-	lcov --remove /tmp/test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
-	     --output-file /tmp/test_coverage_filtered.info --ignore-errors unused ; \
-	genhtml /tmp/test_coverage_filtered.info --output-directory coverage_report ; \
-	rm -f /tmp/test_coverage.info /tmp/test_coverage_filtered.info /tmp/*.gcov
+	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . > /dev/null ; \
+	lcov --capture --directory . --output-file test_coverage.info --ignore-errors mismatch,negative ; \
+	lcov --remove test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
+	     --output-file test_coverage_filtered.info --ignore-errors unused ; \
+	genhtml test_coverage_filtered.info --output-directory coverage_report ; \
+	rm -f test_coverage.info test_coverage_filtered.info *.gcov
 	find $(COVERAGE_OBJ_DIR) $(COVERAGE_LIB_OBJ_DIR) -name "*.o" -o -name "*.gcno" -o -name "*.gcda" | xargs rm -f
 	rm -f $(COVERAGE_EXE)
 	rm -f *.gcov *##*.gcov

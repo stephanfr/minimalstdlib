@@ -1021,6 +1021,23 @@ namespace
                 link_type::delete_block(block);
                 block = next;
             }
+
+            //  Reset the rest of the static allocator state too, as the last skip_list's destructor does, so the
+            //      next test (or a repeat of this one under -r) starts from a fresh allocator
+
+            for (auto &word : link_type::partially_free_blocks_)
+            {
+                word.store(0, minstd::memory_order_release);
+            }
+
+            link_type::high_water_slot_.store(0, minstd::memory_order_relaxed);
+            link_type::high_water_block_.store(0, minstd::memory_order_relaxed);
+            link_type::next_free_slot_.store(1, minstd::memory_order_release);
+
+            if constexpr (requires { link_type::slot_stats_.reset(); })
+            {
+                link_type::slot_stats_.reset();
+            }
         }
     }
 
