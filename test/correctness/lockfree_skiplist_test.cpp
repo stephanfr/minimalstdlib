@@ -1376,4 +1376,105 @@ namespace
 
         CHECK_EQUAL(0u, list_type::active_blocks()); //  the last list frees every block
     }
+
+    //
+    //  head_ and NIL_ are sentinels by identity, so the extreme key values are ordinary keys.  Before the fix NIL_
+    //      carried numeric_limits<K>::max() and head_ min(): inserting max() failed (find(max()) found NIL_ itself),
+    //      and for floating point min() is the smallest positive value, so negative keys failed validation.
+    //
+
+    template <typename KeyType>
+    void check_extreme_keys(const KeyType (&keys)[4])
+    {
+        using list_type = minstd::skip_list<KeyType, uint32_t, SKIPLIST_STRESS_MAX_THREADS>;
+
+        list_type list;
+
+        CHECK(list.find(keys[3]) == list.end());
+
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            CHECK_TRUE(list.insert(keys[i], i));
+        }
+
+        CHECK_FALSE(list.insert(keys[3], 99)); //  duplicates are still rejected
+        CHECK_EQUAL(4u, list.size());
+        CHECK_TRUE(list.validate_ordering());
+
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            auto found = list.find(keys[i]);
+            CHECK(found != list.end());
+            CHECK_EQUAL(i, found->second);
+        }
+
+        //  Iteration visits all four in key order (the keys are given in ascending order)
+
+        uint32_t visited = 0;
+
+        for (auto itr = list.begin(); itr != list.end(); ++itr)
+        {
+            CHECK(visited < 4);
+            CHECK(itr->first == keys[visited]);
+            visited++;
+        }
+
+        CHECK_EQUAL(4u, visited);
+
+        CHECK_TRUE(list.remove(keys[3]));
+        CHECK_TRUE(list.remove(keys[0]));
+        CHECK_FALSE(list.remove(keys[3]));
+        CHECK_EQUAL(2u, list.size());
+        CHECK(list.find(keys[0]) == list.end());
+        CHECK(list.find(keys[3]) == list.end());
+    }
+
+    TEST(SkiplistTests, ExtremeKeysAreOrdinaryKeys)
+    {
+        const uint32_t unsigned_keys[4] = {0, 1, minstd::numeric_limits<uint32_t>::max() - 1, minstd::numeric_limits<uint32_t>::max()};
+        check_extreme_keys(unsigned_keys);
+
+        const int32_t signed_keys[4] = {minstd::numeric_limits<int32_t>::min(), -1, 0, minstd::numeric_limits<int32_t>::max()};
+        check_extreme_keys(signed_keys);
+
+        const double double_keys[4] = {minstd::numeric_limits<double>::lowest(), -2.5, minstd::numeric_limits<double>::min(), minstd::numeric_limits<double>::max()};
+        check_extreme_keys(double_keys);
+    }
+
+    TEST(SkiplistTests, ListWithoutSentinelsFailsSafely)
+    {
+        //  A memory resource that never has memory: the sentinels cannot be allocated, and every operation must
+        //      fail cleanly instead of dereferencing a null head.
+
+        class empty_memory_resource : public minstd::pmr::memory_resource
+        {
+        private:
+            void *do_allocate(size_t, size_t) override
+            {
+                return nullptr;
+            }
+
+            void do_deallocate(void *, size_t, size_t) override
+            {
+            }
+
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+            {
+                return this == &other;
+            }
+        };
+
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        empty_memory_resource no_memory;
+
+                                                        minstd::skip_list<int16_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS> list(&no_memory);
+
+                                                        if (list.insert(1, 1)) _exit(1);
+                                                        if (list.remove(1)) _exit(2);
+                                                        if (list.find(1) != list.end()) _exit(3);
+                                                        if (list.begin() != list.end()) _exit(4);
+                                                        if (list.size() != 0) _exit(5);
+                                                        if (!list.validate_ordering()) _exit(6); })); //  before: the child segfaults
+    }
 }

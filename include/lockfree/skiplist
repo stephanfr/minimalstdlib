@@ -1244,6 +1244,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             iterator begin()
             {
+                if (head_ == nullptr)
+                {
+                    return end(); //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
                 skip_node* next_n = head_->next_node[0].get_reference();
                 bool is_tombstoned = false;
@@ -1267,6 +1272,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             const_iterator begin() const
             {
+                if (head_ == nullptr)
+                {
+                    return end(); //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
                 skip_node* next_n = head_->next_node[0].get_reference();
                 bool is_tombstoned = false;
@@ -1314,14 +1324,22 @@ namespace MINIMAL_STD_NAMESPACE
                     MINIMAL_STD_ASSERT(forward_link_type::block_memory_resource() == memory_resource_); //  use a different Tag
                 }
 
-                NIL_ = allocate_skip_node(numeric_limits<KeyType>::max(), MAX_LEVELS + 1, nullptr);
+                //  head_ and NIL_ are sentinels by identity: traversals treat head_ as before every key and NIL_ as
+                //      after every key, never comparing their keys, so every KeyType value (numeric_limits max()
+                //      and min() included) is available to callers.
+
+#ifndef __MINIMAL_STD_TEST__
+                MINIMAL_STD_ASSERT(memory_resource_ != nullptr); //  the test build falls back to a test allocator
+#endif
+
+                NIL_ = allocate_skip_node(KeyType{}, MAX_LEVELS + 1, nullptr);
 
                 if (NIL_ == nullptr)
                 {
                     return;
                 }
 
-                head_ = allocate_skip_node(numeric_limits<KeyType>::min(), MAX_LEVELS + 1, NIL_);
+                head_ = allocate_skip_node(KeyType{}, MAX_LEVELS + 1, NIL_);
 
                 if (head_ == nullptr)
                 {
@@ -1396,6 +1414,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             iterator find(const KeyType search_key)
             {
+                if (head_ == nullptr)
+                {
+                    return end(); //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 bool is_tombstoned = false;
@@ -1449,7 +1472,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                         }
 
-                        if (curr->key < search_key)
+                        if (key_before(curr, search_key))
                         {
                             pred = curr;
                             curr = succ;
@@ -1461,7 +1484,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                 }
 
-                if ((curr != nullptr) && (curr->key == search_key))
+                if (key_matches(curr, search_key))
                 {
                     return iterator(this, curr);
                 }
@@ -1470,6 +1493,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             const_iterator find(const KeyType search_key) const
             {
+                if (head_ == nullptr)
+                {
+                    return end(); //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 bool is_tombstoned = false;
@@ -1518,7 +1546,7 @@ namespace MINIMAL_STD_NAMESPACE
                                 }
                             }
                         }
-                        if (curr->key < search_key)
+                        if (key_before(curr, search_key))
                         {
                             pred = curr;
                             curr = succ;
@@ -1530,7 +1558,7 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                 }
 
-                if ((curr != nullptr) && (curr->key == search_key))
+                if (key_matches(curr, search_key))
                 {
                     return const_iterator(this, curr);
                 }
@@ -1539,6 +1567,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool insert(const KeyType key, const ValueType &value)
             {
+                if (head_ == nullptr)
+                {
+                    return false; //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 uint32_t insert_level0_retry_count = 0;
@@ -1638,7 +1671,7 @@ namespace MINIMAL_STD_NAMESPACE
                                 {
                                     skip_node *tombstoned_node = curr;
 
-                                    if (curr->key == key)
+                                    if (key_matches(curr, key))
                                     {
                                         soft_deleted = true;
                                     }
@@ -1674,7 +1707,7 @@ namespace MINIMAL_STD_NAMESPACE
                                     }
                                 }
 
-                                if (curr->key < key)
+                                if (key_before(curr, key))
                                 {
                                     pred = curr;
                                     curr = succ;
@@ -1685,7 +1718,7 @@ namespace MINIMAL_STD_NAMESPACE
                                 }
                             }
 
-                            if ((curr->key == key) || soft_deleted)
+                            if (key_matches(curr, key) || soft_deleted)
                             {
                                 destroy_skip_node(new_node);
                                 return false;
@@ -1751,6 +1784,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool remove(const KeyType key)
             {
+                if (head_ == nullptr)
+                {
+                    return false; //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 skip_node *preds[MAX_LEVELS + 1];
@@ -1875,7 +1913,7 @@ namespace MINIMAL_STD_NAMESPACE
                                 while (is_tombstoned)
                                 {
                                     skip_node *tombstoned_node = curr;
-                                    if (curr->key == key)
+                                    if (key_matches(curr, key))
                                     {
                                         soft_deleted = true;
                                     }
@@ -1910,7 +1948,7 @@ namespace MINIMAL_STD_NAMESPACE
                                         backoff(bottom_retry_backoff, read_guard.cpu_slot_);
                                     }
                                 }
-                                if (curr->key < key)
+                                if (key_before(curr, key))
                                 {
                                     pred = curr;
                                     curr = succ;
@@ -1920,7 +1958,7 @@ namespace MINIMAL_STD_NAMESPACE
                                     break;
                                 }
                             }
-                            if (soft_deleted || curr->key != key)
+                            if (soft_deleted || !key_matches(curr, key))
                             {
                                 return false;
                             }
@@ -1942,6 +1980,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             uint32_t size() const
             {
+                if (head_ == nullptr)
+                {
+                    return 0; //  the sentinels could not be allocated
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 auto current_node = head_->next_node[0].get_reference();
@@ -1949,7 +1992,7 @@ namespace MINIMAL_STD_NAMESPACE
                 uint32_t size = 0;
                 bool node_is_tombstoned = false;
 
-                while ((current_node != nullptr) && (current_node->key != numeric_limits<KeyType>::max()))
+                while ((current_node != nullptr) && (current_node != NIL_))
                 {
                     current_node->next_node[0].get(node_is_tombstoned);
 
@@ -1991,12 +2034,17 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool validate_ordering() const
             {
+                if (head_ == nullptr)
+                {
+                    return true; //  an empty list is ordered
+                }
+
                 epoch_read_section_guard read_guard(this);
 
                 for (int level = MAX_LEVELS; level >= 0; --level)
                 {
                     skip_node *current_node = head_;
-                    KeyType last_key = current_node->key;
+                    const KeyType *last_key = nullptr; //  the head is before every key, so there is none yet
                     uint32_t visited_steps = 0;
 
                     while (true)
@@ -2025,18 +2073,13 @@ namespace MINIMAL_STD_NAMESPACE
                             return false;
                         }
 
-                        if (next->key < last_key)
+                        if ((last_key != nullptr) && (next->key < *last_key))
                         {
                             return false;
                         }
 
-                        last_key = next->key;
+                        last_key = &next->key;
                         current_node = next;
-                    }
-
-                    if (NIL_->key < last_key)
-                    {
-                        return false;
                     }
                 }
 
@@ -2418,6 +2461,18 @@ namespace MINIMAL_STD_NAMESPACE
 #endif
             }
 
+            //  Key tests that know the end sentinel: NIL_ follows every key and matches none
+
+            bool key_before(const skip_node *node, const KeyType &key) const
+            {
+                return (node != NIL_) && (node->key < key);
+            }
+
+            bool key_matches(const skip_node *node, const KeyType &key) const
+            {
+                return (node != nullptr) && (node != NIL_) && (node->key == key);
+            }
+
             skip_node *find_lower_bound_after(const KeyType current_key) const
             {
                 bool is_tombstoned = false;
@@ -2535,7 +2590,7 @@ namespace MINIMAL_STD_NAMESPACE
                             }
                         }
 
-                        if (curr->key < search_key)
+                        if (key_before(curr, search_key))
                         {
                             pred = curr;
                             curr = succ;
@@ -2550,7 +2605,7 @@ namespace MINIMAL_STD_NAMESPACE
                     succs[level] = curr;
                 }
 
-                return ((curr != nullptr) && (curr->key == search_key)) ? find_result::FOUND : find_result::NOT_FOUND;
+                return key_matches(curr, search_key) ? find_result::FOUND : find_result::NOT_FOUND;
             }
         };
     }

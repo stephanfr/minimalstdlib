@@ -37,6 +37,8 @@ Re-derived from the current code:
 
 Abstracted:
 - **Pointers:** pointer identity, the per-level predecessor graph and memory reclamation itself are not modelled.
+- **Sentinels:** the head and tail nodes are implicit. In the code they are recognised by identity, not by key value,
+  so every key value is available to callers and the modelled key set needs no reserved values.
 - **Tombstoned keys on insert:** an insert that meets a not-yet-unlinked tombstone of its key is modelled as rejecting.
   The code links a new node beside it, but a key cannot be present and tombstoned at once at this level of
   abstraction.
