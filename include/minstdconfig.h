@@ -185,6 +185,7 @@ namespace MINIMAL_STD_NAMESPACE
     do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
+        __VA_ARGS__; /* reached only when the failure policy returns (TEST) */        \
     } while (0)
 #elif MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_THROW
 #if defined(__cpp_exceptions)
@@ -200,6 +201,7 @@ namespace MINIMAL_STD_NAMESPACE
     do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
+        __VA_ARGS__; /* reached only when the failure policy returns (TEST) */        \
     } while (0)
 #endif
 #else
