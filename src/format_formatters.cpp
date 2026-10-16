@@ -228,8 +228,6 @@ namespace FMT_FORMATTERS_NAMESPACE
     template <typename T>
     void FloatToString(minstd::string &buffer, const T &value, const arg_format_options &format)
     {
-        static uint64_t const pow10[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000};
-
         numeric_text number;
 
         //  The sign bit, not value < 0, so -0.0 and -nan keep their sign as they do in std::format
@@ -269,31 +267,62 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         //  Below 2^64 the integer part fits a uint64_t and the fraction (magnitude - units) is exact, so the
         //      decimals come from the fraction alone: the integer part takes no rounding error however large it
-        //      is.  A double carries about 17 significant digits, so up to 17 decimals are computed and any
-        //      further ones are zeros.
+        //      is.  Up to 19 decimals are computed exactly from the binary value, as std::format prints them;
+        //      any further ones are zeros.
 
         if (magnitude < 18446744073709551616.0)
         {
             static uint64_t const pow10[] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
                                              100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
                                              1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
-                                             1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL};
+                                             1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+                                             1000000000000000000ULL, 10000000000000000000ULL};
 
-            const uint32_t computed_digits = minstd::min(precision, (uint32_t)17);
+            const uint32_t computed_digits = minstd::min(precision, (uint32_t)19);
             const uint64_t decimal_multiplier = pow10[computed_digits];
 
             uint64_t units = (uint64_t)magnitude;
-            const double fraction = magnitude - (double)units;
+            const double fraction = magnitude - (double)units; //  exact
 
-            const double scaled = fraction * (double)decimal_multiplier;
-            uint64_t decimals = (uint64_t)scaled;
-            const double remainder = scaled - (double)decimals;
+            //  The fraction is exactly m / 2^e (IEEE 754: m below 2^53).  Scale it by 10^k in 128-bit integers,
+            //      so the decimals and the tie test are exact: m * 10^19 < 2^117.  Rounding a double product
+            //      instead misjudges near-ties (0.005 is slightly above a tie and must print 0.01).
 
-            //  Round half to even, as std::format does for an exact tie (2.5 -> "2", 0.125 -> "0.12")
+            uint64_t decimals = 0;
+            bool round_up = false;
 
-            const uint64_t last_digit = (computed_digits > 0) ? decimals : units;
+            if (fraction != 0)
+            {
+                uint64_t bits;
+                __builtin_memcpy(&bits, &fraction, sizeof(bits));
 
-            if ((remainder > 0.5) || ((remainder == 0.5) && ((last_digit & 1) != 0)))
+                const uint32_t biased_exponent = static_cast<uint32_t>((bits >> 52) & 0x7FF);
+                const uint64_t m = (biased_exponent == 0) ? (bits & ((uint64_t{1} << 52) - 1))                       //  subnormal
+                                                          : ((bits & ((uint64_t{1} << 52) - 1)) | (uint64_t{1} << 52)); //  normal
+                const uint32_t e = (biased_exponent == 0) ? 1074 : (1075 - biased_exponent);                          //  fraction < 1, so e > 52
+
+                if (e < 128)
+                {
+                    using uint128 = unsigned __int128;
+
+                    const uint128 product = static_cast<uint128>(m) * decimal_multiplier;
+                    const uint128 one = static_cast<uint128>(1) << e;
+                    const uint128 remainder = product & (one - 1);
+                    const uint128 half = one >> 1;
+
+                    decimals = static_cast<uint64_t>(product >> e);
+
+                    //  Round half to even, as std::format does for an exact tie (2.5 -> "2", 0.125 -> "0.12")
+
+                    const uint64_t last_digit = (computed_digits > 0) ? decimals : units;
+
+                    round_up = (remainder > half) || ((remainder == half) && ((last_digit & 1) != 0));
+                }
+
+                //  e >= 128: the fraction is below 2^-75, so 10^19 times it is far below one half: rounds to zero
+            }
+
+            if (round_up)
             {
                 if (++decimals == decimal_multiplier)
                 {

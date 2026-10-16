@@ -9,6 +9,9 @@
 #include <format_formatters>
 
 #include <ctype.h>
+#include <stdio.h>
+
+#include <random>
 
 #include "../shared/process_isolation.h"
 
@@ -433,12 +436,95 @@ namespace
         STRCMP_EQUAL("18446744073709549568.00", minstd::format(buffer, "{:.2}", 18446744073709549568.0).c_str()); //  largest double below 2^64
     }
 
-    TEST(FormatTests, FloatsComputeUpTo17Decimals)
+    TEST(FormatTests, FloatsComputeUpTo19ExactDecimals)
     {
         minstd::fixed_string<128> buffer;
 
         STRCMP_EQUAL("0.3333333333", minstd::format(buffer, "{:.10}", 1.0 / 3).c_str()); //  before: 0.3333333300
-        STRCMP_EQUAL("0.12345678901234500000", minstd::format(buffer, "{:.20}", 0.123456789012345).c_str());
+
+        //  The digits are those of the exact binary value, as printf and std::format give them
+
+        STRCMP_EQUAL("0.10000000000000001", minstd::format(buffer, "{:.17}", 0.1).c_str());
+        STRCMP_EQUAL("0.29999999999999999", minstd::format(buffer, "{:.17}", 0.3).c_str());
+        STRCMP_EQUAL("0.12345678901234499740", minstd::format(buffer, "{:.20}", 0.123456789012345).c_str()); //  19 exact, then 0
+    }
+
+    TEST(FormatTests, FloatsRoundNearTiesByTheExactValue)
+    {
+        //  The tie test used a rounded double product, so values just above or below a tie rounded the wrong way
+
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("0.01", minstd::format(buffer, "{:.2}", 0.005).c_str()); //  just above the tie; was 0.00
+        STRCMP_EQUAL("0.001", minstd::format(buffer, "{:.3}", 0.0005).c_str());
+        STRCMP_EQUAL("0.03", minstd::format(buffer, "{:.2}", 0.025).c_str());  //  just above; was 0.02
+        STRCMP_EQUAL("0.01", minstd::format(buffer, "{:.2}", 0.015).c_str());  //  just below; was 0.02
+    }
+
+    TEST(FormatTests, FloatsMatchPrintf)
+    {
+        //  Differential check against the host's printf, which rounds the exact binary value correctly
+
+        minstd::fixed_string<96> buffer;
+
+        minstd::xoroshiro128_plus_plus engine(20261016);
+
+        size_t mismatches = 0;
+        char expected[96];
+        char first_mismatch[160] = "";
+
+        for (int i = 0; i < 100000; i++)
+        {
+            //  Magnitudes from 1e-6 to 1e18, with ties and near-ties made common by short decimal mantissas
+
+            const int decimal_exponent = static_cast<int>(engine() % 25) - 6;
+            const uint64_t mantissa = (i % 2 == 0) ? (engine() % 100000) : (engine() >> 11);
+
+            double value = static_cast<double>(mantissa) / ((i % 2 == 0) ? 1000.0 : 9007199254740992.0);
+
+            for (int e = 0; e < decimal_exponent; e++)
+            {
+                value *= 10;
+            }
+
+            for (int e = 0; e > decimal_exponent; e--)
+            {
+                value /= 10;
+            }
+
+            if (value >= 1.8e19)
+            {
+                continue; //  above 2^64 only the leading 17 digits are kept (the documented limit)
+            }
+
+            if (engine() & 1)
+            {
+                value = -value;
+            }
+
+            const unsigned precision = static_cast<unsigned>(engine() % 20);
+
+            snprintf(expected, sizeof(expected), "%.*f", static_cast<int>(precision), value);
+
+            char spec_text[16];
+            snprintf(spec_text, sizeof(spec_text), "{:.%u}", precision);
+
+            minstd::format(buffer, spec_text, value);
+
+            if (!(buffer == expected))
+            {
+                if (mismatches++ == 0)
+                {
+                    snprintf(first_mismatch, sizeof(first_mismatch), "%.17g at .%u: got %s expected %s", value, precision, buffer.c_str(), expected);
+                }
+            }
+        }
+
+        if (mismatches != 0)
+        {
+            FAIL(first_mismatch);
+        }
+
     }
 
     TEST(FormatTests, FloatTiesRoundToEven)

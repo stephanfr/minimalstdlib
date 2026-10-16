@@ -6,6 +6,7 @@
 
 #include <minstdconfig.h>
 
+#include <lockfree/intrusive_tagged_stack>
 #include <lockfree/tagged_ptr>
 
 //
@@ -80,5 +81,44 @@ namespace
         //  The hosted test build keeps its earlier behaviour (no sign extension)
 
         CHECK(minstd::lockfree::default_pointer_top_bits == pointer_top_bits::zero);
+    }
+
+    TEST(TaggedPtrTests, NullRoundTripsUnderEveryRule)
+    {
+        //  Under ONES, null decoded as 0xFFFF0000'00000000: empty stacks then looked non-empty and were dereferenced
+
+        CHECK_EQUAL(uintptr_t{0}, round_trip<pointer_top_bits::ones>(0, 0));
+        CHECK_EQUAL(uintptr_t{0}, round_trip<pointer_top_bits::ones>(0, 0xFFFF));
+        CHECK_EQUAL(uintptr_t{0}, round_trip<pointer_top_bits::sign_extend_47>(0, 0x1234));
+        CHECK_EQUAL(uintptr_t{0}, round_trip<pointer_top_bits::zero>(0, 0xFFFF));
+
+        POINTERS_EQUAL(nullptr, codec<pointer_top_bits::ones>::unpack_ptr(codec<pointer_top_bits::ones>::make(nullptr)));
+    }
+
+    TEST(TaggedPtrTests, EmptyStackUnderTheOnesRule)
+    {
+        //  The single arena's free lists are intrusive_tagged_stacks headed by make(nullptr); popping an empty one
+        //      under ONES followed the bogus decoded pointer.
+
+        struct stack_node
+        {
+            stack_node *next_;
+        };
+
+        struct adapter
+        {
+            stack_node *to_node(stack_node *node) const { return node; }
+            stack_node *to_link(stack_node *node) const { return node; }
+        };
+
+        using ones_codec = minstd::lockfree::tagged_ptr<stack_node, uint16_t, pointer_top_bits::ones>;
+        using stack_type = minstd::lockfree::intrusive_tagged_stack<stack_node, ones_codec, stack_node *, &stack_node::next_>;
+
+        minstd::atomic<uint64_t> head{ones_codec::make(nullptr)};
+
+        auto no_backoff = [](size_t &) {};
+
+        POINTERS_EQUAL(nullptr, stack_type::pop(head, adapter{}, no_backoff));
+        POINTERS_EQUAL(nullptr, stack_type::steal_all(head));
     }
 }
