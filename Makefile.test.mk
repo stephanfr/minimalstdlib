@@ -138,7 +138,7 @@ DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 # ---------------------------------------------------------------------------
 # Phony targets
 # ---------------------------------------------------------------------------
-.PHONY: test test-correctness test-failure-modes test-performance test-performance-comparison test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan
+.PHONY: test test-correctness test-failure-modes test-config-matrix test-performance test-performance-comparison test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
@@ -159,6 +159,10 @@ test-correctness-tsan: $(TSAN_CORRECTNESS_EXE) $(TSAN_LOCKFREE_CORRECTNESS_EXE)
 
 test-failure-modes: lib $(FAILURE_MODE_EXE)
 	./$(FAILURE_MODE_EXE)
+
+#  The correctness suites under each non-default build setting (see test/run_config_matrix.sh)
+test-config-matrix: lib
+	MAKE_ARGS="CPPUTEST_PATH=$(CPPUTEST_PATH) MINIMALCLIB_DIR=$(MINIMALCLIB_DIR)" test/run_config_matrix.sh
 
 #  The lock-free vs. std comparison takes ~15 minutes and is run on demand (test-performance-comparison), not in CI.
 test-performance: lib $(PERFORMANCE_EXE)

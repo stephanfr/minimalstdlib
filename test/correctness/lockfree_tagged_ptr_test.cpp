@@ -76,11 +76,16 @@ namespace
         CHECK_EQUAL(HIGH, reinterpret_cast<uintptr_t>(codec<pointer_top_bits::ones>::unpack_ptr(incremented)));
     }
 
-    TEST(TaggedPtrTests, TestBuildDefaultsToTheZeroRule)
+    TEST(TaggedPtrTests, DefaultRuleFollowsTheBuildSetting)
     {
-        //  The hosted test build keeps its earlier behaviour (no sign extension)
+        //  The default codec follows MINIMAL_STD_POINTER_TOP_BITS; the hosted test build leaves it at ZERO (its
+        //      earlier behaviour, no sign extension), and test/run_config_matrix.sh overrides it
 
+        CHECK(minstd::lockfree::default_pointer_top_bits == static_cast<pointer_top_bits>(MINIMAL_STD_POINTER_TOP_BITS));
+
+#if !defined(MINIMAL_STD_CONFIG_MATRIX)
         CHECK(minstd::lockfree::default_pointer_top_bits == pointer_top_bits::zero);
+#endif
     }
 
     TEST(TaggedPtrTests, NullRoundTripsUnderEveryRule)

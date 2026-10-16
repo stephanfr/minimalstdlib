@@ -6,6 +6,7 @@ lib/
 test/build/
 test/build-asan/
 test/build-tsan/
+test/build-config/
 test/coverage/
 test/stats
 
