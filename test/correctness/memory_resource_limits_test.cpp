@@ -20,6 +20,7 @@
 #include <__memory_resource/tracking_memory_resource.h>
 #include <__memory_resource/__extensions/memory_resource_statistics.h>
 #include <single_block_memory_heap>
+#include <__platform/cpu_platform_abstractions.h>
 #include <stack_memory_heap>
 
 #include "../shared/process_isolation.h"
@@ -494,4 +495,77 @@ TEST(MemoryResourceLimitsTests, SingleArenaBoundaryBehaviour)
     }
 
     free(arena);
+}
+
+TEST(MemoryResourceLimitsTests, DefaultHeapServesDefaultAlignedRequests)
+{
+    //  The heap's default alignment was alignof(single_block_memory_heap), 8, while memory_resource::allocate()
+    //      asks for 16 by default: the adapter refused about every other request.  The buffer here is deliberately
+    //      only 8-aligned; the heap now starts at its first 16-byte boundary.
+    alignas(16) static char heap_buffer[16 * 1024 + 8];
+    minstd::single_block_memory_heap heap(heap_buffer + 8, 16 * 1024);
+    minstd::pmr::memory_heap_resource_adapter resource(heap);
+
+    for (size_t i = 0; i < 64; i++)
+    {
+        void *p = resource.allocate(24 + (i % 3) * 8); //  default alignment
+        CHECK(p != nullptr);
+        CHECK_EQUAL(0u, reinterpret_cast<uintptr_t>(p) % 16);
+    }
+}
+
+TEST(MemoryResourceLimitsTests, BitblockFallsBackToOtherArenasWhenUpstreamIsExhausted)
+{
+    //  When this CPU's arena could not add a block because upstream was out of memory, allocate() returned nullptr
+    //      without trying the free elements of the other arenas (it fell back only when the block cap was reached).
+
+    class two_blocks_only : public minstd::pmr::memory_resource
+    {
+    public:
+        size_t served = 0;
+
+    private:
+        minstd::pmr::malloc_free_wrapper_memory_resource upstream_;
+
+        void *do_allocate(size_t bytes, size_t alignment) override
+        {
+            return (served++ < 2) ? upstream_.allocate(bytes, alignment) : nullptr; //  the two initial arena blocks
+        }
+
+        void do_deallocate(void *p, size_t bytes, size_t alignment) override
+        {
+            upstream_.deallocate(p, bytes, alignment);
+        }
+
+        bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+        {
+            return this == &other;
+        }
+    };
+
+    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; }); //  every request starts in arena 0
+
+    {
+        two_blocks_only upstream;
+        minstd::pmr::lockfree_bitblock_resource<64, 1024, 4, 8> resource(&upstream, 2);
+
+        static void *blocks[4096];
+        size_t allocated = 0;
+
+        while ((allocated < 4096) && ((blocks[allocated] = resource.allocate(16)) != nullptr))
+        {
+            allocated++;
+        }
+
+        //  Both arenas' blocks are used: before the fix only arena 0's 1024 elements were
+
+        CHECK(allocated > 1024 + 512);
+
+        for (size_t i = 0; i < allocated; i++)
+        {
+            resource.deallocate(blocks[i], 16);
+        }
+    }
+
+    minstd::platform::clear_test_cpu_id_provider();
 }

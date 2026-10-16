@@ -239,6 +239,13 @@ namespace MINIMAL_STD_NAMESPACE
             return false;
         }
 
+        //  An explicit alignment overrides a type's default zero fill (pointers zero-fill by default), as in std
+
+        if (format_options.alignment().has_value())
+        {
+            format_options.set_zero_fill(false);
+        }
+
         //  Return if we are at the end of the string
 
         if (processed_characters >= argument_format.length())

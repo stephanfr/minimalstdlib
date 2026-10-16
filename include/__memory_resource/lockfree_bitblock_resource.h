@@ -450,12 +450,11 @@ namespace MINIMAL_STD_NAMESPACE
                     return result;
                 }
 
-                if (!cap_reached)
-                {
-                    return nullptr;
-                }
+                //  Cross-arena fallback: try existing blocks in other arenas.  This applies whether this arena could
+                //      not grow because the block cap was reached or because upstream had no memory left: either way
+                //      other arenas may still have free elements.
 
-                //  Cross-arena fallback: try existing blocks in other arenas.
+                (void)cap_reached;
 
                 for (size_t offset = 1; offset < number_of_arenas_; ++offset)
                 {

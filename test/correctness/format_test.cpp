@@ -570,4 +570,16 @@ namespace
         STRCMP_EQUAL("                ", minstd::format(buffer, "{:4000000000}", (int32_t)1).c_str());
         STRCMP_EQUAL("1.00000000000000", minstd::format(buffer, "{:.4000000000}", 1.0).c_str());
     }
+
+    TEST(FormatTests, PointerHonoursAnExplicitAlignment)
+    {
+        //  The pointer default (zero fill, width 18) was merged into a spec with an alignment, so the zero fill won
+
+        minstd::fixed_string<64> buffer;
+        void *pointer = (void *)0xa3348;
+
+        STRCMP_EQUAL("0X00000000000A3348", minstd::format(buffer, "{}", pointer).c_str()); //  the default is unchanged
+        STRCMP_EQUAL("             0XA3348", minstd::format(buffer, "{:>20}", pointer).c_str());
+        STRCMP_EQUAL("******0XA3348*******", minstd::format(buffer, "{:*^20}", pointer).c_str());
+    }
 }
