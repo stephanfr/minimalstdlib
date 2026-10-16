@@ -14,6 +14,7 @@
 #include <minstdconfig.h>
 
 #include <avl_tree>
+#include <buffer>
 #include <dynamic_string>
 #include <fixed_string>
 #include <forward_list>
@@ -1172,6 +1173,182 @@ namespace
             {
                 FAIL(d.text);
             }
+        }
+    }
+
+    //
+    //  stack_buffer and heap_buffer against a flat array
+    //
+
+    void buffer_differential(minstd::buffer<uint16_t> &buffer, size_t capacity, uint64_t seed, divergence &d)
+    {
+        minstd::xoroshiro128_plus_plus engine(seed);
+
+        uint16_t reference[256];
+        size_t count = 0;
+
+        buffer.clear();
+
+        for (size_t step = 0; (step < 6000) && !d.found; step++)
+        {
+            const char *operation = "";
+
+            switch (engine() % 6)
+            {
+            case 0:
+            {
+                operation = "append(element)";
+                const uint16_t v = static_cast<uint16_t>(engine());
+                const size_t appended = buffer.append(v);
+                const size_t want = (count < capacity) ? 1 : 0;
+                if (appended != want) d.at(step, operation, "appended count differs");
+                if (want) reference[count++] = v;
+                break;
+            }
+
+            case 1:
+            case 2:
+            {
+                operation = "append(block)";
+                uint16_t block[64];
+                const size_t n = engine() % 64;
+                for (size_t i = 0; i < n; i++) block[i] = static_cast<uint16_t>(engine());
+                const size_t appended = buffer.append(block, n);
+                const size_t want = (n < capacity - count) ? n : capacity - count;
+                if (appended != want) d.at(step, operation, "appended count differs");
+                for (size_t i = 0; i < want; i++) reference[count++] = block[i];
+                break;
+            }
+
+            case 3:
+                operation = "pop_back";
+                buffer.pop_back();
+                if (count > 0) count--;
+                break;
+
+            case 4:
+                operation = "write through operator[]";
+                if (count > 0)
+                {
+                    const size_t index = engine() % count;
+                    const uint16_t v = static_cast<uint16_t>(engine());
+                    buffer[index] = v;
+                    reference[index] = v;
+                }
+                break;
+
+            default:
+                operation = "clear";
+                if ((engine() % 20) == 0)
+                {
+                    buffer.clear();
+                    count = 0;
+                }
+                break;
+            }
+
+            if ((buffer.size() != count) || (buffer.space_remaining() != capacity - count) || (buffer.buffer_size() != capacity))
+            {
+                d.at(step, operation, "size, space or capacity differs");
+            }
+
+            const minstd::buffer<uint16_t> &read_only = buffer;
+
+            for (size_t i = 0; i < count; i++)
+            {
+                if ((buffer[i] != reference[i]) || (read_only[i] != reference[i]) || (buffer.data()[i] != reference[i]) || (read_only.data()[i] != reference[i]))
+                {
+                    d.at(step, operation, "contents differ");
+                    break;
+                }
+            }
+        }
+    }
+
+    TEST(DifferentialContainerTests, StackBufferMatchesAnArray)
+    {
+        for (uint64_t seed = 1; seed <= 4; seed++)
+        {
+            minstd::stack_buffer<uint16_t, 200> buffer;
+            divergence d;
+
+            buffer_differential(buffer, 200, seed, d);
+
+            if (d.found)
+            {
+                FAIL(d.text);
+            }
+        }
+    }
+
+    TEST(DifferentialContainerTests, HeapBufferMatchesAnArrayAndMovesOwnership)
+    {
+        for (uint64_t seed = 1; seed <= 4; seed++)
+        {
+            minstd::heap_buffer<uint16_t> buffer(heap, 150);
+            divergence d;
+
+            buffer_differential(buffer, 150, seed, d);
+
+            if (d.found)
+            {
+                FAIL(d.text);
+            }
+
+            //  A move hands over the block and its contents; the source is left empty and frees nothing
+
+            const size_t size = buffer.size();
+            const uint16_t first = (size > 0) ? buffer[0] : 0;
+
+            minstd::heap_buffer<uint16_t> moved(minstd::move(buffer));
+
+            CHECK_EQUAL(size, moved.size());
+            CHECK_EQUAL(150u, moved.buffer_size());
+            CHECK_EQUAL(0u, buffer.size());
+            CHECK_EQUAL(0u, buffer.buffer_size());
+            POINTERS_EQUAL(nullptr, buffer.data());
+
+            if (size > 0)
+            {
+                CHECK_EQUAL(first, moved[0]);
+            }
+        }
+    }
+
+    TEST(DifferentialContainerTests, VectorAssignmentAcrossCapacities)
+    {
+        //  Copy assignment reallocates when the target is smaller than the source; contents must match exactly
+
+        using vector_type = minstd::vector<int>;
+        minstd::pmr::polymorphic_allocator<int> allocator(&heap);
+
+        minstd::xoroshiro128_plus_plus engine(5);
+
+        for (int round = 0; round < 200; round++)
+        {
+            const size_t source_capacity = 1 + engine() % 40;
+            const size_t target_capacity = 1 + engine() % 40;
+
+            vector_type source(allocator, source_capacity);
+            vector_type target(allocator, target_capacity);
+
+            const size_t source_count = engine() % (source_capacity + 1);
+            for (size_t i = 0; i < source_count; i++) source.push_back(static_cast<int>(engine() % 1000));
+
+            const size_t target_count = engine() % (target_capacity + 1);
+            for (size_t i = 0; i < target_count; i++) target.push_back(-1);
+
+            target = source;
+
+            CHECK_EQUAL(source.size(), target.size());
+            CHECK(target.capacity() >= source.size());
+
+            for (size_t i = 0; i < source.size(); i++)
+            {
+                CHECK_EQUAL(source[i], target[i]);
+            }
+
+            CHECK(target == source);
         }
     }
 }

@@ -7,6 +7,7 @@ test/build/
 test/build-asan/
 test/build-tsan/
 test/build-config/
+test/build-fuzz/
 test/coverage/
 test/stats
 
