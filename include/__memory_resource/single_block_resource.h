@@ -27,10 +27,14 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
-        //  This resource starts with a super-block of memory and then allocates blocks from that superblock.
-        //      When the superblock is exhausted, a new superblock is allocated from the upstream resource.
-        //      The blocks and allocations will be aligned on __max_align (should be 16 bytes) boundaries
-        //      which should be optimal for modern processors.
+        //  This resource carves allocations from the single block of memory it is given; it has no upstream
+        //      resource, so it returns nullptr once the block is used up.  Allocations are aligned to 16 bytes, or
+        //      more when requested.
+        //
+        //  Freed blocks are kept on per-size-class lists and reused for later requests of the same class only:
+        //      a request searches its own class's list, then the unused tail of the block.  Memory freed by blocks
+        //      of one size class is therefore not available to requests of another, so a workload whose sizes
+        //      shift over time can see nullptr while plenty of the block is free.
         //
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 

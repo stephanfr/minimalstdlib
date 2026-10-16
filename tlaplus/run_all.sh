@@ -61,7 +61,9 @@ for cfg in $(cd "$TLA_DIR" && find . -name '*.cfg' | sort); do
     if [ "$verdict" = "TIMEOUT" ]; then
         outcome="UNEXPECTED"
     elif expected_to_fail "$name"; then
-        [[ "$verdict" == *"No error"* ]] && outcome="UNEXPECTED"
+        #  Only a real counterexample counts: a parse error, a missing module or no spec at all is not the
+        #  expected failure
+        [[ "$verdict" =~ is\ violated|Temporal\ properties\ were\ violated|Deadlock\ reached|evaluated\ to\ FALSE ]] || outcome="UNEXPECTED"
     else
         [[ "$verdict" == *"No error"* ]] || outcome="UNEXPECTED"
     fi

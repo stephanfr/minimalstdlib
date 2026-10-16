@@ -93,13 +93,16 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
+                //  Frees are routed by the caller's size and alignment, which must match the allocation (as for any
+                //      memory_resource): a mismatch can send a block to the wrong pool.
+
                 if (should_use_small_pool(bytes, alignment))
                 {
                     small_resource_.deallocate(block, bytes, alignment);
                 }
-                else
+                else if (!large_resource_.try_deallocate(block, bytes, alignment))
                 {
-                    large_resource_.deallocate(block, bytes, alignment);
+                    return; //  rejected (e.g. a double free): nothing was freed, so nothing to count
                 }
 
                 this->deallocation_made(bytes);

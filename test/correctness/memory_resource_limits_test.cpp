@@ -23,6 +23,7 @@
 #include <__platform/cpu_platform_abstractions.h>
 #include <stack_memory_heap>
 
+#include "../shared/os_abstractions.h"
 #include "../shared/process_isolation.h"
 
 #include <stdint.h>
@@ -567,5 +568,5 @@ TEST(MemoryResourceLimitsTests, BitblockFallsBackToOtherArenasWhenUpstreamIsExha
         }
     }
 
-    minstd::platform::clear_test_cpu_id_provider();
+    minstd::pmr::test::os_abstractions::install_test_cpu_id_provider(); //  the default the test main installs
 }

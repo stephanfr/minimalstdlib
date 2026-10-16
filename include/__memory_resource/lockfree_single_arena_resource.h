@@ -462,8 +462,6 @@ namespace MINIMAL_STD_NAMESPACE
                           "max_waste_percent must be in the range [1, 25]");
             static_assert(max_bin_bytes >= 1024,
                           "max_bin_bytes must be at least 1024 bytes");
-            static_assert(max_bin_bytes < (size_t{1} << 32),
-                          "max_bin_bytes must be below 4 GiB: block sizes are kept in 32-bit metadata fields");
 
             static constexpr size_t MIN_BIN_BYTES = DEFAULT_ALIGNMENT;
             static constexpr size_t MAX_BIN_BYTES = max_bin_bytes;
@@ -516,6 +514,10 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr size_t NUM_NON_SENTINEL_FREE_BLOCK_BINS = compute_non_sentinel_bin_count();
             static constexpr size_t NUM_FREE_BLOCK_BINS = NUM_NON_SENTINEL_FREE_BLOCK_BINS + 1;
             static constexpr size_t MAX_ALLOCATION_SIZE_INTERNAL = max_bin_bytes_aligned();
+
+            //  After alignment, so exactly 4 GiB (which truncates to 0) is excluded too
+            static_assert(MAX_ALLOCATION_SIZE_INTERNAL < (size_t{1} << 32),
+                          "max_bin_bytes must be below 4 GiB: block sizes are kept in 32-bit metadata fields");
 
             static constexpr array<size_t, NUM_FREE_BLOCK_BINS> build_free_block_bin_sizes()
             {
@@ -609,6 +611,13 @@ namespace MINIMAL_STD_NAMESPACE
             //  The largest request that can succeed: the biggest bin also holds the allocation header
 
             static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL - ALLOCATION_HEADER_SIZE;
+
+            //  deallocate() that reports whether the block was accepted (false: not a live block of this arena)
+
+            bool try_deallocate(void *block, size_t bytes, size_t alignment)
+            {
+                return do_try_deallocate(block, bytes, alignment);
+            }
 
         private:
             const void *const block_;   //  first DEFAULT_ALIGNMENT boundary of the caller's block

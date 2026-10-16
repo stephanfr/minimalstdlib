@@ -72,9 +72,11 @@ namespace
 
         alignas(minstd::atomic<uint64_t>) unsigned char storage[sizeof(minstd::atomic<uint64_t>)];
 
-        for (auto &b : storage)
+        volatile unsigned char *fill = storage; //  volatile, so the compiler cannot drop the fill as dead stores
+
+        for (size_t i = 0; i < sizeof(storage); i++)
         {
-            b = 0xA5;
+            fill[i] = 0xA5;
         }
 
         auto *value = new (storage) minstd::atomic<uint64_t>();

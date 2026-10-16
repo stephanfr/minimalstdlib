@@ -869,8 +869,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     //  Allocate exactly in order, then deallocate the tail blocks from multiple
     //  threads to stress the frontier reclaim path (try_reclaim_frontier_blocks).
 
-    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
-
     //  Use a single shard so pending maintenance is deterministic in this correctness test.
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -977,8 +975,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
         }
     }
 
-    minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
-
     CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
@@ -987,8 +983,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
 {
     //  Regression guard for packed block-state transitions when metadata is
     //  repeatedly recycled and reused across maintenance windows.
-
-    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
 
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -1045,8 +1039,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
                 resource.deallocate(flush_ptrs[i], flush_size);
             }
         }
-
-        minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
 
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());

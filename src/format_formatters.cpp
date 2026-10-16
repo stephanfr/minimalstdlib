@@ -129,7 +129,14 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         for (size_t i = minstd::min(count, room); i > 0; i--)
         {
+            const size_t before = buffer.size();
+
             buffer.push_back(c);
+
+            if (buffer.size() == before)
+            {
+                return; //  the buffer could not grow (a dynamic string out of memory): retrying cannot help
+            }
         }
     }
 
@@ -160,10 +167,6 @@ namespace FMT_FORMATTERS_NAMESPACE
             {
                 fill_before = fill_count / 2;
                 fill_after = fill_count - fill_before;
-            }
-            else if (format.is_right_aligned())
-            {
-                fill_before = fill_count;
             }
             else
             {
@@ -351,6 +354,8 @@ namespace FMT_FORMATTERS_NAMESPACE
             //  Too large for the integer: print its leading 17 significant digits, which is all a double
             //      carries, then zeros for the rest of the magnitude.  The scale is divided out in exact
             //      powers of ten (up to 1e22 is exact) so the leading digits pick up as little error as we can.
+            //      This is the precision limit of the formatter: the 17th digit can differ from the exact value
+            //      (printf prints the exact binary value, e.g. 1e23 as 99999999999999991611392).
 
             uint32_t exponent = 0;
             double power = 1;

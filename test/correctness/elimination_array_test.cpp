@@ -69,6 +69,7 @@ namespace
         size_t thread_id;
         size_t successful_eliminations;
         size_t failed_operations;
+        size_t null_retrievals; //  checked on the main thread: CppUTest's CHECK is not safe in worker threads
     };
 
     constexpr uint64_t TEST_SEED = 0x5eed'1234'abcdULL; //  fixed rather than time(nullptr), so runs repeat
@@ -159,6 +160,7 @@ namespace
         
         args->successful_eliminations = 0;
         args->failed_operations = 0;
+        args->null_retrievals = 0;
         
         for (size_t i = 0; i < args->num_elements && !stop_threads; ++i)
         {
@@ -188,6 +190,7 @@ namespace
         
         args->successful_eliminations = 0;
         args->failed_operations = 0;
+        args->null_retrievals = 0;
         
         test_element *retrieved_element = nullptr;
         
@@ -196,8 +199,11 @@ namespace
             if (args->array->get_element(retrieved_element))
             {
                 args->successful_eliminations++;
-                // Verify we got a valid element
-                CHECK(retrieved_element != nullptr);
+
+                if (retrieved_element == nullptr)
+                {
+                    args->null_retrievals++;
+                }
             }
             else
             {
@@ -261,9 +267,12 @@ namespace
         printf("Get thread - successful eliminations: %zu, failed: %zu\n", 
                get_args.successful_eliminations, get_args.failed_operations);
         
-        // There should be at least some successful eliminations
-        CHECK(put_args.successful_eliminations > 0 || get_args.successful_eliminations > 0);
-        
+        //  Whether any elimination happens depends on the two threads overlapping in time, which the scheduler
+        //      does not promise (one vCPU, taskset, TSan), so only conservation is checked: every element handed
+        //      over was received, and no receive produced a null.
+
+        CHECK_EQUAL(0u, get_args.null_retrievals);
+
         // The number of successful put and get eliminations should be equal
         CHECK_EQUAL(put_args.successful_eliminations, get_args.successful_eliminations);
     }
@@ -368,11 +377,14 @@ namespace
                total_successful_puts > 0 ? 
                (double)total_successful_puts / (total_successful_puts + total_failed_puts) * 100.0 : 0.0);
         
-        // Verify that the elimination array is working
-        // We should see some successful eliminations in a multi-threaded environment
-        CHECK(total_successful_puts > 0);
-        CHECK(total_successful_gets > 0);
-        
+        //  Eliminations need the threads to overlap, which the scheduler does not promise, so only conservation
+        //      is checked (see TwoThreadElimination)
+
+        for (size_t i = 0; i < NUM_CONSUMER_THREADS; ++i)
+        {
+            CHECK_EQUAL(0u, consumer_args[i].null_retrievals);
+        }
+
         // The number of successful puts and gets should be approximately equal
         // (allowing for some difference due to timing)
         long diff = (long)total_successful_puts - (long)total_successful_gets;
@@ -573,12 +585,11 @@ namespace
             // Basic sanity checks
             CHECK(total_operations > 0);
             
-            // For multi-threaded scenarios, we should see some eliminations
-            if (num_threads >= 4)
+            for (size_t i = 0; i < num_consumer_threads; ++i)
             {
-                CHECK(total_successful_puts > 0 || total_successful_gets > 0);
+                CHECK_EQUAL(0u, consumer_args[i].null_retrievals);
             }
-            
+
             // Elimination counts should be roughly balanced
             if (total_successful_puts > 0 && total_successful_gets > 0)
             {

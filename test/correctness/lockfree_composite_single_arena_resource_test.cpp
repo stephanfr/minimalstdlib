@@ -85,3 +85,29 @@ TEST(LockfreeCompositeSingleArenaResourceTests, AbsoluteAlignmentVerification)
         composite.deallocate(ptrs_64[i], (i % 200) + 1, 64);
     }
 }
+
+TEST(LockfreeCompositeSingleArenaResourceTests, RejectedLargeFreeIsNotCounted)
+{
+    //  The composite counted every deallocate(), including one the single arena rejected (a double free), so its
+    //      statistics drifted.  The failure hook absorbs the contract report the double free makes.
+    using stats_composite = minstd::pmr::lockfree_composite_single_arena_resource<1000, 64, 1024, 32, 48, true>;
+
+    static unsigned reports;
+    reports = 0;
+    auto previous = minstd::set_failure_hook([](const char *, const char *, const char *, int) { reports++; });
+
+    {
+        stats_composite composite(composite_buffer, buffer_size, 2, 1);
+
+        void *large = composite.allocate(4096, 16);
+        CHECK(large != nullptr);
+
+        composite.deallocate(large, 4096, 16);
+        composite.deallocate(large, 4096, 16); //  double free: rejected
+
+        CHECK_EQUAL(1u, composite.total_allocations());
+        CHECK_EQUAL(1u, composite.total_deallocations()); //  before: 2
+    }
+
+    minstd::set_failure_hook(previous);
+}
