@@ -149,13 +149,15 @@ test-correctness: lib $(CORRECTNESS_EXE) $(LOCKFREE_CORRECTNESS_EXE)
 	./$(CORRECTNESS_EXE)
 	./$(LOCKFREE_CORRECTNESS_EXE)
 
+#  allocator_may_return_null: the allocator model asks malloc-backed resources for impossible sizes and expects
+#      nullptr, as malloc returns; by default the sanitizers abort on such a request instead.
 test-correctness-asan: $(ASAN_CORRECTNESS_EXE) $(ASAN_LOCKFREE_CORRECTNESS_EXE)
-	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_CORRECTNESS_EXE)
-	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_LOCKFREE_CORRECTNESS_EXE)
+	ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ./$(ASAN_CORRECTNESS_EXE)
+	ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ./$(ASAN_LOCKFREE_CORRECTNESS_EXE)
 
 test-correctness-tsan: $(TSAN_CORRECTNESS_EXE) $(TSAN_LOCKFREE_CORRECTNESS_EXE)
-	setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
-	setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
+	TSAN_OPTIONS=allocator_may_return_null=1 setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
+	TSAN_OPTIONS=allocator_may_return_null=1 setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
 
 #  The correctness suites built with clang (CLANG_CXX), in their own object directories
 CLANG_CXX       ?= clang++
