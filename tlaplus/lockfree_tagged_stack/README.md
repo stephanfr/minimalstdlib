@@ -13,7 +13,7 @@ One label per shared-memory access:
 | `push`: `head.load`; loop { `store_link(node, head.ptr)`; CAS `head -> (node, counter + 1)` } | `U_load`, `U_link`, `U_cas` |
 | `pop`: `head.load`; loop { null → return; `next = load_link(cur)`; CAS `head -> (next, counter + 1)` }; `store_link(cur, null)` | `P_load`, `P_check`, `P_link`, `P_cas`, `P_clear` |
 | `steal_all`: CAS loop `head -> (null, counter + 1)` | one step; `StealResetsTag = TRUE` is the old `exchange(make(nullptr))`, which reset the counter to 0 |
-| caller writes into a block it owns (the static arena's bin-7 splice via `store_link`; user data over a `free_block_node`) | `Scribble`: an owner sets a node's link word to any value |
+| caller writes into a block it owns (the static arena's bin-7 splice via `store_link`; the single arena's metadata reuse) | `Scribble`: an owner sets a node's link word to any value |
 
 - A thread owns the nodes it popped or stole, and may push them back.
 - Memory is type-stable: a stale `load_link` of a node owned elsewhere returns whatever the link holds. With
@@ -61,8 +61,8 @@ is roughly 15 hours of saturated churn on one bin during a single stall. Its sta
 A stale popper reads the link word of a node that may since have been popped and handed out. That needs the node's
 memory to stay mapped, and both users meet that:
 - **`lockfree_static_arena_resource`:** blocks live in the caller's static arena and are never returned anywhere.
-  The user's plain writes into an allocated block can race with a stale popper's atomic `load_link` of its link word.
-  The value read is then discarded, because the popper's CAS fails. This is benign in practice but formally a data
-  race, documented in `tlaplus/ACCURACY.md`.
+  Its links live in a side table of `link_cell`s after the blocks, so a stale `load_link` reads a cell, never
+  memory a caller has been handed. (They used to be inside the blocks, which raced with the caller's plain writes;
+  see `tlaplus/ACCURACY.md`.)
 - **`lockfree_single_arena_resource`:** pending lists hold arena blocks and metadata records, and neither is ever
   unmapped while the resource is live.

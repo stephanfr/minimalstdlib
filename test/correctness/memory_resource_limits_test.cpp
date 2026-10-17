@@ -28,6 +28,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace
 {
@@ -80,8 +81,9 @@ TEST(MemoryResourceLimitsTests, StaticArenaDoesNotLoseTheTailOfALargerBlock)
 {
     //  A 64-byte request served from a free 128-byte block used to keep the whole block; deallocate() files it by the
     //      request size, so the other 64 bytes were lost for good.  Now the block is split.
-    alignas(64) static char arena[256];
+    alignas(64) static char arena[4 * (64 + 4)]; //  four 64-byte blocks and their free-list cells
     minstd::pmr::lockfree_static_arena_resource resource(arena, sizeof(arena));
+    CHECK_EQUAL(256u, resource.capacity());
 
     void *a = resource.allocate(128, 64);
     void *b = resource.allocate(64, 64);
@@ -107,8 +109,9 @@ TEST(MemoryResourceLimitsTests, StaticArenaDoesNotLoseTheTailOfALargerBlock)
 TEST(MemoryResourceLimitsTests, StaticArenaLargeBlockIsSplitToTheRequest)
 {
     //  A best-fit block from the large bin is split too: the remainder stays allocatable.
-    alignas(64) static char arena[16 * 1024];
+    alignas(64) static char arena[256 * (64 + 4)]; //  16 KiB of blocks and their free-list cells
     minstd::pmr::lockfree_static_arena_resource resource(arena, sizeof(arena));
+    CHECK_EQUAL(16u * 1024, resource.capacity());
 
     void *big = resource.allocate(16 * 1024, 64);
     CHECK(big != nullptr);
@@ -569,4 +572,60 @@ TEST(MemoryResourceLimitsTests, BitblockFallsBackToOtherArenasWhenUpstreamIsExha
     }
 
     minstd::pmr::test::os_abstractions::install_test_cpu_id_provider(); //  the default the test main installs
+}
+
+TEST(MemoryResourceLimitsTests, StaticArenaKeepsItsFreeListOutsideTheBlocks)
+{
+    //  The free-bin links live in a table after the blocks (one 4-byte cell per 64-byte block), so a stalled popper
+    //      never reads memory a caller owns.  The split must fit the buffer exactly, aligned or not, and a buffer too
+    //      small for one block and its cell yields an empty resource.  (Heap buffers: ASan reports any overrun.)
+
+    static const size_t offsets[] = {0, 1, 8, 63};
+    static const size_t sizes[] = {0, 10, 64, 67, 68, 69, 136, 1000, 4096};
+
+    for (size_t offset : offsets)
+    {
+        for (size_t size : sizes)
+        {
+            char *raw = static_cast<char *>(malloc(size + offset + 1));
+            char *start = raw + offset;
+
+            {
+                minstd::pmr::lockfree_static_arena_resource resource(start, size);
+
+                const uintptr_t first_block = (reinterpret_cast<uintptr_t>(start) + 63) & ~uintptr_t{63};
+                const size_t padding = first_block - reinterpret_cast<uintptr_t>(start);
+                const size_t expected_blocks = (size > padding) ? (size - padding) / 68 : 0;
+
+                CHECK_EQUAL(expected_blocks * 64, resource.capacity());
+
+                //  Fill every block, write all of it, then free and refill: the cells must survive all of it
+
+                void *blocks[64];
+                size_t count = 0;
+
+                while ((count < 64) && ((blocks[count] = resource.allocate(64, 64)) != nullptr))
+                {
+                    memset(blocks[count], 0xEE, 64);
+                    count++;
+                }
+
+                CHECK_EQUAL(expected_blocks < 64 ? expected_blocks : size_t{64}, count);
+
+                for (size_t i = 0; i < count; i++)
+                {
+                    resource.deallocate(blocks[i], 64, 64);
+                }
+
+                for (size_t i = 0; i < count; i++)
+                {
+                    void *again = resource.allocate(64, 64);
+                    CHECK(again != nullptr);
+                    memset(again, 0xDD, 64);
+                }
+            }
+
+            free(raw);
+        }
+    }
 }

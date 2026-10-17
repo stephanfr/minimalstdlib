@@ -17,7 +17,7 @@ otherwise.
 |-------|----------|---------------------|-------------------------|-----------------------------|
 | `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`fixed_small_live`, `fixed_irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
 | `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
-| `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | user writes vs. a stale popper's `load_link`: benign, see below | type-stable arena memory |
+| `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | **fixed:** links in a side table, so a stale `load_link` never reads caller memory | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
 | `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `MutualExclusion` from the RMW results, with interrupts; a load/store mutation fails it |
 | `lockfree_bitblock_resource` | argument below + `bitblock_set` model | bounded retries | **fixed:** hint pointers now release/acquire (litmus E) | blocks never freed while live |
@@ -68,13 +68,13 @@ Everything else is `intrusive_tagged_stack` operations:
 `scribble.cfg` lets owners overwrite link words with any value, which covers both the splice and user data written
 over a free block. It shows that a stale popper's CAS still fails.
 
-**Documented race (benign, not fixed):** `free_block_node::next` is the second word of the block.
-- A popper stalled after loading the head can atomically `load_link` a block that another thread has meanwhile
-  popped, handed to its caller, and started writing with plain stores.
-- That is a data race in C++ terms. It cannot fault, because arena memory stays mapped and the popper's CAS fails on
-  the advanced counter, so the value read is discarded.
-- Making it race-free would mean keeping user data off the link word (a header word per block), or a reclamation
-  scheme. Both cost memory or time this resource is built to avoid.
+**Fixed race:** the free-bin links used to be the second word of each free block.
+- A popper stalled after loading the head could atomically `load_link` a block that another thread had meanwhile
+  popped, handed to its caller, and started writing with plain stores: a data race in C++ terms, reported by TSan
+  in `AllocatorModelTests.ConcurrentStaticArena`.
+- The links now live in a side table after the blocks, one 4-byte `link_cell` per 64-byte block (1/17 of the
+  buffer). A stale popper reads only a cell, which no caller ever writes. The block keeps only its size word, which
+  is written by the freeing owner and read only by the thread that stole bin 7.
 
 **Bin 7:** it can look empty to a concurrent large allocation while one is being searched. That is a false
 out-of-memory for large blocks, not a safety issue. It is documented in the header.
