@@ -283,6 +283,36 @@ namespace
         check_integers<uint64_t>("uint64_t", 8);
     }
 
+    //  Magnitudes from 1e-6 to below 2^64 (above it only 17 significant digits are kept, the documented limit), with
+    //      ties and near-ties made common by short decimal mantissas, and full 53-bit mantissas for the rest
+
+    double wide_magnitude(minstd::xoroshiro128_plus_plus &engine)
+    {
+        while (true)
+        {
+            const bool short_mantissa = (engine() % 2) == 0;
+            const int decimal_exponent = static_cast<int>(engine() % 25) - 6;
+            const uint64_t mantissa = short_mantissa ? (engine() % 100000) : (engine() >> 11);
+
+            double value = static_cast<double>(mantissa) / (short_mantissa ? 1000.0 : 9007199254740992.0);
+
+            for (int e = 0; e < decimal_exponent; e++)
+            {
+                value *= 10;
+            }
+
+            for (int e = 0; e > decimal_exponent; e--)
+            {
+                value /= 10;
+            }
+
+            if (value < 1.8e19)
+            {
+                return value;
+            }
+        }
+    }
+
     TEST(DifferentialFormatTests, FloatsWithSignsAndPaddingMatchPrintf)
     {
         minstd::xoroshiro128_plus_plus engine(99);
@@ -299,16 +329,20 @@ namespace
             s.sign = signs[engine() % sizeof(signs)];
             s.zero = (s.align == 0) && ((engine() % 3) == 0);
             s.width = ((engine() % 2) == 0) ? 0 : static_cast<unsigned>(engine() % 30);
-            s.precision = static_cast<int>(engine() % 12);
+            s.precision = static_cast<int>(engine() % 20); //  up to 19 decimals are exact, as printf gives them
 
             double value;
-            switch (engine() % 10)
+            switch (engine() % 12)
             {
             case 0: value = __builtin_inf(); break;
             case 1: value = -__builtin_inf(); break;
             case 2: value = __builtin_nan(""); break;
             case 3: value = -0.0; break;
             case 4: value = static_cast<double>(engine() % 1000) / 8.0; break; //  exact ties
+            case 5:
+            case 6:
+                value = wide_magnitude(engine);
+                break;
             default:
                 value = static_cast<double>(static_cast<int64_t>(engine() % 2000000) - 1000000) / 997.0;
                 break;

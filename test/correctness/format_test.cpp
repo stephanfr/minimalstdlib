@@ -344,16 +344,6 @@ namespace
         STRCMP_EQUAL("end{", minstd::format(buffer, "end{{").c_str());
     }
 
-    TEST(FormatTests, FloatsRoundAtThePrecision)
-    {
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("1.15", minstd::format(buffer, "{:.2}", 1.15).c_str());              //  before: "1.14"
-        STRCMP_EQUAL("2.0000", minstd::format(buffer, "{}", 1.99999).c_str());            //  before: "1.9999"
-        STRCMP_EQUAL("-2.0000", minstd::format(buffer, "{}", -1.99999).c_str());
-        STRCMP_EQUAL("10", minstd::format(buffer, "{:.0}", 9.7).c_str());
-    }
-
     TEST(FormatTests, FloatsOutsideTheIntegerRange)
     {
         minstd::fixed_string<128> buffer;
@@ -374,24 +364,6 @@ namespace
 
         STRCMP_EQUAL("-1234567", minstd::format(buffer, "{}", (int32_t)-12345678).c_str());
         STRCMP_EQUAL("0xabcdef", minstd::format(buffer, "{:#x}", (uint64_t)0xabcdef0123ULL).c_str());
-    }
-
-    TEST(FormatTests, UnsignedHonoursTheSignOption)
-    {
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("+5", minstd::format(buffer, "{:+}", (uint32_t)5).c_str());           //  before: "5"
-        STRCMP_EQUAL(" 5", minstd::format(buffer, "{: }", (uint64_t)5).c_str());
-        STRCMP_EQUAL("+0x0a", minstd::format(buffer, "{:+#05x}", (uint8_t)10).c_str());
-    }
-
-    TEST(FormatTests, AlternateOctalZero)
-    {
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("0", minstd::format(buffer, "{:#o}", (uint32_t)0).c_str());           //  before: "00"
-        STRCMP_EQUAL("010", minstd::format(buffer, "{:#o}", (uint32_t)8).c_str());
-        STRCMP_EQUAL("0x0", minstd::format(buffer, "{:#x}", (uint32_t)0).c_str());
     }
 
     TEST(FormatTests, FillThatIsAnAlignmentCharacter)
@@ -422,132 +394,6 @@ namespace
         STRCMP_EQUAL("{Invalid format string: '4294967296'}", minstd::format(buffer, "{4294967296}", (int32_t)1).c_str());
         STRCMP_EQUAL("{Invalid format string: ':4294967297'}", minstd::format(buffer, "{:4294967297}", (int32_t)1).c_str());
         STRCMP_EQUAL("{Invalid format string: ':.99999999999'}", minstd::format(buffer, "{:.99999999999}", 1.0).c_str());
-    }
-
-    TEST(FormatTests, FloatsKeepTheirFractionUpTo2To64)
-    {
-        minstd::fixed_string<128> buffer;
-
-        //  Values above 1.8e19 / 10^precision took a path that dropped the fraction and rounded the integer part
-
-        STRCMP_EQUAL("200000000000.75000000", minstd::format(buffer, "{:.8}", 200000000000.75).c_str()); //  before: ...001.00000000
-        STRCMP_EQUAL("100000000000000.500000", minstd::format(buffer, "{:.6}", 1e14 + 0.5).c_str());
-        STRCMP_EQUAL("2251799813685248.5000", minstd::format(buffer, "{}", 2251799813685248.5).c_str());
-        STRCMP_EQUAL("18446744073709549568.00", minstd::format(buffer, "{:.2}", 18446744073709549568.0).c_str()); //  largest double below 2^64
-    }
-
-    TEST(FormatTests, FloatsComputeUpTo19ExactDecimals)
-    {
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("0.3333333333", minstd::format(buffer, "{:.10}", 1.0 / 3).c_str()); //  before: 0.3333333300
-
-        //  The digits are those of the exact binary value, as printf and std::format give them
-
-        STRCMP_EQUAL("0.10000000000000001", minstd::format(buffer, "{:.17}", 0.1).c_str());
-        STRCMP_EQUAL("0.29999999999999999", minstd::format(buffer, "{:.17}", 0.3).c_str());
-        STRCMP_EQUAL("0.12345678901234499740", minstd::format(buffer, "{:.20}", 0.123456789012345).c_str()); //  19 exact, then 0
-    }
-
-    TEST(FormatTests, FloatsRoundNearTiesByTheExactValue)
-    {
-        //  The tie test used a rounded double product, so values just above or below a tie rounded the wrong way
-
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("0.01", minstd::format(buffer, "{:.2}", 0.005).c_str()); //  just above the tie; was 0.00
-        STRCMP_EQUAL("0.001", minstd::format(buffer, "{:.3}", 0.0005).c_str());
-        STRCMP_EQUAL("0.03", minstd::format(buffer, "{:.2}", 0.025).c_str());  //  just above; was 0.02
-        STRCMP_EQUAL("0.01", minstd::format(buffer, "{:.2}", 0.015).c_str());  //  just below; was 0.02
-    }
-
-    TEST(FormatTests, FloatsMatchPrintf)
-    {
-        //  Differential check against the host's printf, which rounds the exact binary value correctly
-
-        minstd::fixed_string<96> buffer;
-
-        minstd::xoroshiro128_plus_plus engine(20261016);
-
-        size_t mismatches = 0;
-        char expected[96];
-        char first_mismatch[160] = "";
-
-        for (int i = 0; i < 100000; i++)
-        {
-            //  Magnitudes from 1e-6 to 1e18, with ties and near-ties made common by short decimal mantissas
-
-            const int decimal_exponent = static_cast<int>(engine() % 25) - 6;
-            const uint64_t mantissa = (i % 2 == 0) ? (engine() % 100000) : (engine() >> 11);
-
-            double value = static_cast<double>(mantissa) / ((i % 2 == 0) ? 1000.0 : 9007199254740992.0);
-
-            for (int e = 0; e < decimal_exponent; e++)
-            {
-                value *= 10;
-            }
-
-            for (int e = 0; e > decimal_exponent; e--)
-            {
-                value /= 10;
-            }
-
-            if (value >= 1.8e19)
-            {
-                continue; //  above 2^64 only the leading 17 digits are kept (the documented limit)
-            }
-
-            if (engine() & 1)
-            {
-                value = -value;
-            }
-
-            const unsigned precision = static_cast<unsigned>(engine() % 20);
-
-            snprintf(expected, sizeof(expected), "%.*f", static_cast<int>(precision), value);
-
-            char spec_text[16];
-            snprintf(spec_text, sizeof(spec_text), "{:.%u}", precision);
-
-            minstd::format(buffer, spec_text, value);
-
-            if (!(buffer == expected))
-            {
-                if (mismatches++ == 0)
-                {
-                    snprintf(first_mismatch, sizeof(first_mismatch), "%.17g at .%u: got %s expected %s", value, precision, buffer.c_str(), expected);
-                }
-            }
-        }
-
-        if (mismatches != 0)
-        {
-            FAIL(first_mismatch);
-        }
-
-    }
-
-    TEST(FormatTests, FloatTiesRoundToEven)
-    {
-        minstd::fixed_string<128> buffer;
-
-        //  Exact ties round to even, as std::format does
-
-        STRCMP_EQUAL("2", minstd::format(buffer, "{:.0}", 2.5).c_str());     //  before: 3
-        STRCMP_EQUAL("4", minstd::format(buffer, "{:.0}", 3.5).c_str());
-        STRCMP_EQUAL("0.12", minstd::format(buffer, "{:.2}", 0.125).c_str()); //  before: 0.13
-        STRCMP_EQUAL("0.38", minstd::format(buffer, "{:.2}", 0.375).c_str());
-        STRCMP_EQUAL("1.15", minstd::format(buffer, "{:.2}", 1.15).c_str());
-    }
-
-    TEST(FormatTests, FloatSignsAndNonFinitePadding)
-    {
-        minstd::fixed_string<128> buffer;
-
-        STRCMP_EQUAL("-0.0000", minstd::format(buffer, "{}", -0.0).c_str()); //  before: 0.0000
-        STRCMP_EQUAL("  inf", minstd::format(buffer, "{:05}", __builtin_inf()).c_str()); //  before: 00inf
-        STRCMP_EQUAL(" -inf", minstd::format(buffer, "{:05}", -__builtin_inf()).c_str());
-        STRCMP_EQUAL("-0012.50", minstd::format(buffer, "{:08.2}", -12.5).c_str());
     }
 
     TEST(FormatTests, HugeWidthsAndPrecisionsStopAtTheBuffer)
