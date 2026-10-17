@@ -360,24 +360,22 @@ TEST(LockfreeSingleArenaMemoryResourceTests, TailFreeingRestoresFrontierAfterMai
     CHECK_EQUAL(initial_frontier, resource.extended_metrics().frontier_offset());
 }
 
-struct test_unmasked_interrupt_policy
-{
-    using interrupt_state_t = uint64_t;
-    static inline interrupt_state_t disable_interrupts() { return 0; }
-    static inline void restore_interrupts(interrupt_state_t) {}
-};
+//  The handler allocates from the resource it interrupted, so its guards must mask the signal as interrupt_guard
+//      masks interrupts on the target: the TRIMMING window in trim_metadata_records() relies on that, and with a
+//      no-op guard a handler landing inside it spins forever (bug N6, tlaplus/lockfree_allocator/bug_n6.cfg).
+//      The signal still arrives everywhere the resource leaves interrupts enabled.
 
 typedef minstd::pmr::lockfree_single_arena_resource_impl<
-    test_unmasked_interrupt_policy,
+    test_userspace_signal_mask_interrupt_policy,
     minstd::platform::default_platform_provider,
     128 * 1024 * 1024,
     5,
         128,
 
     minstd::pmr::extensions::lockfree_single_arena_resource_extended_statistics,
-    minstd::pmr::extensions::null_memory_resource_statistics> lockfree_single_arena_resource_unmasked;
+    minstd::pmr::extensions::null_memory_resource_statistics> lockfree_single_arena_resource_signal_masked;
 
-static lockfree_single_arena_resource_unmasked* s_reentrant_resource = nullptr;
+static lockfree_single_arena_resource_signal_masked* s_reentrant_resource = nullptr;
 static minstd::atomic<int> s_reentrant_signal_count{0};
 static minstd::atomic<bool> s_reentrant_test_done{false};
 
@@ -407,7 +405,7 @@ static void* bomber_reentrant_fn(void* arg)
 
 TEST(LockfreeSingleArenaMemoryResourceTests, DirectInterruptReentrancy)
 {
-    lockfree_single_arena_resource_unmasked resource(buffer, BUFFER_SIZE);
+    lockfree_single_arena_resource_signal_masked resource(buffer, BUFFER_SIZE);
     
     s_reentrant_resource = &resource;
     s_reentrant_signal_count = 0;
@@ -1051,7 +1049,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SignalDuringDeallocation)
     //  the deallocation path (not just during allocation as DirectInterruptReentrancy tests).
     //  The signal handler performs allocation + deallocation to provoke reentrancy.
 
-    lockfree_single_arena_resource_unmasked resource(buffer, BUFFER_SIZE);
+    lockfree_single_arena_resource_signal_masked resource(buffer, BUFFER_SIZE);
 
     s_reentrant_resource = &resource;
     s_reentrant_signal_count = 0;
