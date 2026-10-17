@@ -41,6 +41,10 @@ namespace
         CHECK_TEXT(static_cast<long double>(limits::max()) == max, text);
         CHECK_TEXT(static_cast<long double>(limits::lowest()) == min, text);
         CHECK_TEXT(limits::digits == digits, text);
+        CHECK_TEXT(limits::is_exact, text);
+        CHECK_TEXT(limits::is_modulo == !is_signed, text); //  unsigned arithmetic wraps; signed overflow is undefined
+        CHECK_TEXT(limits::radix == 2, text);
+        CHECK_TEXT(!limits::is_iec559, text);
 
         //  digits10: the decimal digits representable without change, floor(digits * log10(2))
         CHECK_TEXT(limits::digits10 == static_cast<int>(digits * 0.30102999566398119521L), text);
@@ -77,8 +81,31 @@ namespace
         CHECK(minstd::numeric_limits<const volatile int>::max() == __INT_MAX__);
     }
 
+    template <typename T>
+    void check_floating_categories(const char *name)
+    {
+        using limits = minstd::numeric_limits<T>;
+
+        CHECK_TEXT(limits::is_specialized, name);
+        CHECK_TEXT(!limits::is_integer, name);
+        CHECK_TEXT(limits::is_signed, name);
+        CHECK_TEXT(!limits::is_exact, name);
+        CHECK_TEXT(!limits::is_modulo, name);
+        CHECK_TEXT(limits::radix == __FLT_RADIX__, name);
+        CHECK_TEXT(limits::is_iec559, name); //  the targets minstd supports use IEEE 754 float and double
+    }
+
+    struct not_arithmetic
+    {
+    };
+
     TEST(DifferentialNumericsTests, FloatingLimitsMatchThePredefinedMacros)
     {
+        check_floating_categories<float>("float");
+        check_floating_categories<double>("double");
+
+        CHECK(!minstd::numeric_limits<not_arithmetic>::is_specialized);
+
         CHECK(minstd::numeric_limits<float>::max() == __FLT_MAX__);
         CHECK(minstd::numeric_limits<float>::min() == __FLT_MIN__);
         CHECK(minstd::numeric_limits<float>::lowest() == -__FLT_MAX__);

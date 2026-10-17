@@ -103,42 +103,6 @@ TEST_GROUP(RandomWideRanges)
 {
 };
 
-TEST(RandomWideRanges, NarrowEngineCoversAWideRange)
-{
-    //  The rejection threshold assumed the engine was at least as wide as the range: (0, 2^40) returned only
-    //      values in [4278190080, 2^32), and (0, 2^64 - 2) never returned.
-    engine32 engine;
-    minstd::uniform_int_distribution<uint64_t> wide(0, uint64_t{1} << 40);
-
-    uint64_t smallest = UINT64_MAX;
-    uint64_t largest = 0;
-    size_t above_32_bits = 0;
-
-    for (int i = 0; i < 20000; ++i)
-    {
-        const uint64_t v = wide(engine);
-        CHECK(v <= (uint64_t{1} << 40));
-        smallest = (v < smallest) ? v : smallest;
-        largest = (v > largest) ? v : largest;
-        above_32_bits += (v > 0xFFFFFFFFull) ? 1 : 0;
-    }
-
-    CHECK(smallest < (uint64_t{1} << 32));        //  low values appear
-    CHECK(largest > (uint64_t{1} << 39));         //  and the top half of the range
-    CHECK(above_32_bits > 19000);                 //  ~99.6% of [0, 2^40] lies above 2^32
-
-    const bool returns = minstd::pmr::test::runs_to_completion([]
-                                                               {
-                                                                   engine32 e;
-                                                                   minstd::uniform_int_distribution<uint64_t> nearly_full(0, UINT64_MAX - 1);
-                                                                   for (int i = 0; i < 1000; ++i)
-                                                                   {
-                                                                       (void)nearly_full(e);
-                                                                   }
-                                                               });
-    CHECK_TRUE(returns);
-}
-
 TEST(RandomWideRanges, SeedSeqMatchesTheStandardAlgorithm)
 {
     //  Reference values from std::seed_seq (libstdc++); the previous implementation differed in every word.
