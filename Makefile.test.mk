@@ -138,7 +138,7 @@ DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 # ---------------------------------------------------------------------------
 # Phony targets
 # ---------------------------------------------------------------------------
-.PHONY: test test-correctness test-failure-modes test-config-matrix test-performance test-performance-comparison test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan
+.PHONY: test test-correctness test-failure-modes test-config-matrix test-performance test-performance-comparison test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan test-correctness-clang
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
@@ -156,6 +156,18 @@ test-correctness-asan: $(ASAN_CORRECTNESS_EXE) $(ASAN_LOCKFREE_CORRECTNESS_EXE)
 test-correctness-tsan: $(TSAN_CORRECTNESS_EXE) $(TSAN_LOCKFREE_CORRECTNESS_EXE)
 	setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
 	setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
+
+#  The correctness suites built with clang (CLANG_CXX), in their own object directories
+CLANG_CXX       ?= clang++
+CLANG_BUILD_DIR := test/build-clang
+
+test-correctness-clang:
+	$(MAKE) -f Makefile.test.mk CC=$(CLANG_CXX) LD=$(CLANG_CXX) \
+		CPPUTEST_PATH=$(CPPUTEST_PATH) MINIMALCLIB_DIR=$(MINIMALCLIB_DIR) \
+		CORRECTNESS_OBJ_DIR=$(CLANG_BUILD_DIR)/correctness LIB_OBJ_DIR=$(CLANG_BUILD_DIR)/lib \
+		$(CLANG_BUILD_DIR)/correctness/cpputest_correctness.exe $(CLANG_BUILD_DIR)/correctness/cpputest_lockfree_correctness.exe
+	./$(CLANG_BUILD_DIR)/correctness/cpputest_correctness.exe
+	./$(CLANG_BUILD_DIR)/correctness/cpputest_lockfree_correctness.exe
 
 test-failure-modes: lib $(FAILURE_MODE_EXE)
 	./$(FAILURE_MODE_EXE)

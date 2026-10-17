@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//  A fuzz driver for compilers without libFuzzer (minstd does not build with clang, which libFuzzer needs).  It calls
+//  A fuzz driver for builds without libFuzzer (g++, or FUZZ_ENGINE=standalone in run_fuzzers.sh).  It calls
 //      the same LLVMFuzzerTestOneInput entry point with generated inputs: random bytes, bytes from a small dictionary
 //      of format-spec and number tokens, and mutations of earlier inputs.  There is no coverage feedback, so it finds
 //      less than libFuzzer would per execution; it makes up for some of that in speed.
