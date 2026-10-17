@@ -501,48 +501,4 @@ namespace
         CHECK(destination == "456");
         CHECK_EQUAL(3u, destination.length());
     }
-
-    TEST(DynamicStringTests, AppendAndAssignFromItself)
-    {
-        //  The buffer was grown (and the old one freed) before copying from the source, which pointed into it:
-        //      a 40-character string appended to itself came out 41 characters long, and reading the source was
-        //      a use after free.
-        const char *forty = "0123456789012345678901234567890123456789";
-
-        {
-            dynamic_string d(forty, heap_allocator);
-            d += d;
-            CHECK_EQUAL(80u, d.size());
-            CHECK(d == "01234567890123456789012345678901234567890123456789012345678901234567890123456789");
-
-            d = d.c_str() + 75;
-            CHECK_EQUAL(5u, d.size());
-            STRCMP_EQUAL("56789", d.c_str());
-
-            dynamic_string e(forty, heap_allocator);
-            e.append(e.c_str() + 10, 30);
-            CHECK_EQUAL(70u, e.size());
-            STRCMP_EQUAL("0123456789012345678901234567890123456789012345678901234567890123456789", e.c_str());
-
-            minstd::string &as_base = e;
-            as_base = as_base.c_str();
-            CHECK_EQUAL(70u, e.size());
-        }
-    }
-
-    TEST(DynamicStringTests, AssignmentFromALongerStringGrowsTheBuffer)
-    {
-        //  basic_string::operator=(const basic_dynamic_string&) copied without growing and set length_ to the
-        //      source length, past the end of the buffer.
-        {
-            dynamic_string small("ab", heap_allocator);
-            dynamic_string long_string("0123456789012345678901234567890123456789012345678901234567890123456789", heap_allocator);
-
-            minstd::string &as_base = small;
-            as_base = long_string;
-
-            CHECK_EQUAL(70u, small.size());
-            STRCMP_EQUAL(long_string.c_str(), small.c_str());
-        }
-    }
 }

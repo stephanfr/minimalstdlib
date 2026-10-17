@@ -995,10 +995,14 @@ namespace
                 break;
 
             case 1:
+            {
+                //  A prefix, so the character after the range is not a terminator: append must not read it
                 operation = "append";
-                s.append(source, source_length);
-                r.append(source, source_length);
+                const size_t count = engine() % (source_length + 1);
+                s.append(source, count);
+                r.append(source, count);
                 break;
+            }
 
             case 2:
                 operation = "+= text";
