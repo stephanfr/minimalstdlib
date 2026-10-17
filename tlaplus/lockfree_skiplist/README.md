@@ -64,10 +64,8 @@ upper levels. The fix restarts the remove, which is the normal remover (`Retarge
 
 | Config | Expected | Result |
 |--------|----------|--------|
-| `SkiplistUpperLevels_bug.cfg` (height 3, 1 helper, gate off) | `RetiredUnreachable` violated | violated: the inserter passes its own-link check, the remover marks and unlinks what it sees, the inserter's CAS publishes level 1, the remover retires a node still linked at level 1 |
 | `SkiplistUpperLevels.cfg` (height 3, 2 helpers) | no error; `Termination`, `EventuallyRetired` | no error, 10,160 distinct states |
 | `SkiplistUpperLevels_tall.cfg` (height 4, 3 helpers, 2 CAS failures per level) | no error; `Termination`, `EventuallyRetired` | no error, 579,519 distinct states |
-| `SkiplistUpperLevels_retarget_bug.cfg` (height 3, 2 helpers, `RetargetBug`) | `Safety` violated | violated: the remover marks level 0 before the inserter reserves level 1, sees the count drained, unlinks level 0 and retires; the inserter's own link is unmarked, so it publishes level 1 and a retired node is reachable (use-after-free). If the inserter had already finished, the node instead never drains and leaks (`RemoveThatLandsOnAReinsertedNodeReclaimsIt`) |
 
 ```bash
 cd upper_levels

@@ -6,10 +6,10 @@
 #    ./run_all.sh skiplist        only configurations whose path contains "skiplist"
 #
 #  Environment: TLC_WORKERS (default 2), TLC_TIMEOUT seconds per configuration (default 3600), TLA_JAR (default
-#  tlaplus/tla2tools.jar, downloaded if missing).  Each line is checked against the expected result: the *bug*,
-#  *current* (except slot_blocks/current_one), *_genwrap, steal_resets_tag and tag_wraps configurations model known
-#  defects or mutations and are expected to fail; every other configuration is expected to pass.  A line that
-#  differs (or times out) is marked UNEXPECTED and the script exits 1.
+#  tlaplus/tla2tools.jar, downloaded if missing).  Each line is checked against the expected result: *bug*
+#  configurations model a known defect and are expected to fail (one is kept as an example,
+#  lockfree_allocator/bug_n6.cfg); every other configuration is expected to pass.  A line that differs (or times
+#  out) is marked UNEXPECTED and the script exits 1.
 #
 #  A spec is chosen per configuration: the only .tla file in its directory, or else the .tla whose name is the
 #  longest prefix of the configuration's name.  The committed .tla files carry their PlusCal translation.
@@ -25,8 +25,7 @@ fi
 
 expected_to_fail() {
     case "$1" in
-        current_one) return 1 ;;  #  the single-list baseline passes (slot_blocks/README.md)
-        *bug*|*current*|*_genwrap|steal_resets_tag|tag_wraps) return 0 ;;
+        *bug*) return 0 ;;
         *) return 1 ;;
     esac
 }

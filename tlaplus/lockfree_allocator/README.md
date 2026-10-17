@@ -4,7 +4,7 @@
 
 It replaces `LockfreeAllocatorTagged.tla`, which described an earlier design (soft-deleted metadata, iterators, last-block reclaim) that no longer exists in the code.
 
-`boundary/` holds three small models of just the frontier/metadata boundary. They reproduce the overlap bug that the `FixedBoundary` switch below fixes; this model needs five concurrent allocations to reach it, which is beyond an exhaustive run.
+`boundary/` holds two small models of just the frontier/metadata boundary as the code handles it now (the `FixedBoundary` switch below); checking the overlap there needs five concurrent allocations, which is beyond an exhaustive run of this model.
 
 ## What is modelled
 
@@ -73,7 +73,7 @@ Deadlock checking is on, which is how an interrupt handler that can never finish
 
 ## Configurations and expected results
 
-`fixed_*` configurations correspond to the current code (every switch on). `bug_*` configurations turn one switch off.
+`fixed_*` configurations correspond to the current code (every switch on). `bug_n6.cfg` is kept as an example of what the switches are for: it turns one fix off and TLC shows the defect (the deadlock that the trim's interrupt guard prevents). Models of the other fixed defects were removed once their fixes were in; the correct specs are what prove the code.
 
 | Config | Switches | Expected | Result (TLC 1.8, 2 workers) |
 |--------|----------|----------|-----------------------------|
@@ -85,18 +85,13 @@ Deadlock checking is on, which is how an interrupt handler that can never finish
 | `fixed_irq_live.cfg` | as `fixed_irq.cfg`, `SpecIFair` | no error; `Termination` | no error, `Termination` holds; 1,513,359 distinct states |
 | `fixed_irq2.cfg` | all fixed; 2 CPUs × 1 op, each with an interrupt handler (1 op) | no error, no deadlock | no error in 13,254,117 distinct states (stopped after 50 min with TSan sharing the CPUs, not exhaustive; 811,561 states left on the queue) |
 | `fixed_irq2_small.cfg` | as `fixed_irq2.cfg` with one block size (2) and 10 arena units | no error, no deadlock | no error; 31,195,287 distinct states (exhaustive, 60 min on 4 workers) |
-| `bug_precas.cfg` | `pre_cas_backlink`, no serialisation | assertion in `FB_pre`: back-link written inside a live block | assertion in `FB_pre` fails |
-| `bug_n3only_stale.cfg` | `post_cas_hint` (N3 only), no serialisation, `StaleBacklinkAt5` | assertion in `TR_meta`: reclaimer reads a header inside a live block (the TSan report behind N4) | assertion in `TR_meta` fails |
-| `bug_n5.cfg` | `PendingCountFirst = FALSE` | `PendingCountExact` violated | `Safety` violated (count 1, list empty) |
 | `bug_n6.cfg` | `GuardTrim = FALSE`; 1 CPU + interrupt | deadlock: handler spins in `GM_breserve` while the interrupted `Trim` holds TRIMMING | deadlock |
-
-The boundary bug (`FixedBoundary = FALSE`) needs five allocations in flight and is reproduced in `boundary/MetaFrontier_bug.cfg` instead.
 
 ## Running
 
 ```bash
 ./run_tlc.sh fixed_small.cfg                     # exhaustive, ~6 minutes on 3 cores
-./run_tlc.sh bug_n5.cfg                          # expected to fail: prints the counterexample
+./run_tlc.sh bug_n6.cfg                          # expected to fail: prints the counterexample
 ./run_tlc.sh fixed_small.cfg -simulate -depth 600   # random deeper runs
 ```
 

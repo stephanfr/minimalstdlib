@@ -26,7 +26,6 @@ republished between its two loads.
 
 | Config | What | Expected | Result |
 |--------|------|----------|--------|
-| `SlotHandleResolution_current.cfg` | generation checked before the table load only | assertion fails | fails: the reader checks generation 1, the slot is freed and republished as generation 2, and the reader returns node 2 |
 | `SlotHandleResolution_recheck.cfg` | generation re-checked after the table load | no error, terminates | no error, 41,747 distinct states |
 
 ## Iterators (use-after-free, found by the stress test)
@@ -58,5 +57,4 @@ three codegens.
 
 | Config | What | Expected | Result |
 |--------|------|----------|--------|
-| `IteratorSavedHandle_current.cfg` | `operator++` resolves with `unpack_ptr` | assertion fails | fails: the node is retired, the iterator enters a section in a later epoch, the reclaimer frees the node, the iterator reads it |
 | `IteratorSavedHandle_fixed.cfg` | `unpack_unretired_ptr` | no error, terminates | no error, 4,306 distinct states |

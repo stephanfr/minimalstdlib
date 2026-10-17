@@ -16,8 +16,8 @@
 | `OwnedImpliesSet`, `SetImpliesOwned` | the word and the holders agree |
 | `ReleaseByOwnerSucceeds` | an owner's release returns `SUCCESS` |
 
-`NonAtomic = TRUE` splits each RMW into a load and a store. That is a mutation, showing what the code would be
-without the atomic RMW, and `MutualExclusion` then fails: the invariants catch a race.
+`NonAtomic = TRUE` splits each RMW into a load and a store: a mutation, for checking that the invariants catch a
+race (no configuration sets it; `MutualExclusion` fails with it).
 
 ## Configurations and results (TLC 1.8, exhaustive)
 
@@ -26,7 +26,6 @@ without the atomic RMW, and `MutualExclusion` then fails: the invariants catch a
 | `LockfreeBitset_small.cfg` | 2 bits, 2 CPUs, no interrupts | no error, 18 distinct states |
 | `LockfreeBitset.cfg` | 2 bits, 2 CPUs, 1 interrupt level | no error, 200 distinct states |
 | `LockfreeBitset_stress.cfg` | 3 bits, 3 CPUs, 2 interrupt levels | no error, 54,000 distinct states |
-| `LockfreeBitset_nonatomic_bug.cfg` | 1 bit, 2 CPUs, `NonAtomic` | `Safety` violated: both contexts load the bit clear and both store it set |
 
 ```bash
 java -cp ../tla2tools.jar tlc2.TLC -config LockfreeBitset.cfg -workers auto LockfreeBitset.tla

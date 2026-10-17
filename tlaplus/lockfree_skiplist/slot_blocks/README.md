@@ -57,8 +57,6 @@ retire gating. The gating only removes behaviours, so safety shown without it ho
 
 | Config | Lists | Expected | Result |
 |--------|-------|----------|--------|
-| `current_two.cfg` | 2, d5d12c1 | `NoAccessToFreedBlock` violated | violated: a reader of list 1 loads the block; it retires; list 2 extracts and frees it after its own (no) readers |
-| `current_one.cfg` | 1, d5d12c1 | no error | no error, 155,905 distinct states |
 | `fixed_two.cfg` | 2, fix | no error, terminates | no error, 3,630,678 distinct states |
 | `fixed_late.cfg` | 2 (one constructed late), fix | no error, terminates | no error, 4,206,813 distinct states |
 | `fixed_three.cfg` | 3 (one late), fix | no error, terminates | no error, 354,655 distinct states |

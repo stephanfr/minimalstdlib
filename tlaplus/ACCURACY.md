@@ -19,7 +19,7 @@ otherwise.
 | `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
 | `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | **fixed:** links in a side table, so a stale `load_link` never reads caller memory | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
-| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `MutualExclusion` from the RMW results, with interrupts; a load/store mutation fails it |
+| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `MutualExclusion` from the RMW results, with interrupts |
 | `lockfree_bitblock_resource` | argument below + `bitblock_set` model | bounded retries | **fixed:** hint pointers now release/acquire (litmus E) | blocks never freed while live |
 | `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | `GlobalProgress` (lock-freedom) with 2 threads; per-operation completion with 1 | litmus B, C, D | reader reachability, see below; **fixed:** `remove()` re-walk retargeting a re-inserted node |
 | `skiplist` slot blocks | `lockfree_skiplist/slot_blocks/` | `Termination` | litmus I, J | **fixed:** cross-list block use-after-free |
@@ -82,8 +82,7 @@ out-of-memory for large blocks, not a safety issue. It is documented in the head
 ## `bitblock_set` (`lockfree_bitblock_set/`) and `bitset` (`lockfree_bitset/`)
 
 - **`bitset`:** each acquire/release is one RMW whose returned value decides ownership; every context (CPU ×
-  interrupt depth) may try any bit, and failed acquires are modelled. `MutualExclusion` holds; splitting the RMW into a
-  load and a store (`LockfreeBitset_nonatomic_bug.cfg`) breaks it.
+  interrupt depth) may try any bit, and failed acquires are modelled. `MutualExclusion` holds.
 - **`bitblock_set`:** the model covers acquire and release of any range of at most 16 bits across at most two words.
   That includes the unconditional `fetch_or` with rollback of only the newly set bits.
   - The scan paths (`acquire_first_available`, `acquire_first_available_contiguous`) pick a candidate range from
@@ -157,4 +156,3 @@ See `lockfree_mp_sc_queue/README.md` and `lockfree_small/README.md`.
 | `sp_mc_value_stack` generation | 32 bits | a popper does not stall across 2^32 pushes |
 | skip-list slot generation | `GENERATION_MASK` bits, seeded per block incarnation | a handle does not outlive a full wrap of its slot's generation |
 
-The models with small tag widths (`tag_wraps.cfg`, `SpMcValueStack_genwrap.cfg`) show what each counter prevents.

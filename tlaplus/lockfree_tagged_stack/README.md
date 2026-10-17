@@ -35,8 +35,6 @@ One label per shared-memory access:
 | `pop_push_only.cfg` | pop + push | no error | no error, 18,515 distinct states |
 | `steal_advances_tag.cfg` | pop + push + `steal_all` (the code now) | no error | no error, 228,193 distinct states |
 | `scribble.cfg` | as above, owners overwrite link words | no error | no error, 663,383 distinct states |
-| `steal_resets_tag.cfg` | `steal_all` resets the counter to 0 (d5d12c1) | ABA: `Safety` violated | violated |
-| `tag_wraps.cfg` | 2-value counter | ABA: `Safety` violated | violated (what the 16-bit counter guards against) |
 
 **`steal_all` fix:** the old `exchange(make(nullptr))` reset the counter to 0. A popper stalled with `(A, 0)` could
 then succeed against a later `(A, 0)` and install a stale next pointer. `steal_all` now advances the counter with a
@@ -44,8 +42,7 @@ CAS loop. `lockfree_single_arena_resource::steal_pending_deallocation_list` uses
 
 ## Counter width per user
 
-The counter must not wrap while one popper is stalled between its head load and its CAS. `tag_wraps.cfg` shows what
-happens when it does.
+The counter must not wrap while one popper is stalled between its head load and its CAS.
 
 | User | Head encoding | Counter bits | Head changes needed during one stall |
 |------|---------------|--------------|--------------------------------------|

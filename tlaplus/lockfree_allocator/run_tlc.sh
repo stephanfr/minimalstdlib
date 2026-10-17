@@ -3,7 +3,7 @@
 #
 #   ./run_tlc.sh [config] [extra TLC args...]
 #   ./run_tlc.sh fixed_small.cfg
-#   ./run_tlc.sh bug_n3only_stale.cfg -simulate -depth 2000
+#   ./run_tlc.sh fixed_stale.cfg -simulate -depth 2000
 
 set -e
 

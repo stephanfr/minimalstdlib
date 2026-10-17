@@ -6,7 +6,6 @@
 
 | Spec | What it models | Config | Result |
 |------|----------------|--------|--------|
-| `MetaFrontier.tla` | the original code: each side checks the other, then CASes its own word | `MetaFrontier_bug.cfg` (4 growers) | invariant `FrontierBelowMetadata` violated: four metadata growths between the frontier's count read and its CAS put a record inside the new block (3 growers: no error) |
 | `MetaFrontierLockFree.tla` | the fix: both sides re-check after their CAS (behind a seq_cst fence in the C++); on overlap the top of each stack undoes its CAS | `MetaFrontierLockFree.cfg` (2 allocators, 4 growers) | `NoOverlap` holds |
 | `MetaFrontierLive.tla` | the fix with weak fairness | `MetaFrontierLive.cfg` | `Termination` holds: the undo loops cannot livelock |
 
