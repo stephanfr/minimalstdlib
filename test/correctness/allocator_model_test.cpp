@@ -10,6 +10,8 @@
 //      - a block is aligned as requested and does not overlap another live block;
 //      - a block's contents survive until it is freed (each block is filled with its own pattern);
 //      - nullptr comes back only when the resource is reasonably full (min_fill_at_null of its capacity);
+//      - a request no resource can satisfy (near SIZE_MAX, where size + header or alignment rounding would wrap) gets
+//          nullptr at any fill level, and leaves the resource consistent;
 //      - the resource's own statistics, where it keeps them, agree with the model.
 //
 //  The same harness runs single-threaded on default and small configurations and multi-threaded (each thread with
@@ -56,7 +58,22 @@ namespace
         bool check_live_count = false;  //  compare current_allocated() with the model
         size_t charge_overhead = 0;     //  for the null check, a block costs round_up(size + overhead, granule)
         size_t charge_granule = 1;
+        size_t huge_request_every = 16; //  about one allocation in this many asks for an impossible size; 0: never
     };
+
+    //  Sizes whose header, padding or alignment rounding wraps a size_t if added unchecked
+
+    size_t huge_request(minstd::xoroshiro128_plus_plus &engine)
+    {
+        switch (engine() % 5)
+        {
+        case 0: return SIZE_MAX - (engine() % 16); //  within an alignment's padding of the top
+        case 4: return SIZE_MAX - (engine() % 256);
+        case 1: return SIZE_MAX - (engine() % 8192);
+        case 2: return SIZE_MAX / 2 + 1 + (engine() % 4096);
+        default: return SIZE_MAX - 63 - (engine() % 2);
+        }
+    }
 
     struct live_block
     {
@@ -162,6 +179,19 @@ namespace
                 while ((alignment < options.max_alignment) && ((engine() % 3) == 0))
                 {
                     alignment <<= 1;
+                }
+
+                if ((options.huge_request_every != 0) && ((engine() % options.huge_request_every) == 0))
+                {
+                    const size_t huge = huge_request(engine);
+
+                    if (resource.allocate(huge, alignment) != nullptr)
+                    {
+                        snprintf(text, sizeof(text), "granted an impossible %zu bytes (align %zu) with %zu live", huge, alignment, live_count);
+                        result.violation(text);
+                    }
+
+                    continue;
                 }
 
                 unsigned char *p = static_cast<unsigned char *>(resource.allocate(size, alignment));
