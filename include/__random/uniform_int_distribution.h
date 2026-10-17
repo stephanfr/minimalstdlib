@@ -144,7 +144,7 @@ namespace MINIMAL_STD_NAMESPACE
         template <typename URBG>
         static engine_result_type draw(URBG &g, engine_result_type range)
         {
-            const engine_result_type engine_range =
+            constexpr engine_result_type engine_range =
                 static_cast<engine_result_type>(URBG::max()) -
                 static_cast<engine_result_type>(URBG::min());
 
@@ -172,17 +172,26 @@ namespace MINIMAL_STD_NAMESPACE
                 return value % range_plus_one;
             }
 
-            const engine_result_type engine_values = engine_range + 1; //  engine_range < range, so this cannot wrap
-
-            engine_result_type high;
-            engine_result_type value;
-            do
+            //  Only an engine narrower than engine_result_type gets here: a full-width one has range <= engine_range,
+            //      handled above (and engine_values would be 0).
+            if constexpr (engine_range == static_cast<engine_result_type>(~engine_result_type{0}))
             {
-                high = engine_values * draw(g, range / engine_values);
-                value = high + raw();
-            } while ((value > range) || (value < high));
+                return raw();
+            }
+            else
+            {
+                constexpr engine_result_type engine_values = engine_range + 1;
 
-            return value;
+                engine_result_type high;
+                engine_result_type value;
+                do
+                {
+                    high = engine_values * draw(g, range / engine_values);
+                    value = high + raw();
+                } while ((value > range) || (value < high));
+
+                return value;
+            }
         }
     };
 

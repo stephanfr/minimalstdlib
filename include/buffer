@@ -113,7 +113,7 @@ namespace MINIMAL_STD_NAMESPACE
             return elements_appended;
         }
 
-        void pop_back()
+        void pop_back() override
         {
             if (size_ > 0)
             {
@@ -238,7 +238,7 @@ namespace MINIMAL_STD_NAMESPACE
             return elements_appended;
         }
 
-        void pop_back()
+        void pop_back() override
         {
             if (size_ > 0)
             {

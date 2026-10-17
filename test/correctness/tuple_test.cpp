@@ -320,8 +320,8 @@ namespace
 
     TEST(TupleTests, Swap)
     {
-        auto t1 = minstd::make_tuple(10, 20, minstd::fixed_string("Hello"));
-        auto t2 = minstd::make_tuple(5, -129837, minstd::fixed_string("The quick brown fox jumps over the lazy dogs"));
+        auto t1 = minstd::make_tuple(10, 20, minstd::fixed_string<>("Hello"));
+        auto t2 = minstd::make_tuple(5, -129837, minstd::fixed_string<>("The quick brown fox jumps over the lazy dogs"));
 
         CHECK(minstd::get<0>(t1) == 10);
         CHECK(minstd::get<1>(t1) == 20);
@@ -329,7 +329,7 @@ namespace
 
         CHECK(minstd::get<0>(t2) == 5);
         CHECK(minstd::get<1>(t2) == -129837);
-        CHECK(minstd::get<2>(t2) == minstd::fixed_string("The quick brown fox jumps over the lazy dogs"));
+        CHECK(minstd::get<2>(t2) == minstd::fixed_string<>("The quick brown fox jumps over the lazy dogs"));
 
         t1.swap(t2);
 
@@ -339,7 +339,7 @@ namespace
 
         CHECK(minstd::get<0>(t1) == 5);
         CHECK(minstd::get<1>(t1) == -129837);
-        CHECK(minstd::get<2>(t1) == minstd::fixed_string("The quick brown fox jumps over the lazy dogs"));
+        CHECK(minstd::get<2>(t1) == minstd::fixed_string<>("The quick brown fox jumps over the lazy dogs"));
 
         swap(t1, t2);
 
@@ -349,7 +349,7 @@ namespace
 
         CHECK(minstd::get<0>(t2) == 5);
         CHECK(minstd::get<1>(t2) == -129837);
-        CHECK(minstd::get<2>(t2) == minstd::fixed_string("The quick brown fox jumps over the lazy dogs"));
+        CHECK(minstd::get<2>(t2) == minstd::fixed_string<>("The quick brown fox jumps over the lazy dogs"));
     }
 
     TEST(TupleTests, AllMethod)
@@ -943,7 +943,7 @@ namespace
 
     TEST(TupleTests, TupleExplicitConversionToAndFromReferences)
     {
-        auto tup1 = tuple{0, 0, minstd::fixed_string()};
+        auto tup1 = tuple{0, 0, minstd::fixed_string<>()};
 
         tuple<int &, int &, minstd::fixed_string<> &> tup2(tup1);
 
@@ -951,7 +951,7 @@ namespace
         tup1[1_tag] = 2;
         tup1[2_tag] = "Hello, world!";
 
-        bool is_equal = (tup2 == tuple{1, 2, minstd::fixed_string("Hello, world!")});
+        bool is_equal = (tup2 == tuple{1, 2, minstd::fixed_string<>("Hello, world!")});
 
         CHECK(is_equal);
 
@@ -1075,7 +1075,7 @@ namespace
 
     TEST(TupleTests, CheckTupleDecomposition)
     {
-        auto tup = tuple{1, 2, minstd::fixed_string("Hello, world!")};
+        auto tup = tuple{1, 2, minstd::fixed_string<>("Hello, world!")};
 
         auto [a, b, c] = tup;
 
@@ -1088,7 +1088,7 @@ namespace
     {
         using minstd::get;
 
-        auto tup = tuple{0, 0, minstd::fixed_string()};
+        auto tup = tuple{0, 0, minstd::fixed_string<>()};
 
         auto &[a, b, c] = tup;
 
@@ -1109,7 +1109,7 @@ namespace
         auto tup = tuple{
             1,
             minstd::unique_ptr<int>(new (test_heap_resource.allocate(sizeof(int), alignof(int))) int(2), test_heap_resource),
-            minstd::fixed_string("Hello, world!")};
+            minstd::fixed_string<>("Hello, world!")};
 
         // Check that moving a tuple moves the elements when
         // doing a structured bind

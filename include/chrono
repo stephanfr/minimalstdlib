@@ -578,7 +578,11 @@ namespace MINIMAL_STD_NAMESPACE
     }
 
 #pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wuser-defined-literals"
+#else
 #pragma GCC diagnostic ignored "-Wliteral-suffix"
+#endif
     inline namespace literals
     {
         inline namespace chrono_literals

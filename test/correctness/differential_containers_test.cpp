@@ -850,7 +850,7 @@ namespace
     template <size_t MAX>
     struct reference_string
     {
-        char text[MAX + 1] = "";
+        char text[MAX + 1] = {}; //  not = "": clang 18 sizes that literal from the first instantiation and overruns later ones
         size_t length = 0;
 
         void assign(const char *source, size_t count)

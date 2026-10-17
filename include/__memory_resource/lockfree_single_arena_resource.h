@@ -1329,7 +1329,9 @@ namespace MINIMAL_STD_NAMESPACE
                     block_state_ptr::pack(free_block, block_, IN_USE, version),
                     memory_order_release);
 #pragma GCC diagnostic push
+#if !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
                 metadata->requested_size_.store(static_cast<uint32_t>(bytes), memory_order_release);
 #pragma GCC diagnostic pop
                 metadata->total_size_ = static_cast<uint32_t>(free_block->size_including_header_);
@@ -1338,7 +1340,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                 {
-                    extensions::memory_resource_statistics::allocation_made(bytes);
+                    this->extensions::memory_resource_statistics::allocation_made(bytes);
                 }
 
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
@@ -1380,7 +1382,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_bad_index();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_bad_index();
                         }
                         return false;
                     }
@@ -1395,7 +1397,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_state_mismatch();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_state_mismatch();
                         }
                         return false;
                     }
@@ -1409,7 +1411,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_cas_race();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_cas_race();
                         }
                         return false;
                     }
@@ -1422,7 +1424,7 @@ namespace MINIMAL_STD_NAMESPACE
                     //  Count the size the block was allocated with, not the caller's claim, so a mismatched size
                     //      cannot make the statistics drift
 
-                    extensions::memory_resource_statistics::deallocation_made(block_to_deallocate->requested_size_.load(memory_order_relaxed));
+                    this->extensions::memory_resource_statistics::deallocation_made(block_to_deallocate->requested_size_.load(memory_order_relaxed));
                 }
 
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)

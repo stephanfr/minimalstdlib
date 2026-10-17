@@ -119,7 +119,11 @@ namespace MINIMAL_STD_NAMESPACE
         inline namespace string_literals
         {
 #pragma GCC diagnostic push
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wuser-defined-literals"
+#else
 #pragma GCC diagnostic ignored "-Wliteral-suffix"
+#endif
             inline constexpr basic_fixed_string<char, 256>
             operator""s(const char *str, size_t len)
             {
