@@ -27,10 +27,14 @@ namespace MINIMAL_STD_NAMESPACE
             }
         }
 
-        //  This resource starts with a super-block of memory and then allocates blocks from that superblock.
-        //      When the superblock is exhausted, a new superblock is allocated from the upstream resource.
-        //      The blocks and allocations will be aligned on __max_align (should be 16 bytes) boundaries
-        //      which should be optimal for modern processors.
+        //  This resource carves allocations from the single block of memory it is given; it has no upstream
+        //      resource, so it returns nullptr once the block is used up.  Allocations are aligned to 16 bytes, or
+        //      more when requested.
+        //
+        //  Freed blocks are kept on per-size-class lists and reused for later requests of the same class only:
+        //      a request searches its own class's list, then the unused tail of the block.  Memory freed by blocks
+        //      of one size class is therefore not available to requests of another, so a workload whose sizes
+        //      shift over time can see nullptr while plenty of the block is free.
         //
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 
@@ -86,10 +90,17 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 const size_t effective_alignment = (alignment > DEFAULT_ALIGNMENT) ? alignment : DEFAULT_ALIGNMENT;
 
+                //  Both paths add the header and alignment to the size, so a request that close to SIZE_MAX would wrap
+
+                if (bytes > SIZE_MAX - BLOCK_HEADER_SIZE - effective_alignment)
+                {
+                    return nullptr;
+                }
+
                 //  If the total number of deallocations is greater than 10% of the total number of allocations, then
                 //      Try to re-use some released blocks before allocating a new block.
 
-                if (total_deallocations_ > (total_allocations_ / 10))
+                if (total_deallocations() > (total_allocations() / 10))
                 {
                     //  Find the right bin deallocation bin to search for a block
 
@@ -142,13 +153,24 @@ namespace MINIMAL_STD_NAMESPACE
 
                             block_header *current_value = current;
 
-                            if (previous == nullptr)
+                            const bool unlinked = (previous == nullptr)
+                                                      ? deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_value, next, memory_order_acq_rel, memory_order_acquire)
+                                                      : previous->next_deallocated_.compare_exchange_strong(current_value, next, memory_order_acq_rel, memory_order_acquire);
+
+                            if (unlinked)
                             {
-                                deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_value, next, memory_order_acq_rel, memory_order_acquire);
-                            }
-                            else
-                            {
-                                previous->next_deallocated_.compare_exchange_strong(current_value, next, memory_order_acq_rel, memory_order_acquire);
+                                //  Off the list now.  If it was freed again meanwhile, the free saw it still listed and
+                                //      did not push it, so push it here (exactly one of the two does, see push_free()).
+
+                                current->on_free_list_.store(false, memory_order_release);
+
+                                if (!current->in_use_.load(memory_order_acquire))
+                                {
+                                    push_free(current, deallocation_bin);
+                                }
+
+                                current = next;
+                                continue;
                             }
                         }
 
@@ -168,6 +190,18 @@ namespace MINIMAL_STD_NAMESPACE
                     void *returned_pointer = align_pointer((char *)next_block + BLOCK_HEADER_SIZE, effective_alignment);
                     block_header *header = (block_header *)((char *)returned_pointer - BLOCK_HEADER_SIZE);
 
+                    //  Compare remaining space rather than end pointers, so a huge request cannot wrap the address.
+
+                    const uintptr_t returned_int = (uintptr_t)returned_pointer;
+                    const uintptr_t end_int = (uintptr_t)end_of_block_;
+
+                    if ((returned_int >= end_int) ||
+                        ((end_int - returned_int) < DEFAULT_ALIGNMENT) ||
+                        (bytes > (end_int - returned_int) - DEFAULT_ALIGNMENT))
+                    {
+                        break;
+                    }
+
                     block_header *block_following_next_block = (block_header *)align_pointer((char *)returned_pointer + bytes);
 
                     //  If the block following the next block is beyond the end of the block, then we are out of memory.
@@ -180,6 +214,7 @@ namespace MINIMAL_STD_NAMESPACE
                     if (next_empty_block_.compare_exchange_strong(next_block, block_following_next_block, memory_order_acq_rel, memory_order_acquire))
                     {
                         header->in_use_ = true;
+                        header->on_free_list_.store(false, memory_order_relaxed);
                         header->requested_size_ = bytes;
                         header->actual_size_ = (char *)block_following_next_block - (char *)header;
                         header->next_deallocated_.store(nullptr, memory_order_relaxed);
@@ -236,14 +271,9 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
-                //  Add the block to the list of deallocated blocks
+                //  Add the block to the list of deallocated blocks (unless it is still on it: see push_free())
 
-                block_header *current_deallocated_head = deallocated_head_bins_[deallocation_bin].load(memory_order_acquire);
-
-                do
-                {
-                    header->next_deallocated_.store(current_deallocated_head, memory_order_release);
-                } while (!deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_deallocated_head, header, memory_order_acq_rel, memory_order_acquire));
+                push_free(header, deallocation_bin);
 
                 //  Update the statistics
 
@@ -265,6 +295,7 @@ namespace MINIMAL_STD_NAMESPACE
                 size_t actual_size_;    //  size of the block including the block_header
                 size_t requested_size_; //  size of the block requested by the user
                 atomic<bool> in_use_;
+                atomic<bool> on_free_list_; //  linked on a deallocated list (reuse leaves a block linked until a scan unlinks it)
             };
 
             static constexpr size_t BLOCK_HEADER_SIZE = internal::aligned_size(sizeof(block_header), DEFAULT_ALIGNMENT);
@@ -276,7 +307,7 @@ namespace MINIMAL_STD_NAMESPACE
             const size_t size_;
             void *const end_of_block_;
 
-            block_header end_of_list_marker_ = {nullptr, 0, true};
+            block_header end_of_list_marker_ = {.next_ = nullptr, .next_deallocated_ = nullptr, .actual_size_ = 0, .requested_size_ = 0, .in_use_ = true, .on_free_list_ = false};
 
             atomic<block_header *> next_empty_block_;
             atomic<block_header *> head_ = &end_of_list_marker_;
@@ -286,6 +317,25 @@ namespace MINIMAL_STD_NAMESPACE
                                                                                            &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_,
                                                                                            &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_, &end_of_list_marker_};
             atomic<size_t> cmp_exchange_retries_ = 0;
+
+            //  Push a freed block onto its deallocated list, unless it is still linked there.  Reusing a block leaves it
+            //      on the list until a later scan unlinks it, so a block freed again before that must not be pushed a
+            //      second time (it would link to itself and the next scan of the bin would never end).  The free and
+            //      the scan that unlinks it both call this; the exchange makes exactly one of them push.
+            void push_free(block_header *header, size_t deallocation_bin)
+            {
+                if (header->on_free_list_.exchange(true, memory_order_acq_rel))
+                {
+                    return;
+                }
+
+                block_header *current_deallocated_head = deallocated_head_bins_[deallocation_bin].load(memory_order_acquire);
+
+                do
+                {
+                    header->next_deallocated_.store(current_deallocated_head, memory_order_release);
+                } while (!deallocated_head_bins_[deallocation_bin].compare_exchange_strong(current_deallocated_head, header, memory_order_acq_rel, memory_order_acquire));
+            }
 
             static void *align_pointer(void *ptr, size_t alignment = DEFAULT_ALIGNMENT)
             {

@@ -64,6 +64,66 @@ TEST_GROUP(LockfreeSingleArenaMemoryResourceTests)
 {
 };
 
+TEST(LockfreeSingleArenaMemoryResourceTests, UnalignedArenaBuffer)
+{
+    //  The arena starts at the first 64-byte boundary of the caller's block.  It used to encode block offsets
+    //      relative to the raw pointer and assert they were multiples of 64, so any buffer that was not
+    //      64-byte aligned failed that assertion on its first allocation.  (Test builds report contract
+    //      violations through the failure hook instead of trapping, so count every report.)
+
+    static size_t contract_violations;
+    contract_violations = 0;
+
+    auto previous_hook = minstd::set_failure_hook([](const char *, const char *, const char *, int)
+                                                  {
+                                                      ++contract_violations;
+                                                  });
+
+    constexpr size_t ARENA_BYTES = 4 * 1048576;
+    constexpr size_t NUM_ALLOCATIONS = 256;
+
+    char *aligned_buffer = static_cast<char *>(aligned_alloc(4096, ARENA_BYTES + 4096));
+    CHECK(aligned_buffer != nullptr);
+
+    for (size_t offset : {size_t{1}, size_t{8}, size_t{16}, size_t{48}, size_t{63}})
+    {
+        char *arena = aligned_buffer + offset;
+        lockfree_single_arena_resource_without_stats resource(arena, ARENA_BYTES);
+
+        void *allocations[NUM_ALLOCATIONS];
+        size_t sizes[NUM_ALLOCATIONS];
+
+        for (size_t round = 0; round < 2; ++round)
+        {
+            for (size_t i = 0; i < NUM_ALLOCATIONS; ++i)
+            {
+                sizes[i] = 1 + ((i * 37 + round * 11) % 2000);
+                const size_t alignment = (i % 2 == 0) ? 16 : 64;
+
+                allocations[i] = resource.allocate(sizes[i], alignment);
+                CHECK(allocations[i] != nullptr);
+
+                const uintptr_t address = reinterpret_cast<uintptr_t>(allocations[i]);
+                CHECK_EQUAL(0u, address % alignment);
+                CHECK(address >= reinterpret_cast<uintptr_t>(arena));
+                CHECK(address + sizes[i] <= reinterpret_cast<uintptr_t>(arena) + ARENA_BYTES);
+
+                memset(allocations[i], static_cast<int>(i), sizes[i]);
+            }
+
+            for (size_t i = 0; i < NUM_ALLOCATIONS; ++i)
+            {
+                resource.deallocate(allocations[i], sizes[i], (i % 2 == 0) ? 16 : 64);
+            }
+        }
+    }
+
+    minstd::set_failure_hook(previous_hook);
+    free(aligned_buffer);
+
+    CHECK_EQUAL(0u, contract_violations);
+}
+
 TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionality)
 {
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
@@ -155,7 +215,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, CurrentAllocatedIsTrackedOnTemplate
 
 TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanceWindowAtTen)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 512;
     constexpr size_t NUM_BLOCKS = 10;
@@ -194,7 +256,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanc
 
 TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataCountStable)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 1024;
     constexpr size_t NUM_BLOCKS = 10;
@@ -239,7 +303,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataC
 
 TEST(LockfreeSingleArenaMemoryResourceTests, LargePendingBatchDrainsAndOpensMultipleMaintenanceWindows)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 512;
     constexpr size_t NUM_BLOCKS = 100;
@@ -265,7 +331,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, LargePendingBatchDrainsAndOpensMult
 
 TEST(LockfreeSingleArenaMemoryResourceTests, TailFreeingRestoresFrontierAfterMaintenance)
 {
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 2048;
     constexpr size_t NUM_BLOCKS = 20;
@@ -292,24 +360,22 @@ TEST(LockfreeSingleArenaMemoryResourceTests, TailFreeingRestoresFrontierAfterMai
     CHECK_EQUAL(initial_frontier, resource.extended_metrics().frontier_offset());
 }
 
-struct test_unmasked_interrupt_policy
-{
-    using interrupt_state_t = uint64_t;
-    static inline interrupt_state_t disable_interrupts() { return 0; }
-    static inline void restore_interrupts(interrupt_state_t) {}
-};
+//  The handler allocates from the resource it interrupted, so its guards must mask the signal as interrupt_guard
+//      masks interrupts on the target: the TRIMMING window in trim_metadata_records() relies on that, and with a
+//      no-op guard a handler landing inside it spins forever (tlaplus/lockfree_allocator models the guarded trim).
+//      The signal still arrives everywhere the resource leaves interrupts enabled.
 
 typedef minstd::pmr::lockfree_single_arena_resource_impl<
-    test_unmasked_interrupt_policy,
+    test_userspace_signal_mask_interrupt_policy,
     minstd::platform::default_platform_provider,
     128 * 1024 * 1024,
     5,
         128,
 
     minstd::pmr::extensions::lockfree_single_arena_resource_extended_statistics,
-    minstd::pmr::extensions::null_memory_resource_statistics> lockfree_single_arena_resource_unmasked;
+    minstd::pmr::extensions::null_memory_resource_statistics> lockfree_single_arena_resource_signal_masked;
 
-static lockfree_single_arena_resource_unmasked* s_reentrant_resource = nullptr;
+static lockfree_single_arena_resource_signal_masked* s_reentrant_resource = nullptr;
 static minstd::atomic<int> s_reentrant_signal_count{0};
 static minstd::atomic<bool> s_reentrant_test_done{false};
 
@@ -339,7 +405,7 @@ static void* bomber_reentrant_fn(void* arg)
 
 TEST(LockfreeSingleArenaMemoryResourceTests, DirectInterruptReentrancy)
 {
-    lockfree_single_arena_resource_unmasked resource(buffer, BUFFER_SIZE);
+    lockfree_single_arena_resource_signal_masked resource(buffer, BUFFER_SIZE);
     
     s_reentrant_resource = &resource;
     s_reentrant_signal_count = 0;
@@ -801,8 +867,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
     //  Allocate exactly in order, then deallocate the tail blocks from multiple
     //  threads to stress the frontier reclaim path (try_reclaim_frontier_blocks).
 
-    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
-
     //  Use a single shard so pending maintenance is deterministic in this correctness test.
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -909,8 +973,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, FrontierReclaimRace)
         }
     }
 
-    minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
-
     CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     CHECK(resource.extended_metrics().frontier_offset() < peak_frontier);
 }
@@ -919,8 +981,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
 {
     //  Regression guard for packed block-state transitions when metadata is
     //  repeatedly recycled and reused across maintenance windows.
-
-    minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return 0u; });
 
     lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
@@ -978,8 +1038,6 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
             }
         }
 
-        minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
-
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().current_allocated());
         CHECK_EQUAL(static_cast<size_t>(0), resource.extended_metrics().pending_deallocations());
     }
@@ -991,7 +1049,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SignalDuringDeallocation)
     //  the deallocation path (not just during allocation as DirectInterruptReentrancy tests).
     //  The signal handler performs allocation + deallocation to provoke reentrancy.
 
-    lockfree_single_arena_resource_unmasked resource(buffer, BUFFER_SIZE);
+    lockfree_single_arena_resource_signal_masked resource(buffer, BUFFER_SIZE);
 
     s_reentrant_resource = &resource;
     s_reentrant_signal_count = 0;
@@ -1052,7 +1110,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, MetadataTrimStress)
     //  Repeatedly exhaust and release all blocks to stress the metadata trim
     //  path.  Metadata count should remain bounded.
 
-    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE);
+    //  One shard: pending blocks drain per shard in batches of the threshold, so if the thread moved CPUs
+    //      mid-test the blocks would split across shards and leave a remainder below the threshold pending.
+    lockfree_single_arena_resource_with_stats resource(buffer, BUFFER_SIZE, 1);
 
     constexpr size_t ALLOC_SIZE = 2048;
     constexpr size_t NUM_BLOCKS = 500;

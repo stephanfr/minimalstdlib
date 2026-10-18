@@ -40,12 +40,18 @@ namespace MINIMAL_STD_NAMESPACE
 
             intrusive_payload_handle &operator=(const intrusive_payload_handle &other)
             {
-                if (this != &other)
+                //  Take the new reference before dropping the old one: 'other' may live inside the payload
+                //      this handle releases (h = h->next), and releasing first could free it.
+
+                T *incoming = other.ptr_;
+
+                if (incoming != nullptr)
                 {
-                    release();
-                    ptr_ = other.ptr_;
-                    retain();
+                    incoming->add_ref();
                 }
+
+                release();
+                ptr_ = incoming;
 
                 return *this;
             }
@@ -60,9 +66,13 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 if (this != &other)
                 {
-                    release();
-                    ptr_ = other.ptr_;
+                    //  Detach the source before releasing, for the same reason as the copy
+
+                    T *incoming = other.ptr_;
                     other.ptr_ = nullptr;
+
+                    release();
+                    ptr_ = incoming;
                 }
 
                 return *this;

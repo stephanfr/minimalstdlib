@@ -47,6 +47,11 @@ namespace MINIMAL_STD_NAMESPACE
             return assigned_cpu_id_.load(memory_order_acquire) == cpu_id;
         }
 
+        //  The epoch is recorded only when the slot's depth goes 0 -> 1.  A slot shared by readers that keep
+        //      overlapping (more CPUs than NumCPUs, or threads migrating on a hosted build) may never return to
+        //      depth 0, so it keeps the first reader's epoch and reclamation stalls until the overlap ends.  Size
+        //      NumCPUs to the CPUs that use the structure.
+
         uint32_t begin_read_section(uint64_t current_epoch)
         {
             const uint32_t previous_depth = reader_depth_.fetch_add(1, memory_order_acq_rel);

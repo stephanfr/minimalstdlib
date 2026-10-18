@@ -17,16 +17,25 @@ namespace MINIMAL_STD_NAMESPACE
     public:
         single_block_memory_heap() = delete;
 
+        //  The default alignment is max_align_t's, which memory_resource::allocate() also asks for by default
+        //      (alignof(single_block_memory_heap) was 8, so an adapter refused about half of default requests).
+        //      The heap starts at the first block_alignment boundary of location, so blocks are aligned in
+        //      memory, not only relative to the start.
+
         single_block_memory_heap(void *location,
                                  size_t max_size,
-                                 size_t block_alignment = alignof(single_block_memory_heap))
-            : heap_start_(static_cast<char *>(location)),
-              max_size_(max_size),
+                                 size_t block_alignment = alignof(max_align_t))
+            : heap_start_(aligned_start(location, block_alignment)),
+              max_size_(usable_size(location, max_size, block_alignment)),
               block_alignment_(block_alignment),
               header_size_(aligned_size(sizeof(block_header))),
               minimum_size_block_for_split_(header_size_ + aligned_size(sizeof(uint32_t))),
-              current_end_(static_cast<char *>(location))
+              current_end_(const_cast<char *>(heap_start_))
         {
+            //  Blocks are rounded to the alignment with a mask, and each starts with a header of size_t fields
+
+            MINIMAL_STD_ASSERT((block_alignment != 0) && ((block_alignment & (block_alignment - 1)) == 0));
+            MINIMAL_STD_ASSERT(block_alignment >= alignof(block_header));
         }
 
         const size_t max_size() const noexcept
@@ -116,6 +125,14 @@ namespace MINIMAL_STD_NAMESPACE
     protected:
         void *allocate_raw_block(size_t element_size_in_bytes, size_t num_elements_in_block)
         {
+            //  Reject sizes larger than the heap first, so the multiplication, the alignment rounding and the
+            //      addition of the header below cannot wrap.
+
+            if ((num_elements_in_block != 0) && (element_size_in_bytes > max_size_ / num_elements_in_block))
+            {
+                return nullptr;
+            }
+
             //  Compute the block size in bytes adjusting for alignment
 
             size_t block_size_in_bytes = aligned_size(element_size_in_bytes * num_elements_in_block);
@@ -124,7 +141,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             //  If the heap is exhausted, search for an unused block
 
-            if (bytes_allocated_ + block_size_in_bytes > max_size_)
+            if (block_size_in_bytes > max_size_ - bytes_allocated_)
             {
                 return search_for_unused_block(block_size_in_bytes, num_elements_in_block);
             }
@@ -205,9 +222,40 @@ namespace MINIMAL_STD_NAMESPACE
         size_t bytes_allocated_but_unused_ = 0;
         size_t blocks_allocated_but_unused_ = 0;
 
+        static bool valid_alignment(size_t alignment)
+        {
+            return (alignment != 0) && ((alignment & (alignment - 1)) == 0);
+        }
+
+        static size_t start_padding(const void *location, size_t alignment)
+        {
+            if (!valid_alignment(alignment))
+            {
+                return 0; //  reported by the constructor
+            }
+
+            const uintptr_t address = reinterpret_cast<uintptr_t>(location);
+
+            return ((address + alignment - 1) & ~(uintptr_t)(alignment - 1)) - address;
+        }
+
+        static char *aligned_start(void *location, size_t alignment)
+        {
+            return static_cast<char *>(location) + start_padding(location, alignment);
+        }
+
+        static size_t usable_size(const void *location, size_t size, size_t alignment)
+        {
+            const size_t padding = start_padding(location, alignment);
+
+            return (size > padding) ? size - padding : 0;
+        }
+
         size_t aligned_size(size_t unaligned_block_size_in_bytes)
         {
-            return (((unaligned_block_size_in_bytes / block_alignment_) + ((unaligned_block_size_in_bytes % block_alignment_) == 0 ? 0 : 1)) * block_alignment_);
+            const size_t alignment = (block_alignment_ != 0) ? block_alignment_ : 1; //  0 is reported by the constructor
+
+            return (((unaligned_block_size_in_bytes / alignment) + ((unaligned_block_size_in_bytes % alignment) == 0 ? 0 : 1)) * alignment);
         }
 
         void *search_for_unused_block(size_t block_size_in_bytes, size_t num_elements_in_block)

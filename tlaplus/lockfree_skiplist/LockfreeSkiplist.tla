@@ -3,31 +3,28 @@
 (* Bounded model for include/lockfree/skiplist with per-CPU epoch read     *)
 (* sections and lagged retired-node reclamation.                            *)
 (*                                                                          *)
-(* Matches C++ control-flow of: insert, remove, find, gc.                  *)
+(* Matches the C++ control flow of insert, remove, find and the public    *)
+(* advance_and_reclaim(), at the level of keys (a key stands for the node  *)
+(* that currently holds it).                                               *)
 (*                                                                          *)
-(* Key fidelity improvements over prior version:                            *)
-(*  1. `fullyUnlinked` set: nodes must be FULLY_UNLINKED (all upper-level  *)
-(*     pointer references removed) before they are eligible for reclaim,   *)
-(*     matching the C++ `unlink_state::FULLY_UNLINKED` gate.               *)
-(*  2. `CanReclaim`: reclaim requires ALL CPU reader slots to be inactive   *)
-(*     (matches C++ `advance_and_reclaim` which returns early if *)
-(*     any `epoch_reader_states_[i].active_` is true).                     *)
-(*  3. `find` operation modeled as a read-section-wrapped scan that may     *)
-(*     assist with GC of tombstoned nodes (matches C++ `find()`).          *)
-(*  4. Interrupt re-entrancy: a CPU may enter a nested read section while   *)
-(*     already inside one (models ISR calling skiplist ops while a kernel   *)
-(*     thread holds the outer read section on the same CPU). The per-CPU   *)
-(*     `readerDepth` counter correctly gates epoch snapshot: only the first *)
-(*     entry (depth 0->1) records the epoch, matching the C++ code path    *)
-(*     `if (previous_depth == 0) { ... epoch_.store(...) }`.               *)
-(*  5. `remove`-bottom success path calls `try_advance_epoch` then          *)
-(*     throttled `advance_and_reclaim`, reflected as a combined  *)
-(*     AdvanceAndReclaimStep action.                                        *)
-(*  6. `RemoveBottomStolenByOther`: models the C++ path where the level-0  *)
-(*     tombstone check finds another thread already soft-deleted the node   *)
-(*     (return false without retiring).                                    *)
-(*  7. `RemoveMarkGotoRetry`: models `goto RETRY_REMOVE` when              *)
-(*     mark_retry_count >= MAX_REMOVE_MARK_RETRIES_PER_LEVEL.             *)
+(*  - `fullyUnlinked`: a node must be FULLY_UNLINKED before it can be      *)
+(*    reclaimed (`unlink_state::FULLY_UNLINKED`).                          *)
+(*  - `CanAdvanceEpoch` / `CanReclaim`: the per-slot reader checks of      *)
+(*    `try_advance_epoch` and `reclaim_from_per_cpu_list`.                 *)
+(*  - Interrupt re-entrancy: a CPU may enter a nested read section; only   *)
+(*    the outermost entry records the epoch.                               *)
+(*  - remove(): marking the upper levels deletes nothing; the level-0 mark *)
+(*    CAS is the deletion and the call returns true right after it.  The   *)
+(*    node is unlinked and retired then only if its upper levels have      *)
+(*    drained, otherwise later by a traversal (find's assist).  A failed   *)
+(*    mark retries a bounded number of times and then returns false; the  *)
+(*    re-walk after a failure may restart the call (stale handle, or a     *)
+(*    re-inserted node: see upper_levels/ for why it must restart).        *)
+(*  - Abstractions: CAS contention is a nondeterministic choice; retries   *)
+(*    are bounded by MaxRetryTicks; an insert that meets a not-yet-unlinked *)
+(*    tombstone of its key is modelled as rejecting (the code links a new  *)
+(*    node beside it), because a key cannot be present and tombstoned at   *)
+(*    once at this level of abstraction.                                    *)
 (***************************************************************************)
 
 EXTENDS Integers, FiniteSets
@@ -55,20 +52,28 @@ VARIABLES
     op,
     opKey,
     level,
-    retryTick
+    retryTick,
+    height,           \* height of the node holding each key (chosen at insert)
+    upMarked,         \* upper levels of that node already tombstoned by some remove()
+    interfered,       \* per thread: another thread changed a link since this thread's last CAS failure
+    finishParity,     \* ghost: flips each time any operation completes (global progress)
+    removeMarks       \* ghost: level-0 marks made by each thread's current remove() call
+
+ghost == <<finishParity, removeMarks>>
+links == <<height, upMarked, interfered>>
 
 vars == <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-          readerDepth, readerEpoch, pc, op, opKey, level, retryTick>>
+          readerDepth, readerEpoch, pc, op, opKey, level, retryTick, height, upMarked, interfered,
+          finishParity, removeMarks>>
 
 PcStates == {
     "idle",
     "insert_find", "insert_link0", "insert_link_upper",
     "remove_find", "remove_mark", "remove_bottom",
-    "find_scan",
-    "gc_scan"
+    "find_scan"
 }
 
-Ops == {"none", "insert", "remove", "find", "gc"}
+Ops == {"none", "insert", "remove", "find"}
 
 (*
  * In the C++ code each thread maps to the CPU it is currently scheduled on.
@@ -93,6 +98,11 @@ TypeOK ==
     /\ opKey \in [Threads -> Keys]
     /\ level \in [Threads -> 0..MaxLevels]
     /\ retryTick \in [Threads -> 0..MaxRetryTicks]
+    /\ height \in [Keys -> 1..MaxLevels]
+    /\ upMarked \in [Keys -> SUBSET (1..MaxLevels)]
+    /\ interfered \in [Threads -> BOOLEAN]
+    /\ finishParity \in {0, 1}
+    /\ removeMarks \in [Threads -> 0..2]
     /\ Threads # {}
     /\ Cpus # {}
 
@@ -110,6 +120,11 @@ Init ==
     /\ opKey = [t \in Threads |-> CHOOSE k \in Keys : TRUE]
     /\ level = [t \in Threads |-> 0]
     /\ retryTick = [t \in Threads |-> 0]
+    /\ height = [k \in Keys |-> 1]
+    /\ upMarked = [k \in Keys |-> {}]
+    /\ interfered = [t \in Threads |-> FALSE]
+    /\ finishParity = 0
+    /\ removeMarks = [t \in Threads |-> 0]
 
 InitRemoveScenario ==
     /\ LET key == CHOOSE k \in Keys : TRUE IN present = {key}
@@ -125,6 +140,11 @@ InitRemoveScenario ==
     /\ opKey = [t \in Threads |-> CHOOSE k \in Keys : TRUE]
     /\ level = [t \in Threads |-> 0]
     /\ retryTick = [t \in Threads |-> 0]
+    /\ height = [k \in Keys |-> 1]
+    /\ upMarked = [k \in Keys |-> {}]
+    /\ interfered = [t \in Threads |-> FALSE]
+    /\ finishParity = 0
+    /\ removeMarks = [t \in Threads |-> 0]
 
 TickRetry(t) ==
     [retryTick EXCEPT ![t] = IF retryTick[t] < MaxRetryTicks THEN retryTick[t] + 1 ELSE MaxRetryTicks]
@@ -165,6 +185,7 @@ FinishOpCore(t) ==
     /\ op' = [op EXCEPT ![t] = "none"]
     /\ level' = [level EXCEPT ![t] = 0]
     /\ retryTick' = [retryTick EXCEPT ![t] = 0]
+    /\ finishParity' = 1 - finishParity
 
 FinishOp(t) ==
     /\ FinishOpCore(t)
@@ -223,7 +244,7 @@ ReclaimableNodes(epoch) ==
 
 (***************************************************************************)
 (* AdvanceAndReclaim: combines try_advance_epoch + reclaim_retired_nodes.  *)
-(* Called after a successful remove-bottom or from gc.                     *)
+(* Called by remove() (throttled) and through the public advance_and_reclaim(). *)
 (* `callerCpu` is exempted from both the advance and reclaim guards,      *)
 (* matching the C++ `try_advance_epoch(slot)` and                         *)
 (* `reclaim_from_per_cpu_list(slot)` self-exemption.                      *)
@@ -238,79 +259,57 @@ AdvanceAndReclaim(callerCpu) ==
     /\ fullyUnlinked' = fullyUnlinked \ reclaimable
     /\ retiredAt' = retiredAt   \* retiredAt entries for reclaimed keys now irrelevant
 
-(***************************************************************************)
-(* RetireKey: soft-deleted node is physically unlinked from level 0 and   *)
-(* added to the retired+fullyUnlinked lists, recorded at current epoch.   *)
-(* In C++: unlink_state=FULLY_UNLINKED is set at the level-0 CAS success  *)
-(* point, immediately before retire_node() is called.                     *)
-(***************************************************************************)
-RetireKey(k) ==
-    /\ retired' = retired \cup {k}
-    /\ fullyUnlinked' = fullyUnlinked \cup {k}
-    /\ retiredAt' = [retiredAt EXCEPT ![k] = globalEpoch]
-    /\ tomb' = tomb \ {k}
+\* A CAS fails only because another thread changed the word after this thread read it.  Every step that changes
+\*   a link gives the other threads a token; a failure consumes the failing thread's token.
+Interfere(t) == interfered' = [u \in Threads |-> IF u = t THEN interfered[t] ELSE TRUE]
+ConsumeInterference(t) == /\ interfered[t]
+                          /\ interfered' = [interfered EXCEPT ![t] = FALSE]
 
 (***************************************************************************)
 (* START operations                                                        *)
 (***************************************************************************)
 
-StartInsert(t, k) ==
+StartOp(t, k, o, p) ==
     /\ pc[t] = "idle"
     /\ EnterRead(t)
-    /\ pc' = [pc EXCEPT ![t] = "insert_find"]
-    /\ op' = [op EXCEPT ![t] = "insert"]
+    /\ pc' = [pc EXCEPT ![t] = p]
+    /\ op' = [op EXCEPT ![t] = o]
     /\ opKey' = [opKey EXCEPT ![t] = k]
     /\ level' = [level EXCEPT ![t] = 0]
     /\ retryTick' = [retryTick EXCEPT ![t] = 0]
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, finishParity>>
+    /\ UNCHANGED links
 
-StartRemove(t, k) ==
-    /\ pc[t] = "idle"
-    /\ EnterRead(t)
-    /\ pc' = [pc EXCEPT ![t] = "remove_find"]
-    /\ op' = [op EXCEPT ![t] = "remove"]
-    /\ opKey' = [opKey EXCEPT ![t] = k]
-    /\ level' = [level EXCEPT ![t] = MaxLevels]
-    /\ retryTick' = [retryTick EXCEPT ![t] = 0]
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch>>
-
-StartFind(t, k) ==
-    /\ pc[t] = "idle"
-    /\ EnterRead(t)
-    /\ pc' = [pc EXCEPT ![t] = "find_scan"]
-    /\ op' = [op EXCEPT ![t] = "find"]
-    /\ opKey' = [opKey EXCEPT ![t] = k]
-    /\ level' = [level EXCEPT ![t] = 0]
-    /\ retryTick' = [retryTick EXCEPT ![t] = 0]
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch>>
-
-StartGc(t, k) ==
-    /\ pc[t] = "idle"
-    /\ EnterRead(t)
-    /\ pc' = [pc EXCEPT ![t] = "gc_scan"]
-    /\ op' = [op EXCEPT ![t] = "gc"]
-    /\ opKey' = [opKey EXCEPT ![t] = k]
-    /\ level' = [level EXCEPT ![t] = MaxLevels]
-    /\ retryTick' = [retryTick EXCEPT ![t] = 0]
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch>>
+StartInsert(t, k) == StartOp(t, k, "insert", "insert_find") /\ UNCHANGED removeMarks
+StartRemove(t, k) == StartOp(t, k, "remove", "remove_find") /\ removeMarks' = [removeMarks EXCEPT ![t] = 0]
+StartFind(t, k)   == StartOp(t, k, "find", "find_scan") /\ UNCHANGED removeMarks
 
 (***************************************************************************)
-(* INSERT state machine                                                    *)
-(*                                                                          *)
-(* insert_find: scan for key; reject if already present or soft-deleted    *)
-(* insert_link0: CAS at level 0; nondeterministic success/retry/abort      *)
-(* insert_link_upper: link upper levels (bounded retries); always finish   *)
-(*                                                                          *)
-(* Matches C++:                                                            *)
-(*   RETRY_INSERT while(true) { find_with_nodelists -> if FOUND/SOFT_DELETE*)
-(*     return false; else CAS level0 -> CAS upper levels -> return true }  *)
+(* advance_and_reclaim(slot): public, called outside a read section (and   *)
+(* by remove(), throttled).  One step: try to advance the epoch, then      *)
+(* reclaim what the lag allows.  (Replaces the former gc(), which no       *)
+(* longer exists.)                                                         *)
+(***************************************************************************)
+ReclaimCall(t) ==
+    /\ pc[t] = "idle"
+    /\ AdvanceAndReclaim(cpu_of(t))
+    /\ finishParity' = 1 - finishParity
+    /\ UNCHANGED <<present, tomb, readerDepth, readerEpoch, pc, op, opKey, level, retryTick, removeMarks>>
+    /\ UNCHANGED links
+
+(***************************************************************************)
+(* INSERT                                                                  *)
+(*   RETRY_INSERT: find_with_nodelists -> FOUND: return false;             *)
+(*   else CAS level 0 (bounded retries, then return false), then publish   *)
+(*   the upper levels (bounded; a failure skips the level); return true.   *)
 (***************************************************************************)
 InsertFindReject(t) ==
     /\ pc[t] = "insert_find"
     /\ op[t] = "insert"
     /\ opKey[t] \in (present \cup tomb)
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
 InsertFindMiss(t) ==
     /\ pc[t] = "insert_find"
@@ -318,96 +317,114 @@ InsertFindMiss(t) ==
     /\ opKey[t] \notin (present \cup tomb)
     /\ pc' = [pc EXCEPT ![t] = "insert_link0"]
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey, level, retryTick>>
+                   readerDepth, readerEpoch, op, opKey, level, retryTick, finishParity, removeMarks>>
+    /\ UNCHANGED links
 
 InsertLink0Success(t) ==
     /\ pc[t] = "insert_link0"
     /\ op[t] = "insert"
     /\ opKey[t] \notin (present \cup tomb)
     /\ present' = present \cup {opKey[t]}
+    /\ \E h \in 1..MaxLevels : height' = [height EXCEPT ![opKey[t]] = h]
+    /\ upMarked' = [upMarked EXCEPT ![opKey[t]] = {}]
+    /\ Interfere(t)
     /\ pc' = [pc EXCEPT ![t] = "insert_link_upper"]
-    /\ level' = [level EXCEPT ![t] = 1]
-    /\ retryTick' = retryTick
     /\ UNCHANGED <<tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey>>
+                   readerDepth, readerEpoch, op, opKey, level, retryTick, finishParity, removeMarks>>
 
-\* CAS failure on level 0: retry insert_find loop, bounded by MaxRetryTicks
+\* CAS failure on level 0: search again (bounded by MaxRetryTicks)
 InsertLink0Fail(t) ==
     /\ pc[t] = "insert_link0"
     /\ op[t] = "insert"
+    /\ ConsumeInterference(t)
     /\ retryTick[t] < MaxRetryTicks
     /\ pc' = [pc EXCEPT ![t] = "insert_find"]
     /\ retryTick' = TickRetry(t)
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey, level>>
+                   readerDepth, readerEpoch, op, opKey, level, finishParity, removeMarks>>
+    /\ UNCHANGED <<height, upMarked>>
 
-\* Exceeded MAX_INSERT_LEVEL0_RETRIES: delete new_node and return false
+\* MAX_INSERT_LEVEL0_RETRIES: free the new node and return false
 InsertLink0Abort(t) ==
     /\ pc[t] = "insert_link0"
     /\ op[t] = "insert"
     /\ retryTick[t] = MaxRetryTicks
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
-\* After level-0 success, upper-level CASes complete (with bounded retries).
-\* In C++ bounded upper-level failures just skip that level; always returns true.
+\* Upper levels published (bounded retries per level; a failure skips the level); return true
 InsertUpperFinish(t) ==
     /\ pc[t] = "insert_link_upper"
     /\ op[t] = "insert"
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ IF height[opKey[t]] > 1 THEN Interfere(t) ELSE UNCHANGED interfered
+    /\ UNCHANGED <<height, upMarked>>
 
 (***************************************************************************)
-(* REMOVE state machine                                                    *)
-(*                                                                          *)
-(* remove_find: scan; return false if not in `present`                    *)
-(* remove_mark: soft-delete upper levels top-down; goto RETRY_REMOVE if   *)
-(*   mark_retry_count >= MAX_REMOVE_MARK_RETRIES_PER_LEVEL                 *)
-(* remove_bottom: CAS-mark level-0 link; on success retire + epoch work;  *)
-(*   if another thread already marked: return false;                       *)
-(*   on CAS failure retry or goto RETRY_REMOVE after MAX_REMOVE_BOTTOM.   *)
-(*                                                                          *)
-(* Matches C++:                                                            *)
-(*   RETRY_REMOVE while(true) { find -> mark upper -> CAS bottom }        *)
+(* REMOVE                                                                  *)
+(*   RETRY_REMOVE: find_with_nodelists -> not FOUND: return false.         *)
+(*   Mark the upper levels top-down (each bounded; exhausted: goto         *)
+(*   RETRY_REMOVE).  Then the level-0 mark CAS:                            *)
+(*     success      -> the node is deleted; unlink and retire it if its    *)
+(*                     upper levels drained (else a traversal will);       *)
+(*                     throttled advance_and_reclaim; return true          *)
+(*     marked       -> another remove deleted it: return false             *)
+(*     else (CAS lost to a successor change) -> retry, bounded             *)
+(*                     (MAX_REMOVE_BOTTOM_RETRIES: return false); the      *)
+(*                     re-walk may restart the call (stale handle, or the  *)
+(*                     key now belongs to a re-inserted node).             *)
 (***************************************************************************)
 RemoveFindMissOrSoftDeleted(t) ==
     /\ pc[t] = "remove_find"
     /\ op[t] = "remove"
     /\ opKey[t] \notin present
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
+\* Found: height[k] - 1 upper levels to mark, top-down
 RemoveFindHit(t) ==
     /\ pc[t] = "remove_find"
     /\ op[t] = "remove"
     /\ opKey[t] \in present
-    /\ pc' = [pc EXCEPT ![t] = "remove_mark"]
-    /\ level' = [level EXCEPT ![t] = MaxLevels]
+    /\ level' = [level EXCEPT ![t] = height[opKey[t]] - 1]
+    /\ pc' = [pc EXCEPT ![t] = IF height[opKey[t]] = 1 THEN "remove_bottom" ELSE "remove_mark"]
     /\ retryTick' = ResetRetry(t)
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey>>
+                   readerDepth, readerEpoch, op, opKey, finishParity, removeMarks>>
+    /\ UNCHANGED links
 
-\* Mark one upper level as soft-deleted, decrement level counter.
-\* When level reaches 1, transition to remove_bottom.
-\* Matches C++ mark loop: for (level = top_level-1; level >= 1; --level) soft_delete(...)
+\* Mark one upper level (soft_delete).  Deletes nothing: the key stays present.  A level that is already
+\*   tombstoned is skipped without a write.
 RemoveMarkProgress(t) ==
     /\ pc[t] = "remove_mark"
     /\ op[t] = "remove"
     /\ level[t] > 0
-    /\ present' = present \ {opKey[t]}
-    /\ tomb' = tomb \cup {opKey[t]}
-    /\ IF level[t] = 1
-          THEN /\ pc' = [pc EXCEPT ![t] = "remove_bottom"]
-               /\ level' = [level EXCEPT ![t] = 0]
-               /\ retryTick' = ResetRetry(t)
-          ELSE /\ pc' = pc
-               /\ level' = [level EXCEPT ![t] = @ - 1]
-               /\ retryTick' = ResetRetry(t)
-    /\ UNCHANGED <<retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey>>
+    /\ IF level[t] \in upMarked[opKey[t]]
+          THEN UNCHANGED <<upMarked, interfered>>
+          ELSE /\ upMarked' = [upMarked EXCEPT ![opKey[t]] = @ \cup {level[t]}]
+               /\ Interfere(t)
+    /\ UNCHANGED height
+    /\ level' = [level EXCEPT ![t] = @ - 1]
+    /\ pc' = [pc EXCEPT ![t] = IF level[t] = 1 THEN "remove_bottom" ELSE "remove_mark"]
+    /\ retryTick' = ResetRetry(t)
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
+                   readerDepth, readerEpoch, op, opKey, finishParity, removeMarks>>
 
-\* Mark-retry exceeded MAX_REMOVE_MARK_RETRIES_PER_LEVEL: goto RETRY_REMOVE
-\* (restart from remove_find; key may have been re-inserted by then)
+\* soft_delete lost a race on this level: try the level again
+RemoveMarkRetry(t) ==
+    /\ pc[t] = "remove_mark"
+    /\ op[t] = "remove"
+    /\ ConsumeInterference(t)
+    /\ retryTick[t] < MaxRetryTicks
+    /\ retryTick' = TickRetry(t)
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
+                   readerDepth, readerEpoch, pc, op, opKey, level, finishParity, removeMarks>>
+    /\ UNCHANGED <<height, upMarked>>
+
+\* MAX_REMOVE_MARK_RETRIES_PER_LEVEL: goto RETRY_REMOVE
 RemoveMarkGotoRetry(t) ==
     /\ pc[t] = "remove_mark"
     /\ op[t] = "remove"
@@ -415,167 +432,136 @@ RemoveMarkGotoRetry(t) ==
     /\ pc' = [pc EXCEPT ![t] = "remove_find"]
     /\ retryTick' = ResetRetry(t)
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey, level>>
+                   readerDepth, readerEpoch, op, opKey, level, finishParity, removeMarks>>
+    /\ UNCHANGED links
 
-\* Level-0 CAS success: this thread soft-deleted the node.
-\* Node moves from tomb to retired+fullyUnlinked; epoch work triggered.
-\* Matches C++: CAS level-0 success -> unlink_state=FULLY_UNLINKED ->
-\*   retire_node -> try_advance_epoch -> throttled reclaim
-RemoveBottomSuccess(t) ==
+\* Level-0 mark CAS succeeds: the node is deleted (present -> tomb).  If its upper levels have drained, this
+\*   call unlinks and retires it; either way it may run the throttled advance_and_reclaim, then returns true.
+RemoveBottomMark(t) ==
     /\ pc[t] = "remove_bottom"
     /\ op[t] = "remove"
-    /\ opKey[t] \in tomb
-    /\ LET k          == opKey[t] IN
-       LET c          == cpu_of(t) IN
-       LET newRetired  == retired \cup {k} IN
-       LET newFU       == fullyUnlinked \cup {k} IN
-       LET newRetAt    == [retiredAt EXCEPT ![k] = globalEpoch] IN
-       LET nextEpoch   == IF CanAdvanceEpoch(c)
-                            THEN IF globalEpoch < MaxEpoch THEN globalEpoch + 1 ELSE MaxEpoch
-                            ELSE globalEpoch IN
-       LET reclaimable == IF CanReclaim(c, nextEpoch) THEN ReclaimableNodes(nextEpoch) ELSE {} IN
-       /\ tomb' = tomb \ {k}
-       /\ retired' = newRetired \ reclaimable
-       /\ fullyUnlinked' = newFU \ reclaimable
-       /\ retiredAt' = newRetAt
-       /\ globalEpoch' = nextEpoch
-       /\ present' = present
-       /\ FinishOp(t)
-       /\ UNCHANGED opKey
+    /\ opKey[t] \in present
+    /\ LET k == opKey[t] IN
+       LET c == cpu_of(t) IN
+       \E unlinkNow \in BOOLEAN, reclaimNow \in BOOLEAN :
+          LET newRetired == IF unlinkNow THEN retired \cup {k} ELSE retired IN
+          LET newFU      == IF unlinkNow THEN fullyUnlinked \cup {k} ELSE fullyUnlinked IN
+          LET newRetAt   == IF unlinkNow THEN [retiredAt EXCEPT ![k] = globalEpoch] ELSE retiredAt IN
+          LET nextEpoch  == IF reclaimNow /\ CanAdvanceEpoch(c)
+                              THEN IF globalEpoch < MaxEpoch THEN globalEpoch + 1 ELSE MaxEpoch
+                              ELSE globalEpoch IN
+          LET reclaimable == IF reclaimNow /\ CanReclaim(c, nextEpoch)
+                               THEN { x \in newFU : newRetAt[x] > 0 /\ newRetAt[x] + EpochLag <= nextEpoch }
+                               ELSE {} IN
+          /\ present' = present \ {k}
+          /\ tomb' = IF unlinkNow THEN tomb ELSE tomb \cup {k}
+          /\ retired' = newRetired \ reclaimable
+          /\ fullyUnlinked' = newFU \ reclaimable
+          /\ retiredAt' = newRetAt
+          /\ globalEpoch' = nextEpoch
+    /\ removeMarks' = [removeMarks EXCEPT ![t] = @ + 1]
+    /\ FinishOp(t)
+    /\ UNCHANGED opKey
+    /\ Interfere(t)
+    /\ UNCHANGED <<height, upMarked>>
 
-\* Another thread already soft-deleted the node (tombstone found in bottom CAS):
-\* return false without retiring.
-\* Matches C++: `else if (tombstoned(deletion_transaction)) { return false; }`
+\* The level-0 link is already marked: another remove() deleted the node.  Return false.
 RemoveBottomStolenByOther(t) ==
     /\ pc[t] = "remove_bottom"
     /\ op[t] = "remove"
-    /\ opKey[t] \notin tomb
+    /\ opKey[t] \notin present
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
-\* CAS failure on bottom level, still within retry limit: keep retrying
+\* The mark CAS lost to a change of the node's successor: retry (the re-walk finds the same node)
 RemoveBottomRetryContinue(t) ==
     /\ pc[t] = "remove_bottom"
     /\ op[t] = "remove"
-    /\ opKey[t] \in tomb
+    /\ ConsumeInterference(t)
+    /\ opKey[t] \in present
     /\ retryTick[t] < MaxRetryTicks
     /\ retryTick' = TickRetry(t)
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, pc, op, opKey, level>>
+                   readerDepth, readerEpoch, pc, op, opKey, level, finishParity, removeMarks>>
+    /\ UNCHANGED <<height, upMarked>>
 
-\* Exceeded MAX_REMOVE_BOTTOM_RETRIES: goto RETRY_REMOVE
-RemoveBottomRetryRestart(t) ==
+\* The re-walk after a lost CAS restarts the call: a stale handle, or the key now belongs to a re-inserted node
+\*   whose upper levels this call has not marked (goto RETRY_REMOVE).
+RemoveBottomRewalkRestart(t) ==
     /\ pc[t] = "remove_bottom"
     /\ op[t] = "remove"
-    /\ opKey[t] \in tomb
-    /\ retryTick[t] = MaxRetryTicks
+    /\ ConsumeInterference(t)
+    /\ retryTick[t] < MaxRetryTicks
     /\ pc' = [pc EXCEPT ![t] = "remove_find"]
     /\ retryTick' = ResetRetry(t)
     /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch,
-                   readerDepth, readerEpoch, op, opKey, level>>
+                   readerDepth, readerEpoch, op, opKey, level, finishParity, removeMarks>>
+    /\ UNCHANGED <<height, upMarked>>
+
+\* MAX_REMOVE_BOTTOM_RETRIES (or MAX_REMOVE_LOCAL_ASSIST_FAILURES): return false
+RemoveBottomGiveUp(t) ==
+    /\ pc[t] = "remove_bottom"
+    /\ op[t] = "remove"
+    /\ retryTick[t] = MaxRetryTicks
+    /\ FinishOp(t)
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
 (***************************************************************************)
-(* FIND state machine                                                      *)
-(*                                                                          *)
-(* find() in C++ is a read-section-wrapped traversal that assists with    *)
-(* GC of tombstoned nodes it encounters.                                   *)
-(*                                                                          *)
-(* The key safety property: find holding a read section prevents reclaim   *)
-(* of nodes retired during the scan (CanReclaim requires all CPUs idle).   *)
-(*                                                                          *)
-(* FindScanNoAssist: find completes without encountering tombstoned nodes. *)
-(* FindScanAssist: find encounters and helps retire a tombstoned node.     *)
+(* FIND: a read-section-wrapped traversal.  It may meet a tombstoned node  *)
+(* whose upper levels have drained and unlink and retire it (the helper    *)
+(* path every traversal - find, insert, remove - takes).                   *)
 (***************************************************************************)
 FindScanNoAssist(t) ==
     /\ pc[t] = "find_scan"
     /\ op[t] = "find"
     /\ FinishOp(t)
-    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey>>
+    /\ UNCHANGED <<present, tomb, retired, fullyUnlinked, retiredAt, globalEpoch, opKey, removeMarks>>
+    /\ UNCHANGED links
 
 FindScanAssist(t) ==
     /\ pc[t] = "find_scan"
     /\ op[t] = "find"
-    /\ tomb # {}
-    /\ LET k == CHOOSE k \in tomb : TRUE IN
-       /\ tomb' = tomb \ {k}
-       /\ retired' = retired \cup {k}
-       /\ fullyUnlinked' = fullyUnlinked \cup {k}
-       /\ retiredAt' = [retiredAt EXCEPT ![k] = globalEpoch]
-    /\ UNCHANGED <<present, globalEpoch>>
+    /\ \E k \in tomb :
+          /\ tomb' = tomb \ {k}
+          /\ retired' = retired \cup {k}
+          /\ fullyUnlinked' = fullyUnlinked \cup {k}
+          /\ retiredAt' = [retiredAt EXCEPT ![k] = globalEpoch]
+    /\ UNCHANGED <<present, globalEpoch, opKey, removeMarks>>
     /\ FinishOp(t)
-    /\ UNCHANGED opKey
-
-(***************************************************************************)
-(* GC state machine                                                        *)
-(*                                                                          *)
-(* gc() in C++ does a full level-0 scan, calling                           *)
-(*   unlink_tombstoned_node_upper_levels + retire on tombstoned nodes,     *)
-(*   then advance_epoch_and_reclaim_retired_nodes.                         *)
-(*                                                                          *)
-(* GcStep models the whole gc() call in one step for TLC tractability.    *)
-(* It may retire the opKey if it is tombstoned, then AdvanceAndReclaim.   *)
-(***************************************************************************)
-GcStep(t) ==
-    /\ pc[t] = "gc_scan"
-    /\ op[t] = "gc"
-    /\ LET retireNow    == opKey[t] \in tomb IN
-       LET newRetired   == IF retireNow THEN retired \cup {opKey[t]} ELSE retired IN
-       LET newFU        == IF retireNow THEN fullyUnlinked \cup {opKey[t]} ELSE fullyUnlinked IN
-       LET newRetAt     == [retiredAt EXCEPT ![opKey[t]] = IF retireNow THEN globalEpoch ELSE @] IN
-       LET newTomb      == IF retireNow THEN tomb \ {opKey[t]} ELSE tomb IN
-       LET c            == cpu_of(t) IN
-       LET nextEpoch    == IF CanAdvanceEpoch(c)
-                             THEN IF globalEpoch < MaxEpoch THEN globalEpoch + 1 ELSE MaxEpoch
-                             ELSE globalEpoch IN
-       LET reclaimable  == IF CanReclaim(c, nextEpoch)
-                           THEN { k \in newFU : newRetAt[k] > 0 /\ newRetAt[k] + EpochLag <= nextEpoch }
-                           ELSE {} IN
-       /\ present' = present
-       /\ tomb' = newTomb
-       /\ retired' = newRetired \ reclaimable
-       /\ fullyUnlinked' = newFU \ reclaimable
-       /\ retiredAt' = newRetAt
-       /\ globalEpoch' = nextEpoch
-       /\ FinishOpCore(t)
-       /\ ExitRead(t)
-    /\ UNCHANGED opKey
+    /\ Interfere(t)
+    /\ UNCHANGED <<height, upMarked>>
 
 (***************************************************************************)
 (* Per-thread step relation                                                *)
 (***************************************************************************)
+RemoveThreadStep(t) ==
+    \/ \E k \in Keys : StartRemove(t, k)
+    \/ RemoveFindMissOrSoftDeleted(t)
+    \/ RemoveFindHit(t)
+    \/ RemoveMarkProgress(t)
+    \/ RemoveMarkRetry(t)
+    \/ RemoveMarkGotoRetry(t)
+    \/ RemoveBottomMark(t)
+    \/ RemoveBottomStolenByOther(t)
+    \/ RemoveBottomRetryContinue(t)
+    \/ RemoveBottomRewalkRestart(t)
+    \/ RemoveBottomGiveUp(t)
+
 ThreadStep(t) ==
     \/ \E k \in Keys : StartInsert(t, k)
-    \/ \E k \in Keys : StartRemove(t, k)
     \/ \E k \in Keys : StartFind(t, k)
-    \/ \E k \in Keys : StartGc(t, k)
+    \/ ReclaimCall(t)
     \/ InsertFindReject(t)
     \/ InsertFindMiss(t)
     \/ InsertLink0Success(t)
     \/ InsertLink0Fail(t)
     \/ InsertLink0Abort(t)
     \/ InsertUpperFinish(t)
-    \/ RemoveFindMissOrSoftDeleted(t)
-    \/ RemoveFindHit(t)
-    \/ RemoveMarkProgress(t)
-    \/ RemoveMarkGotoRetry(t)
-    \/ RemoveBottomSuccess(t)
-    \/ RemoveBottomStolenByOther(t)
-    \/ RemoveBottomRetryContinue(t)
-    \/ RemoveBottomRetryRestart(t)
+    \/ RemoveThreadStep(t)
     \/ FindScanNoAssist(t)
     \/ FindScanAssist(t)
-    \/ GcStep(t)
-
-RemoveThreadStep(t) ==
-    \/ \E k \in Keys : StartRemove(t, k)
-    \/ RemoveFindMissOrSoftDeleted(t)
-    \/ RemoveFindHit(t)
-    \/ RemoveMarkProgress(t)
-    \/ RemoveMarkGotoRetry(t)
-    \/ RemoveBottomSuccess(t)
-    \/ RemoveBottomStolenByOther(t)
-    \/ RemoveBottomRetryContinue(t)
-    \/ RemoveBottomRetryRestart(t)
 
 Next == \E t \in Threads : ThreadStep(t)
 
@@ -619,14 +605,24 @@ InterruptReentrancySafe ==
     \A c \in Cpus :
         (readerDepth[c] >= 1) => (readerEpoch[c] > 0)
 
+\* One remove() call deletes at most one node (it returns right after its level-0 mark)
+RemoveDeletesAtMostOne == \A t \in Threads : removeMarks[t] <= 1
+
 (***************************************************************************)
 (* Liveness properties                                                     *)
 (***************************************************************************)
 
 EventuallyIdle == []<>(\A t \in Threads : pc[t] = "idle")
 
+\* Every operation finishes (wait-freedom).  Holds for one thread; with more, a lock-free remove() may restart
+\*   indefinitely while other threads keep completing operations, which lock-freedom allows.
 ActiveOpsEventuallyFinish ==
     \A t \in Threads : []((pc[t] # "idle") => <>(pc[t] = "idle"))
+
+\* Lock-freedom: while operations are in progress, some operation keeps completing.
+GlobalProgress ==
+    \/ <>[](\A t \in Threads : pc[t] = "idle")
+    \/ ([]<>(finishParity = 0) /\ []<>(finishParity = 1))
 
 RemoveBottomEventuallyIdle ==
     \A t \in Threads : []((pc[t] = "remove_bottom") => <>(pc[t] = "idle"))

@@ -48,6 +48,13 @@ namespace MINIMAL_STD_NAMESPACE
                 return minstd::pair(false, minstd::optional<uint32_t>());
             }
 
+            //  An id too large for 32 bits cannot name an argument, so reject it rather than wrap
+
+            if (position > (UINT32_MAX - 9) / 10)
+            {
+                return minstd::pair(false, minstd::optional<uint32_t>());
+            }
+
             position = position * 10 + (argument_format[i] - '0');
         }
 
@@ -100,52 +107,61 @@ namespace MINIMAL_STD_NAMESPACE
         }
     }
 
+    static bool IsAlignmentCharacter(char c)
+    {
+        return (c == '<') || (c == '>') || (c == '^');
+    }
+
     bool ParseAlignmentAndFill(const minstd::string &argument_format, size_t &processed_characters, arg_format_options &format_options)
     {
-        //  Extract the fill character and alignment specifier
+        //  The alignment is either the first or the second character of the spec.  When it is the second,
+        //      the first is the fill, which may itself be an alignment character: '{:<<5}' fills with '<'.
 
-        size_t align_spec_loc = strcspn(argument_format.c_str() + processed_characters, "<>^");
+        size_t align_spec_loc;
 
-        if ((processed_characters + align_spec_loc) < argument_format.length())
+        if ((processed_characters + 1 < argument_format.length()) && IsAlignmentCharacter(argument_format[processed_characters + 1]))
         {
-            if ((align_spec_loc == 0) || (align_spec_loc == 1))
+            align_spec_loc = 1;
+        }
+        else if (IsAlignmentCharacter(argument_format[processed_characters]))
+        {
+            align_spec_loc = 0;
+        }
+        else
+        {
+            //  No alignment, so there must be no alignment character anywhere else in the spec
+
+            return strcspn(argument_format.c_str() + processed_characters, "<>^") + processed_characters >= argument_format.length();
+        }
+
+        switch (argument_format[processed_characters + align_spec_loc])
+        {
+        case '<':
+            format_options.set_alignment(arg_format_options::align::left);
+            break;
+
+        case '>':
+            format_options.set_alignment(arg_format_options::align::right);
+            break;
+
+        case '^':
+            format_options.set_alignment(arg_format_options::align::center);
+            break;
+        }
+
+        if (align_spec_loc == 1)
+        {
+            //  Fill character cannot be either an opening or closing curly brace.  We can only detect the opening brace here.
+
+            if (argument_format[processed_characters] == '{')
             {
-                switch (argument_format[processed_characters + align_spec_loc])
-                {
-                case '<':
-                    format_options.set_alignment(arg_format_options::align::left);
-                    break;
-
-                case '>':
-                    format_options.set_alignment(arg_format_options::align::right);
-                    break;
-
-                case '^':
-                    format_options.set_alignment(arg_format_options::align::center);
-                    break;
-                }
-            }
-            else
-            {
-                //  Invalid alignment specifier
-
                 return false;
             }
 
-            if (align_spec_loc == 1)
-            {
-                //  Fill character cannot be either an opening or closing curly brace.  We can only detect the opening brace here.
-
-                if (argument_format[processed_characters] == '{')
-                {
-                    return false;
-                }
-
-                format_options.set_fill(argument_format[processed_characters]);
-            }
-
-            processed_characters += align_spec_loc + 1;
+            format_options.set_fill(argument_format[processed_characters]);
         }
+
+        processed_characters += align_spec_loc + 1;
 
         return true;
     }
@@ -223,6 +239,13 @@ namespace MINIMAL_STD_NAMESPACE
             return false;
         }
 
+        //  An explicit alignment overrides a type's default zero fill (pointers zero-fill by default), as in std
+
+        if (format_options.alignment().has_value())
+        {
+            format_options.set_zero_fill(false);
+        }
+
         //  Return if we are at the end of the string
 
         if (processed_characters >= argument_format.length())
@@ -277,6 +300,13 @@ namespace MINIMAL_STD_NAMESPACE
         while ((argument_format[processed_characters] != 0) &&
                (isdigit(argument_format[processed_characters])))
         {
+            //  Widths that do not fit in 32 bits are invalid rather than wrapped
+
+            if (format_options.width().has_value() && (format_options.width().value() > (UINT32_MAX - 9) / 10))
+            {
+                return false;
+            }
+
             format_options.set_width((format_options.width().has_value() ? format_options.width().value() * 10 : 0) + (argument_format[processed_characters] - '0'));
             processed_characters++;
         }
@@ -297,6 +327,11 @@ namespace MINIMAL_STD_NAMESPACE
             while ((argument_format[processed_characters] != 0) &&
                    (isdigit(argument_format[processed_characters])))
             {
+                if (format_options.precision().has_value() && (format_options.precision().value() > (UINT32_MAX - 9) / 10))
+                {
+                    return false;
+                }
+
                 format_options.set_precision((format_options.precision().has_value() ? format_options.precision().value() * 10 : 0) + (argument_format[processed_characters] - '0'));
                 processed_characters++;
             }
@@ -377,22 +412,6 @@ namespace MINIMAL_STD_NAMESPACE
                 //  No closing brace, so exit now.
 
                 break;
-            }
-
-            //   Insure the closing brace is not where the fill character is expected: a '}' directly after the ':'
-            //      and followed by an alignment character.  A '}' that ends a placeholder may be followed by anything.
-
-            if ((closing_brace > 0) &&
-                (fmt[i + closing_brace - 1] == ':') &&
-                ((fmt[i + closing_brace + 1] == '<') ||
-                 (fmt[i + closing_brace + 1] == '>') ||
-                 (fmt[i + closing_brace + 1] == '^')))
-            {
-                buffer += "{Invalid format string: '";
-                buffer.append(fmt + i, closing_brace + 2);
-                buffer += "'}";
-                i += closing_brace + 2;
-                continue;
             }
 
             //  Extract the format string

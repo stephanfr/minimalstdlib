@@ -8,8 +8,7 @@
 (*   pop()        head.load; loop { if null return; next = load_link(cur); *)
 (*                CAS head -> (next, counter + 1); on success              *)
 (*                store_link(cur, null) }                                  *)
-(*   steal_all()  head.exchange(make(nullptr)): StealResetsTag = TRUE      *)
-(*                (counter 0, the code at d5d12c1) or FALSE (counter + 1)  *)
+(*   steal_all()  CAS loop head -> (null, counter + 1)                     *)
 (*                                                                         *)
 (* A thread owns the nodes it popped or stole and may push them back       *)
 (* (the allocator frees a block it allocated).  The counter wraps at       *)
@@ -28,9 +27,8 @@ CONSTANTS
     OpsPerThread,
     TagMod,
     UseSteal,       \* TRUE: threads may also steal_all
-    Scribble,       \* TRUE: an owner may overwrite the link word of a node it owns with any value (the static
-                    \*   arena's bin-7 splice via store_link, and user data written over a free_block_node)
-    StealResetsTag
+    Scribble        \* TRUE: an owner may overwrite the link word of a node it owns with any value (the static
+                    \*   arena's bin-7 splice via store_link; the single arena reusing a metadata record)
 
 NULL == 0
 ASSUME NULL \notin Nodes
@@ -98,7 +96,7 @@ variables ops = 0, cur = NULL, curTag = 0, nxt = NULL, pushing = NULL, stolen = 
             await UseSteal;
             stolen := StackSeq;
             headPtr := NULL;
-            headTag := IF StealResetsTag THEN 0 ELSE (headTag + 1) % TagMod;
+            headTag := (headTag + 1) % TagMod;
  S_own:     owned[self] := owned[self] \cup {stolen[i] : i \in 1..Len(stolen)};
             stolen := <<>>;
         };
@@ -164,7 +162,7 @@ L_loop(self) == /\ pc[self] = "L_loop"
                               \/ /\ UseSteal
                                  /\ stolen' = [stolen EXCEPT ![self] = StackSeq]
                                  /\ headPtr' = NULL
-                                 /\ headTag' = IF StealResetsTag THEN 0 ELSE (headTag + 1) % TagMod
+                                 /\ headTag' = (headTag + 1) % TagMod
                                  /\ pc' = [pc EXCEPT ![self] = "S_own"]
                                  /\ UNCHANGED <<link, owned, pushing>>
                       ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
@@ -203,7 +201,7 @@ P_cas(self) == /\ pc[self] = "P_cas"
                      THEN /\ headPtr' = nxt[self]
                           /\ headTag' = (curTag[self] + 1) % TagMod
                           /\ Assert(cur[self] \notin AllOwned, 
-                                    "Failure of assertion at line 72, column 17.")
+                                    "Failure of assertion at line 70, column 17.")
                           /\ owned' = [owned EXCEPT ![self] = owned[self] \cup {cur[self]}]
                           /\ pc' = [pc EXCEPT ![self] = "P_clear"]
                           /\ UNCHANGED << cur, curTag >>

@@ -850,6 +850,83 @@ namespace
         CHECK_EQUAL(inserted.load(), list.nodes_reclaimed()); //  before: fewer (stranded nodes)
     }
 
+    TEST(SkiplistTests, RemoveThatLandsOnAReinsertedNodeReclaimsIt)
+    {
+        //  remove(10) targets node A.  Its level-0 mark fails because A's successor changes (insert 15); while it
+        //      backs off, another remove takes A and unlinks it, and an insert adds key 10 again as node B.  The
+        //      re-walk then finds B.  remove() used to mark B at level 0 without marking B's upper levels, so a B
+        //      taller than one level was never unlinked, retired or reclaimed.  The hooks run those operations on
+        //      this thread at exactly those points; the filler inserts vary B's height across trials.
+
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14, minstd::skiplist_extensions::skiplist_statistics>;
+        using hooks = minstd::skiplist_internal::remove_test_hooks;
+
+        static list_type *current_list;
+        static uint32_t hook_inserts;
+
+        for (uint32_t trial = 0; trial < 48; ++trial)
+        {
+            list_type list;
+            list.reset_statistics();
+            current_list = &list;
+            hook_inserts = 0;
+
+            uint32_t inserted = 0;
+
+            for (uint32_t filler = 0; filler < trial; ++filler)
+            {
+                inserted += list.insert(1000 + filler, filler) ? 1 : 0;
+            }
+
+            inserted += list.insert(5, 5) ? 1 : 0;
+            inserted += list.insert(10, 10) ? 1 : 0;
+            inserted += list.insert(20, 20) ? 1 : 0;
+
+            hooks::before_bottom_mark = []
+            {
+                hook_inserts += current_list->insert(15, 15) ? 1 : 0;
+            };
+
+            hooks::after_bottom_retry_backoff = []
+            {
+                CHECK_TRUE(current_list->remove(10));
+                hook_inserts += current_list->insert(10, 10) ? 1 : 0;
+            };
+
+            CHECK_TRUE(list.remove(10)); //  removes B
+            CHECK_TRUE(hooks::before_bottom_mark == nullptr);
+            CHECK_TRUE(hooks::after_bottom_retry_backoff == nullptr);
+            CHECK_EQUAL(2u, hook_inserts);
+            inserted += hook_inserts;
+
+            CHECK_FALSE(list.find(10) != list.end());
+
+            list.remove(5);
+            list.remove(15);
+            list.remove(20);
+
+            for (uint32_t filler = 0; filler < trial; ++filler)
+            {
+                list.remove(1000 + filler);
+            }
+
+            //  Help every level unlink, and let every CPU slot reclaim what it retired.
+            for (uint32_t round = 0; round < 64; ++round)
+            {
+                list.find(10);
+                list.find(0xFFFFFFFF);
+
+                for (size_t slot = 0; slot < SKIPLIST_STRESS_MAX_THREADS; ++slot)
+                {
+                    list.advance_and_reclaim(slot);
+                }
+            }
+
+            CHECK_EQUAL(0u, list.size());
+            CHECK_EQUAL(inserted, list.nodes_reclaimed()); //  before the fix: one fewer whenever B was taller than one level
+        }
+    }
+
     TEST(SkiplistTests, SharedSlotReclaimThrottleIsRaceFree)
     {
         //  Several threads drive the throttle of ONE slot, as threads on one CPU (or an interrupt handler and
@@ -943,6 +1020,23 @@ namespace
                 auto *next = block->retired_next;
                 link_type::delete_block(block);
                 block = next;
+            }
+
+            //  Reset the rest of the static allocator state too, as the last skip_list's destructor does, so the
+            //      next test (or a repeat of this one under -r) starts from a fresh allocator
+
+            for (auto &word : link_type::partially_free_blocks_)
+            {
+                word.store(0, minstd::memory_order_release);
+            }
+
+            link_type::high_water_slot_.store(0, minstd::memory_order_relaxed);
+            link_type::high_water_block_.store(0, minstd::memory_order_relaxed);
+            link_type::next_free_slot_.store(1, minstd::memory_order_release);
+
+            if constexpr (requires { link_type::slot_stats_.reset(); })
+            {
+                link_type::slot_stats_.reset();
             }
         }
     }
@@ -1298,5 +1392,150 @@ namespace
         }
 
         CHECK_EQUAL(0u, list_type::active_blocks()); //  the last list frees every block
+    }
+
+    //
+    //  head_ and NIL_ are sentinels by identity, so the extreme key values are ordinary keys.  Before the fix NIL_
+    //      carried numeric_limits<K>::max() and head_ min(): inserting max() failed (find(max()) found NIL_ itself),
+    //      and for floating point min() is the smallest positive value, so negative keys failed validation.
+    //
+
+    template <typename KeyType>
+    void check_extreme_keys(const KeyType (&keys)[4])
+    {
+        using list_type = minstd::skip_list<KeyType, uint32_t, SKIPLIST_STRESS_MAX_THREADS>;
+
+        list_type list;
+
+        CHECK(list.find(keys[3]) == list.end());
+
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            CHECK_TRUE(list.insert(keys[i], i));
+        }
+
+        CHECK_FALSE(list.insert(keys[3], 99)); //  duplicates are still rejected
+        CHECK_EQUAL(4u, list.size());
+        CHECK_TRUE(list.validate_ordering());
+
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            auto found = list.find(keys[i]);
+            CHECK(found != list.end());
+            CHECK_EQUAL(i, found->second);
+        }
+
+        //  Iteration visits all four in key order (the keys are given in ascending order)
+
+        uint32_t visited = 0;
+
+        for (auto itr = list.begin(); itr != list.end(); ++itr)
+        {
+            CHECK(visited < 4);
+            CHECK(itr->first == keys[visited]);
+            visited++;
+        }
+
+        CHECK_EQUAL(4u, visited);
+
+        CHECK_TRUE(list.remove(keys[3]));
+        CHECK_TRUE(list.remove(keys[0]));
+        CHECK_FALSE(list.remove(keys[3]));
+        CHECK_EQUAL(2u, list.size());
+        CHECK(list.find(keys[0]) == list.end());
+        CHECK(list.find(keys[3]) == list.end());
+    }
+
+    TEST(SkiplistTests, ExtremeKeysAreOrdinaryKeys)
+    {
+        const uint32_t unsigned_keys[4] = {0, 1, minstd::numeric_limits<uint32_t>::max() - 1, minstd::numeric_limits<uint32_t>::max()};
+        check_extreme_keys(unsigned_keys);
+
+        const int32_t signed_keys[4] = {minstd::numeric_limits<int32_t>::min(), -1, 0, minstd::numeric_limits<int32_t>::max()};
+        check_extreme_keys(signed_keys);
+
+        const double double_keys[4] = {minstd::numeric_limits<double>::lowest(), -2.5, minstd::numeric_limits<double>::min(), minstd::numeric_limits<double>::max()};
+        check_extreme_keys(double_keys);
+    }
+
+    TEST(SkiplistTests, ListWithoutSentinelsFailsSafely)
+    {
+        //  A memory resource that never has memory: the sentinels cannot be allocated, and every operation must
+        //      fail cleanly instead of dereferencing a null head.
+
+        class empty_memory_resource : public minstd::pmr::memory_resource
+        {
+        private:
+            void *do_allocate(size_t, size_t) override
+            {
+                return nullptr;
+            }
+
+            void do_deallocate(void *, size_t, size_t) override
+            {
+            }
+
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+            {
+                return this == &other;
+            }
+        };
+
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        empty_memory_resource no_memory;
+
+                                                        minstd::skip_list<int16_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS> list(&no_memory);
+
+                                                        if (list.insert(1, 1)) _exit(1);
+                                                        if (list.remove(1)) _exit(2);
+                                                        if (list.find(1) != list.end()) _exit(3);
+                                                        if (list.begin() != list.end()) _exit(4);
+                                                        if (list.size() != 0) _exit(5);
+                                                        if (!list.validate_ordering()) _exit(6); })); //  before: the child segfaults
+    }
+
+    TEST(SkiplistTests, SentinelsWithoutSlotsFailSafely)
+    {
+        //  A resource with room for the sentinel nodes but not for a slot block gave the sentinels slot 0, so every
+        //      link to NIL_ decoded as nullptr: validate_ordering() dereferenced it and inserts retried and failed.
+
+        class small_requests_only : public minstd::pmr::memory_resource
+        {
+        private:
+            minstd::pmr::malloc_free_wrapper_memory_resource upstream_;
+
+            void *do_allocate(size_t bytes, size_t alignment) override
+            {
+                return (bytes <= 4096) ? upstream_.allocate(bytes, alignment) : nullptr; //  slot blocks are far larger
+            }
+
+            void do_deallocate(void *p, size_t bytes, size_t alignment) override
+            {
+                upstream_.deallocate(p, bytes, alignment);
+            }
+
+            bool do_is_equal(const minstd::pmr::memory_resource &other) const noexcept override
+            {
+                return this == &other;
+            }
+        };
+
+        struct slotless_tag
+        {
+        };
+
+        CHECK(minstd::pmr::test::runs_to_completion([]
+                                                    {
+                                                        small_requests_only resource;
+
+                                                        minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14,
+                                                                          minstd::skiplist_extensions::null_skiplist_statistics, slotless_tag>
+                                                            list(&resource);
+
+                                                        if (!list.validate_ordering()) _exit(1);
+                                                        if (list.insert(1, 1)) _exit(2);
+                                                        if (list.size() != 0) _exit(3);
+                                                        if (list.begin() != list.end()) _exit(4); })); //  before: the child segfaults
     }
 }

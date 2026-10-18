@@ -46,8 +46,7 @@ A reader of another live list could be reading the block.
 Lists can be constructed late (`LateStart`).
 
 **Abstractions:** the epoch grace is reduced to its guarantee (`LockfreeSkiplist.tla` models the epochs themselves),
-and there is one block index. With `Fix = "sole"` the model checks the extraction and destructor rules but not the
-retire gating. The gating only removes behaviours, so safety shown without it holds with it.
+and there is one block index. The model checks the extraction and destructor rules but not the retire gating. The gating only removes behaviours, so safety shown without it holds with it.
 
 **Checked:**
 - `NoAccessToFreedBlock`: every read of block memory is of a live block.
@@ -57,11 +56,9 @@ retire gating. The gating only removes behaviours, so safety shown without it ho
 
 | Config | Lists | Expected | Result |
 |--------|-------|----------|--------|
-| `current_two.cfg` | 2, d5d12c1 | `NoAccessToFreedBlock` violated | violated: a reader of list 1 loads the block; it retires; list 2 extracts and frees it after its own (no) readers |
-| `current_one.cfg` | 1, d5d12c1 | no error | no error, 155,905 distinct states |
-| `fixed_two.cfg` | 2, fix | no error, terminates | no error, 3,630,678 distinct states |
-| `fixed_late.cfg` | 2 (one constructed late), fix | no error, terminates | no error, 4,206,813 distinct states |
-| `fixed_three.cfg` | 3 (one late), fix | no error, terminates | no error, 354,655 distinct states |
+| `two_lists.cfg` | 2, fix | no error, terminates | no error, 3,630,678 distinct states |
+| `late_list.cfg` | 2 (one constructed late), fix | no error, terminates | no error, 4,206,813 distinct states |
+| `three_lists.cfg` | 3 (one late), fix | no error, terminates | no error, 354,655 distinct states |
 
 C++ tests (`test/correctness/lockfree_skiplist_test.cpp`):
 - `SlotBlocksAreNotRetiredWhileSeveralListsOfTheTypeAreLive`: blocks retired by list A were freed while list B was

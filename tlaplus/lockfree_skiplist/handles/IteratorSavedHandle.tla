@@ -4,23 +4,22 @@
 (* an iterator keeps its node's handle between calls, outside any read     *)
 (* section, and resolves it in a new section.                              *)
 (*                                                                         *)
-(*   remover   final unlink; retire_node: [mark_retired]; fence;           *)
+(*   remover   final unlink; retire_node: mark_retired; fence;             *)
 (*             retired_epoch_ = epoch                                      *)
 (*   reclaimer try_advance_epoch: advance when every active reader's       *)
 (*             snapshot is current; reclaim: free when retired_epoch_ <=   *)
 (*             epoch - 2 and every active reader's snapshot is above it;   *)
 (*             ~skip_node: free_slot (table entry = null), then the memory *)
-(*   iterator  enter section (snapshot = epoch); p = unpack(handle);       *)
-(*             [Check: retired mark set -> leapfrog]; read p's links;      *)
-(*             exit                                                        *)
+(*   iterator  enter section (snapshot = epoch);                           *)
+(*             p = unpack_unretired_ptr(handle): null if the retired mark  *)
+(*             is set, and the iterator leapfrogs; read p's links; exit    *)
 (*                                                                         *)
-(* Check = FALSE is the code at d5d12c1 (unpack_ptr), TRUE uses            *)
-(* unpack_unretired_ptr.  The orderings are sequentially consistent here;  *)
-(* on weak memory they rest on the fences (litmus/aarch64 K).             *)
+(* The orderings are sequentially consistent here; on weak memory they    *)
+(* rest on the fences (litmus/aarch64 K).                                  *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
-CONSTANTS Check, MaxEpoch, Passes
+CONSTANTS MaxEpoch, Passes
 
 (* --algorithm IteratorSavedHandle {
 variables
@@ -30,7 +29,7 @@ variables
 fair process (Remover = 1)
 {
  U_unlink:  node := "unlinked";
- U_mark:    if (Check) { marked := TRUE; };
+ U_mark:    marked := TRUE;
  U_stamp:   retiredEpoch := epoch; node := "retired";
 }
 
@@ -59,9 +58,7 @@ variables n = 0, p = 0;
  I_enter:   active := TRUE; snapshot := epoch;
  I_resolve: p := table;
             if (p # 0) {
-                if (Check) {
  I_check:       if (marked) { p := 0; };
-                };
  I_read:        if (p # 0) { assert node # "freed" /\ node # "destroying"; };
             };
  I_exit:    active := FALSE;
@@ -100,10 +97,7 @@ U_unlink == /\ pc[1] = "U_unlink"
                             snapshot, n, p >>
 
 U_mark == /\ pc[1] = "U_mark"
-          /\ IF Check
-                THEN /\ marked' = TRUE
-                ELSE /\ TRUE
-                     /\ UNCHANGED marked
+          /\ marked' = TRUE
           /\ pc' = [pc EXCEPT ![1] = "U_stamp"]
           /\ UNCHANGED << epoch, node, retiredEpoch, table, active, snapshot, 
                           n, p >>
@@ -162,21 +156,10 @@ I_enter == /\ pc[3] = "I_enter"
 I_resolve == /\ pc[3] = "I_resolve"
              /\ p' = table
              /\ IF p' # 0
-                   THEN /\ IF Check
-                              THEN /\ pc' = [pc EXCEPT ![3] = "I_check"]
-                              ELSE /\ pc' = [pc EXCEPT ![3] = "I_read"]
+                   THEN /\ pc' = [pc EXCEPT ![3] = "I_check"]
                    ELSE /\ pc' = [pc EXCEPT ![3] = "I_exit"]
              /\ UNCHANGED << epoch, node, retiredEpoch, marked, table, active, 
                              snapshot, n >>
-
-I_read == /\ pc[3] = "I_read"
-          /\ IF p # 0
-                THEN /\ Assert(node # "freed" /\ node # "destroying", 
-                               "Failure of assertion at line 65, column 30.")
-                ELSE /\ TRUE
-          /\ pc' = [pc EXCEPT ![3] = "I_exit"]
-          /\ UNCHANGED << epoch, node, retiredEpoch, marked, table, active, 
-                          snapshot, n, p >>
 
 I_check == /\ pc[3] = "I_check"
            /\ IF marked
@@ -187,13 +170,22 @@ I_check == /\ pc[3] = "I_check"
            /\ UNCHANGED << epoch, node, retiredEpoch, marked, table, active, 
                            snapshot, n >>
 
+I_read == /\ pc[3] = "I_read"
+          /\ IF p # 0
+                THEN /\ Assert(node # "freed" /\ node # "destroying", 
+                               "Failure of assertion at line 62, column 30.")
+                ELSE /\ TRUE
+          /\ pc' = [pc EXCEPT ![3] = "I_exit"]
+          /\ UNCHANGED << epoch, node, retiredEpoch, marked, table, active, 
+                          snapshot, n, p >>
+
 I_exit == /\ pc[3] = "I_exit"
           /\ active' = FALSE
           /\ pc' = [pc EXCEPT ![3] = "I_loop"]
           /\ UNCHANGED << epoch, node, retiredEpoch, marked, table, snapshot, 
                           n, p >>
 
-Iterator == I_loop \/ I_enter \/ I_resolve \/ I_read \/ I_check \/ I_exit
+Iterator == I_loop \/ I_enter \/ I_resolve \/ I_check \/ I_read \/ I_exit
 
 (* Allow infinite stuttering to prevent deadlock on termination. *)
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"

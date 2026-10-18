@@ -386,4 +386,12 @@ namespace
         CHECK_EQUAL(6u, partial.length());
         STRCMP_EQUAL("abcdef", partial.c_str());
     }
+
+    TEST(FixedStringTests, NposLengthCopiesTheWholeString)
+    {
+        //  length + 1 wrapped to 0 for npos, so nothing was copied and the buffer was left unterminated.
+        minstd::fixed_string<64> s("hello", minstd::fixed_string<64>::npos);
+        CHECK_EQUAL(5u, s.size());
+        STRCMP_EQUAL("hello", s.c_str());
+    }
 }

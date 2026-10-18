@@ -1058,4 +1058,32 @@ namespace
 
         CHECK_EQUAL(0u, resource.bytes_in_use());
     }
+
+    using avl_tree_int = minstd::avl_tree<uint32_t, uint32_t>;
+    using avl_tree_intAllocator = minstd::pmr::polymorphic_allocator<avl_tree_int::node_type>;
+
+    static_assert(minstd::is_same_v<avl_tree_int::value_type, minstd::pair<const uint32_t, uint32_t>>, "keys must not be changeable through iterators");
+
+    TEST(avl_treeTests, InsertLvaluePairAndConstFind)
+    {
+        static char heap_buffer[TEST_BUFFER_SIZE];
+        minstd::single_block_memory_heap heap(heap_buffer, TEST_BUFFER_SIZE);
+        minstd::pmr::memory_heap_resource_adapter heap_resource(heap);
+        avl_tree_intAllocator allocator(&heap_resource);
+
+        avl_tree_int tree(allocator);
+
+        //  insert(const value_type &) did not compile: it passed a const value to an rvalue parameter
+
+        const avl_tree_int::value_type entry(5, 50);
+        CHECK(tree.insert(entry).second);
+        CHECK_FALSE(tree.insert(entry).second);
+
+        const avl_tree_int &const_tree = tree;
+
+        avl_tree_int::const_iterator found = const_tree.find(5);
+        CHECK(found != const_tree.end());
+        CHECK_EQUAL(50, found->second);
+        CHECK(const_tree.find(6) == const_tree.end());
+    }
 }

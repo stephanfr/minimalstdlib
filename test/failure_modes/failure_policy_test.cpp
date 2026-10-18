@@ -6,6 +6,9 @@
 
 #include <minstdconfig.h>
 
+#include <avl_tree>
+#include <forward_list>
+#include <list>
 #include <lockfree/spsc_queue>
 #include <vector>
 
@@ -225,5 +228,54 @@ namespace
         CHECK_EQUAL(1, g_failure_event.call_count);
         CHECK_EQUAL(2u, v.size());
         CHECK(allocator.guard_intact(2)); //  before: bytes 8..11 overwritten with 3
+    }
+
+    //
+    //  Under the TRAP allocation policy with the TEST failure policy (this build), MINIMAL_STD_OUT_OF_MEMORY
+    //      reported the failure and then dropped its fallback, so these containers carried on with a null node:
+    //      avl_tree counted and constructed a node at nullptr, and the lists linked one in.
+    //
+
+    TEST(FailurePolicyTests, AvlTreeInsertOomTakesTheFallback)
+    {
+        using tree_type = minstd::avl_tree<uint32_t, uint32_t>;
+
+        failing_allocator_type<tree_type::node_type> allocator;
+        tree_type tree(allocator);
+
+        auto result = tree.insert(1u, 10u);
+
+        CHECK_FALSE(result.second);
+        CHECK(result.first == tree.end());
+        CHECK_EQUAL(0u, tree.size());
+        CHECK(tree.empty());
+        CHECK_EQUAL(1, g_failure_event.call_count);
+    }
+
+    TEST(FailurePolicyTests, ListPushFrontOomTakesTheFallback)
+    {
+        using list_type = minstd::list<uint32_t>;
+
+        failing_allocator_type<list_type::node_type> allocator;
+        list_type list(allocator);
+
+        list.push_front(1u);
+
+        CHECK(list.empty());
+        CHECK_EQUAL(0u, list.size());
+        CHECK_EQUAL(1, g_failure_event.call_count);
+    }
+
+    TEST(FailurePolicyTests, ForwardListPushFrontOomTakesTheFallback)
+    {
+        using list_type = minstd::forward_list<uint32_t>;
+
+        failing_allocator_type<list_type::node_type> allocator;
+        list_type list(allocator);
+
+        list.push_front(1u);
+
+        CHECK(list.empty());
+        CHECK_EQUAL(1, g_failure_event.call_count);
     }
 }

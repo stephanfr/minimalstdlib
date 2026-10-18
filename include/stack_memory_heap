@@ -12,7 +12,7 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
-    template <size_t FIXED_SIZE, size_t ALIGNMENT = alignof(single_block_memory_heap)>
+    template <size_t FIXED_SIZE, size_t ALIGNMENT = alignof(max_align_t)>
     class stack_memory_heap : public single_block_memory_heap
     {
     public:
@@ -23,6 +23,6 @@ namespace MINIMAL_STD_NAMESPACE
 
     private :
 
-        char heap_[FIXED_SIZE]; //  Storage on the stack
+        alignas(ALIGNMENT) char heap_[FIXED_SIZE]; //  Storage on the stack, aligned as the heap promises its blocks
     };
 }

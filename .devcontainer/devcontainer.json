@@ -2,11 +2,12 @@
     "name": "minimalstdlib",
     "image": "ghcr.io/stephanfr/aarch64-bare-metal-toolchain:13.3.rel1",
     "runArgs": ["--cap-add=SYS_PTRACE", "--security-opt", "seccomp=unconfined"],
-    "postCreateCommand": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends lcov gdb gdb-multiarch valgrind strace ltrace && git clone https://github.com/stephanfr/minimalclib.git ${containerWorkspaceFolder}/../minimalclib && make -C ${containerWorkspaceFolder}/../minimalclib lib native",
+    "postCreateCommand": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends lcov gdb gdb-multiarch valgrind strace ltrace clang-18 libclang-rt-18-dev python3 && git clone https://github.com/stephanfr/minimalclib.git ${containerWorkspaceFolder}/../minimalclib && make -C ${containerWorkspaceFolder}/../minimalclib lib native",
     "remoteEnv": {
         "TOOLS": "/opt",
         "THIRD_PARTY": "/opt",
         "CPPUTEST_PATH": "/opt/cpputest",
+        "CLANG_CXX": "clang++-18",
         "MINIMALCLIB_DIR": "${containerWorkspaceFolder}/../minimalclib"
     },
     "customizations": {

@@ -30,7 +30,7 @@ namespace MINIMAL_STD_NAMESPACE
         //
         //  On destruction, this resource will just dump all the memory it allocated without invoking any destructors
 
-        template <size_t ELEMENT_SIZE_IN_BYTES, size_t ELEMENTS_PER_BLOCK, size_t MAX_NUMBER_OF_ARENAS, size_t MAX_NUMBER_OF_BLOCKS, bool include_statistics = true>
+        template <size_t ELEMENT_SIZE_IN_BYTES, size_t ELEMENTS_PER_BLOCK, size_t MAX_NUMBER_OF_ARENAS, size_t MAX_NUMBER_OF_BLOCKS, bool include_statistics = false>
             requires((ELEMENT_SIZE_IN_BYTES >= 4) &&
                      ((ELEMENT_SIZE_IN_BYTES % 16) == 0) &&
                      (ELEMENT_SIZE_IN_BYTES <= 256) &&
@@ -249,7 +249,8 @@ namespace MINIMAL_STD_NAMESPACE
                     if (block_space == nullptr)
                     {
                         //  Leave this arena empty; do_allocate() adds a block when memory becomes available.
-                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block), continue);
+                        MINIMAL_STD_OUT_OF_MEMORY(sizeof(block), alignof(block));
+                        continue;
                     }
 
                     auto initial_block = new (block_space) block();
@@ -380,7 +381,12 @@ namespace MINIMAL_STD_NAMESPACE
 
             void *do_allocate(size_t num_bytes, size_t alignment) override
             {
-                //  Ignore the alignment as alignment will be 16 bytes based on the template requirements
+                //  Every allocation is an element boundary + HEADER_SIZE, so only alignments up to 16 can be honoured.
+
+                if (alignment > HEADER_SIZE)
+                {
+                    return nullptr;
+                }
 
                 size_t num_elements = elements_for_bytes(num_bytes);
 
@@ -390,7 +396,7 @@ namespace MINIMAL_STD_NAMESPACE
                 }
 
                 uint64_t core_id = platform::get_cpu_id();
-                uint64_t arena_in_use = core_id % number_of_arenas_;
+                uint64_t arena_in_use = (core_id < number_of_arenas_) ? core_id : (core_id % number_of_arenas_); //  no divide on the usual path
                 size_t hint_index = core_id % MAX_NUMBER_OF_ARENAS;
                 size_t scan_offset = core_id;
 
@@ -444,12 +450,11 @@ namespace MINIMAL_STD_NAMESPACE
                     return result;
                 }
 
-                if (!cap_reached)
-                {
-                    return nullptr;
-                }
+                //  Cross-arena fallback: try existing blocks in other arenas.  This applies whether this arena could
+                //      not grow because the block cap was reached or because upstream had no memory left: either way
+                //      other arenas may still have free elements.
 
-                //  Cross-arena fallback: try existing blocks in other arenas.
+                (void)cap_reached;
 
                 for (size_t offset = 1; offset < number_of_arenas_; ++offset)
                 {
@@ -469,6 +474,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             void do_deallocate(void *block, size_t num_bytes, size_t alignment) override
             {
+                if (block == nullptr)
+                {
+                    return;
+                }
+
                 //  Find the block from which the allocation was made
 
                 uint8_t *payload = static_cast<uint8_t *>(block);

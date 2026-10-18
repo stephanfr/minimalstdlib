@@ -60,6 +60,11 @@ namespace MINIMAL_STD_NAMESPACE
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#if defined(__clang__)
+        //  A variable-length array (a GCC and clang extension): the size comes from GetFmtArgSize(), which custom
+        //      formatters supply as an ordinary function, so it is not a constant expression.
+#pragma clang diagnostic ignored "-Wvla-cxx-extension"
+#endif
         alignas(max_align_t) unsigned char arg_storage[total_arg_storage_required + 1];
         const fmt_arg *all_args[num_args + 1];
         size_t i = 0;

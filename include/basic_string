@@ -38,20 +38,17 @@ namespace MINIMAL_STD_NAMESPACE
 
         basic_string &operator=(const T *value)
         {
-            grow_buffer_for_string(value);
-
-            length_ = minstd::min(strlcpy(buffer_, value, buffer_size_), chars_that_fit());
-
-            return *this;
+            return assign_range(0, value, strnlen(value, max_size_));
         }
 
         basic_string &operator=(const basic_string &string_to_copy)
         {
-            grow_buffer(string_to_copy.length_);
+            if (this == &string_to_copy)
+            {
+                return *this;
+            }
 
-            length_ = minstd::min(strlcpy(buffer_, string_to_copy.buffer_, buffer_size_), chars_that_fit());
-
-            return *this;
+            return assign_range(0, string_to_copy.buffer_, string_to_copy.length_);
         }
 
         template <size_t OTHER_MAX_SIZE>
@@ -133,6 +130,13 @@ namespace MINIMAL_STD_NAMESPACE
             return buffer_;
         }
 
+        //  The most characters the string can hold
+
+        size_t max_size() const
+        {
+            return max_size_;
+        }
+
         size_t size() const
         {
             return length_;
@@ -157,13 +161,11 @@ namespace MINIMAL_STD_NAMESPACE
 
         basic_string<T> &operator+=(const T *value)
         {
-            grow_buffer_for_string(value);
-
-            basic_string<T>::length_ += minstd::min(strlcpy(basic_string<T>::buffer_ + basic_string<T>::length_, value, basic_string<T>::buffer_size_ - basic_string<T>::length_), chars_that_fit() - basic_string<T>::length_);
-
-            return *this;
+            return assign_range(length_, value, strnlen(value, max_size_));
         }
 
+        //  Appends up to length characters of value, stopping at a terminator (value need not be terminated
+        //      within length).
         basic_string<T> &append(const T *value, size_t length)
         {
             if (length == 0)
@@ -171,18 +173,7 @@ namespace MINIMAL_STD_NAMESPACE
                 return *this;
             }
 
-            grow_buffer(length + 1);
-
-            size_t chars_copied = 0;
-
-            while (value[chars_copied] != 0 && chars_copied < length && length_ < chars_that_fit())
-            {
-                buffer_[length_++] = value[chars_copied++];
-            }
-
-            buffer_[length_] = 0;
-
-            return *this;
+            return assign_range(length_, value, strnlen(value, length));
         }
 
         constexpr const T &back() const
@@ -361,15 +352,17 @@ namespace MINIMAL_STD_NAMESPACE
               buffer_size_(buffer_size),
               max_size_(max_size)
         {
-            length_ = minstd::min(strlcpy(buffer_, value, buffer_size_), max_size_);
+            length_ = copy_terminated(value, strnlen(value, max_size_));
         }
 
+        //  Copies up to length characters, stopping at a terminator (value need not be terminated within length;
+        //      npos means "up to the terminator").
         explicit constexpr basic_string(T *buffer, size_t buffer_size, size_t max_size, const T *value, size_t length)
             : buffer_(buffer),
               buffer_size_(buffer_size),
               max_size_(max_size)
         {
-            length_ = minstd::min(strlcpy(buffer_, value, minstd::min(buffer_size_, length + 1)), minstd::min(length, max_size_));
+            length_ = copy_terminated(value, strnlen(value, minstd::min(length, max_size_)));
         }
 
         explicit basic_string(T *buffer, size_t buffer_size, size_t max_size, const basic_string &string_to_copy)
@@ -377,7 +370,58 @@ namespace MINIMAL_STD_NAMESPACE
               buffer_size_(buffer_size),
               max_size_(max_size)
         {
-            length_ = minstd::min(strlcpy(buffer_, string_to_copy.buffer_, buffer_size_), max_size_);
+            length_ = copy_terminated(string_to_copy.buffer_, string_to_copy.length_);
+        }
+
+        //  Constructors: copies count characters (clipped to the buffer) and terminates.  Returns the length.
+        constexpr size_t copy_terminated(const T *value, size_t count)
+        {
+            const size_t to_copy = minstd::min(count, chars_that_fit());
+
+            for (size_t i = 0; i < to_copy; ++i)
+            {
+                buffer_[i] = value[i];
+            }
+
+            buffer_[to_copy] = 0;
+
+            return to_copy;
+        }
+
+        //  Replaces everything from offset (at most length_) with count characters of src, growing the buffer first
+        //      and clipping to what fits.  src may point into this string's own buffer (s += s, s = s.c_str() + 1):
+        //      growing can move the buffer, so such a source is re-based on the new buffer, and the copy is a
+        //      memmove.  count must be computed before the call.
+        basic_string &assign_range(size_t offset, const T *src, size_t count)
+        {
+            const uintptr_t old_buffer = reinterpret_cast<uintptr_t>(buffer_);
+            const uintptr_t src_address = reinterpret_cast<uintptr_t>(src);
+            const bool aliased = (src_address >= old_buffer) && (src_address < old_buffer + (buffer_size_ * sizeof(T)));
+            const size_t src_offset = aliased ? static_cast<size_t>(src - buffer_) : 0;
+
+            offset = minstd::min(offset, length_);
+
+            if (offset + count > length_)
+            {
+                grow_buffer(offset + count - length_); //  keeps buffer_[0, length_]
+            }
+
+            if (aliased)
+            {
+                src = buffer_ + src_offset;
+            }
+
+            const size_t fit = chars_that_fit();
+
+            offset = minstd::min(offset, fit);
+            count = minstd::min(count, fit - offset);
+
+            memmove(buffer_ + offset, src, count * sizeof(T));
+
+            length_ = offset + count;
+            buffer_[length_] = 0;
+
+            return *this;
         }
 
         virtual void grow_buffer_for_string(const T *str) = 0;

@@ -40,7 +40,7 @@ TEST(lockfree_static_arena_resource_CorrectnessTests, TestBasicAllocationAndAlig
 
 TEST(lockfree_static_arena_resource_CorrectnessTests, TestFallbackAllocation)
 {
-    alignas(64) uint8_t buffer[128]; // Exact size for two blocks (64 each)
+    alignas(64) uint8_t buffer[2 * (64 + 4)]; // Exact size for two 64-byte blocks and their free-list cells
     minstd::pmr::lockfree_static_arena_resource resource(buffer, sizeof(buffer));
 
     void* p1 = resource.allocate(32, 8); // Uses 64 bytes
@@ -95,7 +95,7 @@ TEST(lockfree_static_arena_resource_CorrectnessTests, ConcurrentRecycleNeverRepo
     constexpr size_t BLOCK = 256;
     constexpr size_t ITERATIONS = 20000;
 
-    alignas(64) static uint8_t arena[NUM_THREADS * BLOCK];
+    alignas(64) static uint8_t arena[NUM_THREADS * BLOCK / 64 * (64 + 4)]; //  the blocks and their free-list cells
     minstd::pmr::lockfree_static_arena_resource resource(arena, sizeof(arena));
 
     struct args_type

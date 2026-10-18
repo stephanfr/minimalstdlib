@@ -138,7 +138,7 @@ DEP_FILES := $(CORRECTNESS_OBJ:.o=.d) \
 # ---------------------------------------------------------------------------
 # Phony targets
 # ---------------------------------------------------------------------------
-.PHONY: test test-correctness test-failure-modes test-performance test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan
+.PHONY: test test-correctness test-failure-modes test-config-matrix test-performance test-performance-comparison test-performance-host-std test-soak test-coverage clean_test test-correctness-asan test-correctness-tsan test-correctness-clang
 
 # ---------------------------------------------------------------------------
 # Aggregate targets
@@ -149,19 +149,41 @@ test-correctness: lib $(CORRECTNESS_EXE) $(LOCKFREE_CORRECTNESS_EXE)
 	./$(CORRECTNESS_EXE)
 	./$(LOCKFREE_CORRECTNESS_EXE)
 
+#  allocator_may_return_null: the allocator model asks malloc-backed resources for impossible sizes and expects
+#      nullptr, as malloc returns; by default the sanitizers abort on such a request instead.
 test-correctness-asan: $(ASAN_CORRECTNESS_EXE) $(ASAN_LOCKFREE_CORRECTNESS_EXE)
-	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_CORRECTNESS_EXE)
-	ASAN_OPTIONS=detect_leaks=0 ./$(ASAN_LOCKFREE_CORRECTNESS_EXE)
+	ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ./$(ASAN_CORRECTNESS_EXE)
+	ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 ./$(ASAN_LOCKFREE_CORRECTNESS_EXE)
 
 test-correctness-tsan: $(TSAN_CORRECTNESS_EXE) $(TSAN_LOCKFREE_CORRECTNESS_EXE)
-	setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
-	setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
+	TSAN_OPTIONS=allocator_may_return_null=1 setarch $$(uname -m) -R ./$(TSAN_CORRECTNESS_EXE)
+	TSAN_OPTIONS=allocator_may_return_null=1 setarch $$(uname -m) -R ./$(TSAN_LOCKFREE_CORRECTNESS_EXE)
+
+#  The correctness suites built with clang (CLANG_CXX), in their own object directories
+CLANG_CXX       ?= clang++
+CLANG_BUILD_DIR := test/build-clang
+
+test-correctness-clang:
+	$(MAKE) -f Makefile.test.mk CC=$(CLANG_CXX) LD=$(CLANG_CXX) \
+		CPPUTEST_PATH=$(CPPUTEST_PATH) MINIMALCLIB_DIR=$(MINIMALCLIB_DIR) \
+		CORRECTNESS_OBJ_DIR=$(CLANG_BUILD_DIR)/correctness LIB_OBJ_DIR=$(CLANG_BUILD_DIR)/lib \
+		$(CLANG_BUILD_DIR)/correctness/cpputest_correctness.exe $(CLANG_BUILD_DIR)/correctness/cpputest_lockfree_correctness.exe
+	./$(CLANG_BUILD_DIR)/correctness/cpputest_correctness.exe
+	./$(CLANG_BUILD_DIR)/correctness/cpputest_lockfree_correctness.exe
 
 test-failure-modes: lib $(FAILURE_MODE_EXE)
 	./$(FAILURE_MODE_EXE)
 
+#  The correctness suites under each non-default build setting (see test/run_config_matrix.sh)
+test-config-matrix: lib
+	MAKE_ARGS="CPPUTEST_PATH=$(CPPUTEST_PATH) MINIMALCLIB_DIR=$(MINIMALCLIB_DIR)" test/run_config_matrix.sh
+
+#  The lock-free vs. std comparison takes ~15 minutes and is run on demand (test-performance-comparison), not in CI.
 test-performance: lib $(PERFORMANCE_EXE)
-	./$(PERFORMANCE_EXE)
+	./$(PERFORMANCE_EXE) -xg LockfreeVsStdComparisonPerformanceTests
+
+test-performance-comparison: lib $(PERFORMANCE_EXE)
+	./$(PERFORMANCE_EXE) -g LockfreeVsStdComparisonPerformanceTests
 
 test-performance-host-std: $(HOST_PERF_EXE)
 	./$(HOST_PERF_EXE)
@@ -173,12 +195,12 @@ test-coverage:
 	$(MAKE) -f Makefile.test.mk clean_test
 	$(MAKE) -f Makefile.test.mk $(COVERAGE_EXE)
 	cd $(COVERAGE_OBJ_DIR) && \
-	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . -o /tmp > /dev/null ; \
-	lcov --capture --directory . --output-file /tmp/test_coverage.info --ignore-errors mismatch,negative ; \
-	lcov --remove /tmp/test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
-	     --output-file /tmp/test_coverage_filtered.info --ignore-errors unused ; \
-	genhtml /tmp/test_coverage_filtered.info --output-directory coverage_report ; \
-	rm -f /tmp/test_coverage.info /tmp/test_coverage_filtered.info /tmp/*.gcov
+	gcov ../../$(CORRECTNESS_SRC_DIR)/cpputest_correctness_main.cpp --object-directory . > /dev/null ; \
+	lcov --capture --directory . --output-file test_coverage.info --ignore-errors mismatch,negative ; \
+	lcov --remove test_coverage.info '/usr/include/*' '$(CPPUTEST_PATH)/*' \
+	     --output-file test_coverage_filtered.info --ignore-errors unused ; \
+	genhtml test_coverage_filtered.info --output-directory coverage_report ; \
+	rm -f test_coverage.info test_coverage_filtered.info *.gcov
 	find $(COVERAGE_OBJ_DIR) $(COVERAGE_LIB_OBJ_DIR) -name "*.o" -o -name "*.gcno" -o -name "*.gcda" | xargs rm -f
 	rm -f $(COVERAGE_EXE)
 	rm -f *.gcov *##*.gcov

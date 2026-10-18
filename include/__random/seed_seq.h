@@ -78,63 +78,74 @@ namespace MINIMAL_STD_NAMESPACE
 
         //  Fills [first, last) with values derived from the stored seeds.
         //
-        //  Implements the mixing algorithm specified in [rand.util.seedseq.generate]
-        //  of the C++ standard.  Two passes (forward and backward) over the output
-        //  range ensure every output word depends on every stored seed value.
+        //  The algorithm specified in [rand.util.seedseq] of the C++ standard, so the
+        //  output matches std::seed_seq for the same seeds.
         template <typename RandomAccessIterator>
         void generate(RandomAccessIterator first, RandomAccessIterator last) noexcept
         {
             if (first == last)
                 return;
 
-            using T = uint_least32_t;
+            //  [rand.util.seedseq]: all arithmetic is modulo 2^32.
+            using T = uint32_t;
 
-            const size_t m = static_cast<size_t>(last - first);
+            const size_t n = static_cast<size_t>(last - first);
             const size_t s = n_;
 
-            //  Initialise output to a non-zero constant.
-            for (size_t i = 0u; i < m; ++i)
-                first[i] = T(0x8b8b8b8bu);
-
-            //  Layout parameters derived from output-range size.
-            const size_t t = (m >= 623u) ? 11u
-                           : (m >= 68u)  ? 7u
-                           : (m >= 39u)  ? 5u
-                           : (m >= 7u)   ? 3u
-                           : (m - 1u) / 2u;
-            const size_t p = (m - t) / 2u;
-            const size_t q = p + t;
-            const size_t S = (s > m) ? s : m;   // max(s, m)
-
-            //  Forward pass — k = 0 .. S (inclusive).
-            //  Mixes stored seed values into the output array.
-            for (size_t k = 0u; k <= S; ++k)
+            auto at = [&first](size_t index) -> T
             {
-                const size_t km  = k % m;
-                const size_t km1 = (k + m - 1u) % m;   // (k-1) mod m, avoids underflow
-                const T r1 = T(1664525u) * (first[km] ^ first[(k + p) % m] ^ first[km1]);
-                const T r2 = (k == 0u)  ? r1 + T(s) :
-                             (k <= s)   ? r1 + T(km) + v_[k - 1u] :
-                                          r1 + T(km);
-                first[(k + p) % m] += r1;
-                first[(k + q) % m] += r2;
-                first[km] = r2;
+                return static_cast<T>(first[index]);
+            };
+
+            auto mix = [](T x) -> T
+            {
+                return x ^ (x >> 27);
+            };
+
+            for (size_t i = 0u; i < n; ++i)
+            {
+                first[i] = T(0x8b8b8b8bu);
             }
 
-            //  Backward pass — k = S+1 .. S+m (inclusive).
-            //  A second mixing sweep using XOR so that the forward values
-            //  cannot be trivially recovered.
-            for (size_t k = S + 1u; k <= S + m; ++k)
+            const size_t t = (n >= 623u) ? 11u
+                             : (n >= 68u) ? 7u
+                             : (n >= 39u) ? 5u
+                             : (n >= 7u)  ? 3u
+                                          : (n - 1u) / 2u;
+            const size_t p = (n - t) / 2u;
+            const size_t q = p + t;
+            const size_t m = ((s + 1u) > n) ? (s + 1u) : n; //  max(s + 1, n)
+
+            for (size_t k = 0u; k < m; ++k)
             {
-                const size_t km  = k % m;
-                const size_t km1 = (k + m - 1u) % m;
-                const T r1 = T(1664525u) * (first[km] + first[(k + p) % m] + first[km1]);
-                //  v_ index for this iteration is k-m-1; valid when k <= s+m.
-                const T r2 = (k <= s + m) ? r1 - v_[k - m - 1u] - T(km)
-                                           : r1 - T(km);
-                first[(k + p) % m] ^= r1;
-                first[(k + q) % m] ^= r2;
-                first[km] = r2;
+                const size_t kn = k % n;
+                const size_t kpn = (k + p) % n;
+                const size_t kqn = (k + q) % n;
+                const size_t km1n = (k + n - 1u) % n;
+
+                const T r1 = T(1664525u) * mix(at(kn) ^ at(kpn) ^ at(km1n));
+                const T r2 = (k == 0u)  ? T(r1 + T(s))
+                             : (k <= s) ? T(r1 + T(kn) + T(v_[k - 1u]))
+                                        : T(r1 + T(kn));
+
+                first[kpn] = T(at(kpn) + r1);
+                first[kqn] = T(at(kqn) + r2);
+                first[kn] = r2;
+            }
+
+            for (size_t k = m; k < m + n; ++k)
+            {
+                const size_t kn = k % n;
+                const size_t kpn = (k + p) % n;
+                const size_t kqn = (k + q) % n;
+                const size_t km1n = (k + n - 1u) % n;
+
+                const T r3 = T(1566083941u) * mix(T(at(kn) + at(kpn) + at(km1n)));
+                const T r4 = T(r3 - T(kn));
+
+                first[kpn] = T(at(kpn) ^ r3);
+                first[kqn] = T(at(kqn) ^ r4);
+                first[kn] = r4;
             }
         }
 

@@ -127,36 +127,71 @@ namespace MINIMAL_STD_NAMESPACE
                 return p.a();
             }
 
-            //  Rejection sampling: compute the threshold below which raw engine
-            //  outputs are rejected to ensure a uniform distribution.
-            //  threshold = engine_range % (range + 1), where engine_range is the
-            //  number of distinct values the engine produces (max - min + 1).
+            //  Add in the unsigned type: a signed add overflows when the interval is wider than result_type's max.
+            return static_cast<result_type>(static_cast<unsigned_result_type>(draw(g, static_cast<engine_result_type>(range))) + a);
+        }
 
-            const engine_result_type engine_range =
+        //  A uniform value in [0, range].
+        //
+        //  An engine at least as wide as the range: rejection sampling on one output.  Raw values below
+        //      threshold = (engine values) mod (range + 1) are rejected, leaving a whole number of copies of each
+        //      result.
+        //
+        //  An engine narrower than the range (e.g. a 32-bit engine and a 64-bit range): combine outputs.  A uniform
+        //      high part in [0, range / engine values], scaled by the number of engine values, plus one engine
+        //      output is uniform over a superset of [0, range]; reject results above range or that wrapped.  This
+        //      is the method libstdc++ uses.
+        template <typename URBG>
+        static engine_result_type draw(URBG &g, engine_result_type range)
+        {
+            constexpr engine_result_type engine_range =
                 static_cast<engine_result_type>(URBG::max()) -
                 static_cast<engine_result_type>(URBG::min());
 
-            const engine_result_type range_plus_one = static_cast<engine_result_type>(range) + 1;
-
-            if (range_plus_one == 0)
+            auto raw = [&g]() -> engine_result_type
             {
-                //  The interval covers all 2^64 values: every engine output is valid (and range + 1 is not a divisor).
-                const engine_result_type raw = static_cast<engine_result_type>(g()) - static_cast<engine_result_type>(URBG::min());
+                return static_cast<engine_result_type>(g()) - static_cast<engine_result_type>(URBG::min());
+            };
 
-                return static_cast<result_type>(static_cast<unsigned_result_type>(raw));
+            if (range == engine_range)
+            {
+                return raw();
             }
 
-            const engine_result_type threshold = (engine_range - range) % range_plus_one;
-
-            engine_result_type raw;
-            do
+            if (range < engine_range)
             {
-                raw = static_cast<engine_result_type>(g()) -
-                      static_cast<engine_result_type>(URBG::min());
-            } while (raw < threshold);
+                const engine_result_type range_plus_one = range + 1;
+                const engine_result_type threshold = (engine_range - range) % range_plus_one;
 
-            //  Add in the unsigned type: a signed add overflows when the interval is wider than result_type's max.
-            return static_cast<result_type>(static_cast<unsigned_result_type>(raw % range_plus_one) + a);
+                engine_result_type value;
+                do
+                {
+                    value = raw();
+                } while (value < threshold);
+
+                return value % range_plus_one;
+            }
+
+            //  Only an engine narrower than engine_result_type gets here: a full-width one has range <= engine_range,
+            //      handled above (and engine_values would be 0).
+            if constexpr (engine_range == static_cast<engine_result_type>(~engine_result_type{0}))
+            {
+                return raw();
+            }
+            else
+            {
+                constexpr engine_result_type engine_values = engine_range + 1;
+
+                engine_result_type high;
+                engine_result_type value;
+                do
+                {
+                    high = engine_values * draw(g, range / engine_values);
+                    value = high + raw();
+                } while ((value > range) || (value < high));
+
+                return value;
+            }
         }
     };
 

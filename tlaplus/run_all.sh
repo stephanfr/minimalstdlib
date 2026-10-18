@@ -6,8 +6,10 @@
 #    ./run_all.sh skiplist        only configurations whose path contains "skiplist"
 #
 #  Environment: TLC_WORKERS (default 2), TLC_TIMEOUT seconds per configuration (default 3600), TLA_JAR (default
-#  tlaplus/tla2tools.jar, downloaded if missing).  Compare each line with the expected result in the model's README:
-#  the *bug*, *current*, *_genwrap, steal_resets_tag and tag_wraps configurations are expected to fail.
+#  tlaplus/tla2tools.jar, downloaded if missing).  Each line is checked against the expected result: *bug*
+#  configurations are expected to fail (one is kept as an example of a failing model,
+#  lockfree_tagged_stack/bug_tag_wraps.cfg); every other configuration is expected to pass.  A line that differs (or times
+#  out) is marked UNEXPECTED and the script exits 1.
 #
 #  A spec is chosen per configuration: the only .tla file in its directory, or else the .tla whose name is the
 #  longest prefix of the configuration's name.  The committed .tla files carry their PlusCal translation.
@@ -15,11 +17,20 @@
 TLA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TLA_JAR="${TLA_JAR:-$TLA_DIR/tla2tools.jar}"
 FILTER="${1:-}"
-SLOW="fixed_irq2.cfg fixed_irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeBitset_stress.cfg"
+SLOW="irq2.cfg irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeSkiplist_safety_2t.cfg"
 
 if [ ! -f "$TLA_JAR" ]; then
     wget -q "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar" -O "$TLA_JAR" || exit 1
 fi
+
+expected_to_fail() {
+    case "$1" in
+        *bug*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+status=0
 
 for cfg in $(cd "$TLA_DIR" && find . -name '*.cfg' | sort); do
     name="$(basename "$cfg" .cfg)"
@@ -45,7 +56,21 @@ for cfg in $(cd "$TLA_DIR" && find . -name '*.cfg' | sort); do
     verdict=$(grep -m1 -E "Model checking completed. No error|is violated|Temporal properties were violated|Deadlock reached|evaluated to FALSE|Error:" "$log")
     [ $rc -eq 124 ] && verdict="TIMEOUT"
     states=$(grep "distinct states found" "$log" | tail -1 | sed 's/.*generated, //')
-    printf '%-60s %5ss  %s | %s\n' "${cfg#./}" "$(( $(date +%s) - start ))" "$verdict" "$states"
+    outcome="ok"
+    if [ "$verdict" = "TIMEOUT" ]; then
+        outcome="UNEXPECTED"
+    elif expected_to_fail "$name"; then
+        #  Only a real counterexample counts: a parse error, a missing module or no spec at all is not the
+        #  expected failure
+        [[ "$verdict" =~ is\ violated|Temporal\ properties\ were\ violated|Deadlock\ reached|evaluated\ to\ FALSE ]] || outcome="UNEXPECTED"
+    else
+        [[ "$verdict" == *"No error"* ]] || outcome="UNEXPECTED"
+    fi
+    [ "$outcome" = "UNEXPECTED" ] && status=1
+
+    printf '%-10s %-60s %5ss  %s | %s\n' "$outcome" "${cfg#./}" "$(( $(date +%s) - start ))" "$verdict" "$states"
     rm -rf "$meta" "$log"
     find "$dir" -name '*_TTrace_*' -delete
 done
+
+exit $status

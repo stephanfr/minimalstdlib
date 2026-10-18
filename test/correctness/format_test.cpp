@@ -9,6 +9,11 @@
 #include <format_formatters>
 
 #include <ctype.h>
+#include <stdio.h>
+
+#include <random>
+
+#include "../shared/process_isolation.h"
 
 static unsigned __seven_bit_ascii_ctype_table[] = {
     _C, _C, _C, _C, _C, _C, _C, _C,
@@ -275,7 +280,9 @@ namespace
 
         STRCMP_EQUAL("This is a test: {Invalid format string: ':**<6'} bad alignment \n", minstd::format(formatted_string, "This is a test: {:**<6} {:14}\n", "of", "bad alignment").c_str());
         STRCMP_EQUAL("This is a test: {Invalid format string: ':{<6'} bad alignment \n", minstd::format(formatted_string, "This is a test: {:{<6} {:14}\n", "of", "bad alignment").c_str());
-        STRCMP_EQUAL("This is a test: {Invalid format string: ':}<'}6} of            \n", minstd::format(formatted_string, "This is a test: {:}<6} {:14}\n", "of", "bad alignment").c_str());
+        //  '}' cannot be a fill character: "{:}" is an empty spec, and "<6}" that follows is literal text
+
+        STRCMP_EQUAL("This is a test: of<6} bad alignment \n", minstd::format(formatted_string, "This is a test: {:}<6} {:14}\n", "of", "bad alignment").c_str());
     }
 
     TEST(FormatTests, MostNegativeIntegers)
@@ -297,8 +304,9 @@ namespace
         STRCMP_EQUAL("x=1>0", minstd::format(formatted_string, "x={}>0", (int32_t)1).c_str());
         STRCMP_EQUAL("[  7]^", minstd::format(formatted_string, "[{:>3}]^", (int32_t)7).c_str());
 
-        //  A '}' in the fill position is still rejected (an invalid placeholder consumes no argument)
-        STRCMP_EQUAL("{Invalid format string: ':}<'}6} a", minstd::format(formatted_string, "{:}<6} {}", "a", "x").c_str());
+        //  "{:}" is an empty spec, so a following '<' is literal text, as in std::format
+        STRCMP_EQUAL("a<6} x", minstd::format(formatted_string, "{:}<6} {}", "a", "x").c_str());
+        STRCMP_EQUAL("x<br>", minstd::format(formatted_string, "{:}<br>", "x").c_str()); //  before: rejected
     }
 
     TEST(FormatTests, SignedLeftAndCenterAlignmentHonourWidth)
@@ -334,5 +342,90 @@ namespace
         STRCMP_EQUAL("{7}", minstd::format(buffer, "{{{}}}", (int32_t)7).c_str());
         STRCMP_EQUAL("a{b}c 1 }", minstd::format(buffer, "a{{b}}c {} }}", (int32_t)1).c_str());
         STRCMP_EQUAL("end{", minstd::format(buffer, "end{{").c_str());
+    }
+
+    TEST(FormatTests, FloatsOutsideTheIntegerRange)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("inf -inf", minstd::format(buffer, "{} {}", __builtin_inf(), -__builtin_inf()).c_str());
+        STRCMP_EQUAL("nan", minstd::format(buffer, "{}", __builtin_nan("")).c_str());
+        STRCMP_EQUAL("  inf", minstd::format(buffer, "{:5}", __builtin_inff()).c_str());
+        STRCMP_EQUAL("2000000000000000.0000", minstd::format(buffer, "{}", 2e15).c_str());
+        STRCMP_EQUAL("100000000000000000000.00", minstd::format(buffer, "{:.2}", 1e20).c_str());
+        STRCMP_EQUAL("-30000000000000000000000000000000.0", minstd::format(buffer, "{:.1}", -3e31).c_str());
+    }
+
+    TEST(FormatTests, FullBufferKeepsTheSignAndLeadingDigits)
+    {
+        minstd::fixed_string<8> buffer;
+
+        //  Before the fix the digits were written least significant first, so a full buffer kept "87654321"
+
+        STRCMP_EQUAL("-1234567", minstd::format(buffer, "{}", (int32_t)-12345678).c_str());
+        STRCMP_EQUAL("0xabcdef", minstd::format(buffer, "{:#x}", (uint64_t)0xabcdef0123ULL).c_str());
+    }
+
+    TEST(FormatTests, FillThatIsAnAlignmentCharacter)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("ab<<<", minstd::format(buffer, "{:<<5}", "ab").c_str());
+        STRCMP_EQUAL(">>>ab", minstd::format(buffer, "{:>>5}", "ab").c_str());
+        STRCMP_EQUAL("^^7^^", minstd::format(buffer, "{:^^5}", (int32_t)7).c_str());
+    }
+
+    TEST(FormatTests, StringPrecisionTruncates)
+    {
+        minstd::fixed_string<128> buffer;
+        minstd::fixed_string<16> hello("hello");
+
+        STRCMP_EQUAL("he", minstd::format(buffer, "{:.2}", "hello").c_str());              //  before: "hello"
+        STRCMP_EQUAL("hel  |", minstd::format(buffer, "{:5.3}|", hello).c_str());
+        STRCMP_EQUAL("hello", minstd::format(buffer, "{:.9}", "hello").c_str());
+    }
+
+    TEST(FormatTests, OversizedIdsAndWidthsAreInvalid)
+    {
+        minstd::fixed_string<128> buffer;
+
+        //  4294967296 wrapped to argument 0 before the fix
+
+        STRCMP_EQUAL("{Invalid format string: '4294967296'}", minstd::format(buffer, "{4294967296}", (int32_t)1).c_str());
+        STRCMP_EQUAL("{Invalid format string: ':4294967297'}", minstd::format(buffer, "{:4294967297}", (int32_t)1).c_str());
+        STRCMP_EQUAL("{Invalid format string: ':.99999999999'}", minstd::format(buffer, "{:.99999999999}", 1.0).c_str());
+    }
+
+    TEST(FormatTests, HugeWidthsAndPrecisionsStopAtTheBuffer)
+    {
+        //  Fill loops ran once per character even on a full buffer: about 4e9 iterations for these.  An optimised
+        //      host build can drop the no-op loop, so this guards the behaviour rather than reproducing the stall.
+        minstd::fixed_string<16> buffer;
+
+        CHECK_TRUE(minstd::pmr::test::runs_to_completion([]
+                                                         {
+                                                             minstd::fixed_string<16> b;
+                                                             minstd::format(b, "{:4000000000}", (int32_t)1);
+                                                             minstd::format(b, "{:.4000000000}", 1.0);
+                                                             minstd::format(b, "{:>4000000000}", "x");
+                                                             if (b.size() != 16) _exit(1); },
+                                                         2));
+
+        //  The buffer fills with padding and the rest is truncated, as for any output too long for the buffer
+
+        STRCMP_EQUAL("                ", minstd::format(buffer, "{:4000000000}", (int32_t)1).c_str());
+        STRCMP_EQUAL("1.00000000000000", minstd::format(buffer, "{:.4000000000}", 1.0).c_str());
+    }
+
+    TEST(FormatTests, PointerHonoursAnExplicitAlignment)
+    {
+        //  The pointer default (zero fill, width 18) was merged into a spec with an alignment, so the zero fill won
+
+        minstd::fixed_string<64> buffer;
+        void *pointer = (void *)0xa3348;
+
+        STRCMP_EQUAL("0X00000000000A3348", minstd::format(buffer, "{}", pointer).c_str()); //  the default is unchanged
+        STRCMP_EQUAL("             0XA3348", minstd::format(buffer, "{:>20}", pointer).c_str());
+        STRCMP_EQUAL("******0XA3348*******", minstd::format(buffer, "{:*^20}", pointer).c_str());
     }
 }

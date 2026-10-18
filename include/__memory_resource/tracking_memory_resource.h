@@ -69,6 +69,11 @@ namespace MINIMAL_STD_NAMESPACE
 
             void do_deallocate(void *p, size_t bytes, size_t alignment) override
             {
+                if (p == nullptr)
+                {
+                    return; //  nothing was allocated, so there is nothing to account for
+                }
+
                 upstream_->deallocate(p, bytes, alignment);
                 bytes_in_use_.fetch_sub(bytes, memory_order_relaxed);
                 deallocation_count_.fetch_add(1, memory_order_relaxed);

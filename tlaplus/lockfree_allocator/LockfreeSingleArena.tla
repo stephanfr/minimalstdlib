@@ -32,24 +32,18 @@
 (*     deallocate whenever its CPU is outside an interrupt_guard, while    *)
 (*     the interrupted code on that CPU makes no progress.                 *)
 (*                                                                         *)
-(* Fix switches (see the remediation plan)                                 *)
-(*   FrontierMode      "pre_cas_backlink"  previous_block_ of next written  *)
-(*                                         BEFORE the frontier CAS         *)
-(*                                         (origin/More-fixes)             *)
-(*                     "post_cas_hint"     written after the CAS, reclaimer *)
-(*                                         validates the hint (N3)         *)
-(*                     "packed"            predecessor packed into the     *)
-(*                                         frontier word, each block keeps *)
-(*                                         its own back-link (N4)          *)
-(*   SerializeReclaim  TRUE: frontier_reclaim_in_progress_ try-flag (N4)    *)
-(*   PendingCountFirst TRUE: count_ incremented before the push (N5)       *)
-(*   GuardTrim         TRUE: trim_metadata_records holds an interrupt_guard *)
-(*                     while a manager is TRIMMING (N6)                    *)
-(*   FixedBoundary     TRUE: after its CAS, each side re-checks the other   *)
-(*                     (behind a seq_cst fence in C++; TLA+ is SC) and,    *)
-(*                     on overlap, undoes its claim once it is on top of   *)
-(*                     its own stack, or keeps it if the overlap has gone  *)
-(*                     (grow_metadata_region, get_next_empty_memory_block) *)
+(* Protocol points the invariants depend on                               *)
+(*   - The frontier word packs the block pointer and its predecessor; each *)
+(*     block keeps its own back-link, written after the frontier CAS.      *)
+(*   - frontier_reclaim_in_progress_: one thread rolls the frontier back.  *)
+(*   - A free increments the pending count before it pushes the block.     *)
+(*   - trim_metadata_records holds an interrupt_guard while a manager is   *)
+(*     TRIMMING (a same-CPU handler that needs that manager would spin).   *)
+(*   - Frontier/metadata boundary: after its CAS each side re-checks the   *)
+(*     other (behind a seq_cst fence in C++; TLA+ is SC) and, on overlap,  *)
+(*     undoes its claim once it is on top of its own stack, or keeps it if *)
+(*     the overlap has gone (grow_metadata_region,                         *)
+(*     get_next_empty_memory_block).                                       *)
 (*                                                                         *)
 (* Abstractions (each documented in README.md)                             *)
 (*   - Arena memory is counted in 64-byte units; a block is [start,start+n).*)
@@ -76,16 +70,9 @@ CONSTANTS
     Threshold,          \* MAINTENANCE_WINDOW_THRESHOLD
     OpsPerThread,       \* allocate/deallocate calls per thread, e.g. <<2, 2>>
     MaxIrqOps,          \* allocate/deallocate calls per interrupt handler
-    FrontierMode,       \* "pre_cas_backlink" | "post_cas_hint" | "packed"
-    SerializeReclaim,   \* N4 reclaim flag
-    PendingCountFirst,  \* N5 count-before-push
-    GuardTrim,          \* N6 interrupt_guard around trim's TRIMMING section
-    FixedBoundary,      \* frontier/metadata boundary: re-check after each CAS, undo from the top (item 1)
     InitialBacklinks    \* initial previous_block_ contents: the arena buffer is not zeroed
 
-ASSUME FrontierMode \in {"pre_cas_backlink", "post_cas_hint", "packed"}
-ASSUME SerializeReclaim \in BOOLEAN /\ PendingCountFirst \in BOOLEAN /\ UseInterrupts \in BOOLEAN /\ GuardTrim \in BOOLEAN
-ASSUME FixedBoundary \in BOOLEAN
+ASSUME UseInterrupts \in BOOLEAN
 
 NULL == -1
 CPUs == 1..NumCPUs
@@ -120,8 +107,8 @@ StaleBacklinkAt5 == [u \in Units |-> IF u = 5 THEN 2 ELSE NULL]
 
 (* --algorithm LockfreeSingleArena {
 variables
-    \* next_empty_memory_block_: tag modes use (ptr, counter); "packed" uses (ptr, predecessor)
-    fwPtr = 0, fwCtr = 0, fwPred = NULL,
+    \* next_empty_memory_block_: the block pointer and its predecessor, packed in one word
+    fwPtr = 0, fwPred = NULL,
 
     \* block_header fields at every unit (only meaningful at a block start)
     hdrMeta = [u \in Units |-> NULL],
@@ -144,7 +131,7 @@ variables
     pending = [c \in CPUs |-> <<>>],                  \* pending_shards_[c].head_ (LIFO: head first)
     pendingCount = [c \in CPUs |-> 0],                \* pending_shards_[c].count_
     windowOpen = [c \in CPUs |-> FALSE],              \* maintenance_window_open_
-    reclaimBusy = FALSE,                              \* frontier_reclaim_in_progress_ (N4)
+    reclaimBusy = FALSE,                              \* frontier_reclaim_in_progress_
 
     guardDepth = [c \in CPUs |-> 0],                  \* interrupt_guard nesting per CPU
     irqActive = [c \in CPUs |-> FALSE],
@@ -187,24 +174,14 @@ procedure RecycleMetadata(rm)
 
 \* ------------------------------------------------------------------ try_reclaim_frontier_blocks
 procedure TryReclaim()
-variables tPtr = 0, tCtr = 0, tPred = NULL, tPrev = NULL, tMi = NULL, tPP = NULL;
+variables tPtr = 0, tPred = NULL, tPrev = NULL, tMi = NULL, tPP = NULL;
 {
  TR_flag:
-    if (SerializeReclaim) {                                     \* N4: only one thread rolls the frontier back
-        if (reclaimBusy) { return; } else { reclaimBusy := TRUE; };
-    };
+    if (reclaimBusy) { return; } else { reclaimBusy := TRUE; }; \* only one thread rolls the frontier back
  TR_load:
-    tPtr := fwPtr; tCtr := fwCtr; tPred := fwPred;              \* next_empty_memory_block_.load
-    if (FrontierMode = "packed") {
-        tPrev := fwPred;                                        \* predecessor comes from the same word
-        if (fwPred = NULL) { goto TR_done; } else { goto TR_meta; };
-    };
- TR_hint:
-    assert ~InUserRegion(tPtr);
-    tPrev := hdrPrev[tPtr];                                     \* frontier_ptr->previous_block_
-    if (hdrPrev[tPtr] = NULL \/ (FrontierMode = "post_cas_hint" /\ ~(hdrPrev[tPtr] < tPtr))) {
-        goto TR_done;                                           \* sentinel, or N3 range check failed
-    };
+    tPtr := fwPtr; tPred := fwPred;                             \* next_empty_memory_block_.load
+    tPrev := fwPred;                                            \* predecessor comes from the same word
+    if (fwPred = NULL) { goto TR_done; };
  TR_meta:
     assert ~InUserRegion(tPrev);                                \* reclaimer must not read user data
     tMi := hdrMeta[tPrev];                                      \* prev->metadata_index_
@@ -212,22 +189,16 @@ variables tPtr = 0, tCtr = 0, tPred = NULL, tPrev = NULL, tMi = NULL, tPP = NULL
     if (tMi = NULL \/ tMi >= metaCount) { goto TR_done; };
  TR_state:
     if (mPtr[tMi] # tPrev \/ mState[tMi] # "AVAILABLE") { goto TR_done; };   \* meta->block_state_.load
- TR_adj:
-    if (FrontierMode = "post_cas_hint") {                       \* N3 adjacency check (absent with the packed frontier)
-        assert ~InUserRegion(tPrev);
-        if (tPrev + hdrSize[tPrev] # tPtr) { goto TR_done; };
-    };
  TR_claim:
     if (mState[tMi] = "AVAILABLE" /\ mPtr[tMi] = tPrev) {     \* CAS AVAILABLE -> FRONTIER_RECLAIM_IN_PROGRESS
         mState[tMi] := "FRONTIER_RECLAIM_IN_PROGRESS";
     } else { goto TR_done; };
  TR_pp:
-    if (FrontierMode = "packed") { tPP := hdrPrev[tPrev]; };    \* N4: prev's own back-link, final once claimed
+    tPP := hdrPrev[tPrev];                                      \* prev's own back-link, final once claimed
  TR_cas:
-    if (fwPtr = tPtr /\ fwCtr = tCtr /\ fwPred = tPred) {      \* frontier CAS
+    if (fwPtr = tPtr /\ fwPred = tPred) {                      \* frontier CAS
         fwPtr := tPrev;
-        fwCtr := IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1;
-        fwPred := IF FrontierMode = "packed" THEN tPP ELSE NULL;
+        fwPred := tPP;
     } else { goto TR_restore; };
  TR_reclaimed:
     assert mState[tMi] = "FRONTIER_RECLAIM_IN_PROGRESS";
@@ -236,7 +207,7 @@ variables tPtr = 0, tCtr = 0, tPred = NULL, tPrev = NULL, tMi = NULL, tPP = NULL
  TR_restore:
     if (mState[tMi] = "FRONTIER_RECLAIM_IN_PROGRESS") { mState[tMi] := "AVAILABLE"; };
  TR_done:
-    if (SerializeReclaim) { reclaimBusy := FALSE; };
+    reclaimBusy := FALSE;
     return;
 }
 
@@ -250,7 +221,7 @@ variables xc = 0, xk = 0, xshrunk = FALSE;
  TM_claim:
     if (mgrActive[xk] = 0 /\ ~mgrTrimming[xk]) {
         mgrTrimming[xk] := TRUE;
-        if (GuardTrim) { guard_enter(); };                      \* N6: no same-CPU interrupt while TRIMMING
+        guard_enter();                                          \* no same-CPU interrupt while TRIMMING
     } else { return; };
  TM_recheck:
     if (metaCount # xc) { goto TM_release; };
@@ -260,13 +231,13 @@ variables xc = 0, xk = 0, xshrunk = FALSE;
     if (xshrunk) { mgrFree[xk] := {}; };
  TM_release:
     mgrTrimming[xk] := FALSE;
-    if (GuardTrim) { guard_exit(); };
+    guard_exit();
     goto TM_load;
 }
 
 \* ------------------------------------------------------------------ run_maintenance_window
 procedure RunWindow(rs)
-variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsCtr = 0, bsPred = NULL, bpp = NULL, pm = NULL;
+variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsPred = NULL, bpp = NULL, pm = NULL;
 {
  RW_steal:
     stolen := pending[rs];                                      \* steal_pending_deallocation_list (guarded exchange)
@@ -282,11 +253,9 @@ variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsCtr 
         stolen := SubSeq(stolen, (IF Len(stolen) < Threshold THEN Len(stolen) ELSE Threshold) + 1, Len(stolen));
  \* ---- reclaim_pending_frontier_batch
  RW_bflag:
-        if (SerializeReclaim) {
-            if (reclaimBusy) { goto RW_publish; } else { reclaimBusy := TRUE; };
-        };
+        if (reclaimBusy) { goto RW_publish; } else { reclaimBusy := TRUE; };
  RW_bload:
-        bsPtr := fwPtr; bsCtr := fwCtr; bsPred := fwPred;
+        bsPtr := fwPtr; bsPred := fwPred;
  RW_bfind:
         with (C = {m \in batch : mState[m] = "DEALLOCATED_PENDING" /\ mPtr[m] + mSize[m] = bsPtr}) {
             if (C = {}) { goto RW_bdone; } else { cand := Min(C); };
@@ -295,12 +264,11 @@ variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsCtr 
         if (mState[cand] = "DEALLOCATED_PENDING") { mState[cand] := "FRONTIER_RECLAIM_IN_PROGRESS"; }
         else { goto RW_bload; };
  RW_bpp:
-        if (FrontierMode = "packed") { bpp := hdrPrev[mPtr[cand]]; };
+        bpp := hdrPrev[mPtr[cand]];
  RW_bcas:
-        if (fwPtr = bsPtr /\ fwCtr = bsCtr /\ fwPred = bsPred) {
+        if (fwPtr = bsPtr /\ fwPred = bsPred) {
             fwPtr := mPtr[cand];
-            fwCtr := IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1;
-            fwPred := IF FrontierMode = "packed" THEN bpp ELSE NULL;
+            fwPred := bpp;
         } else { goto RW_brestore; };
  RW_brecycle:
         batch := batch \ {cand};
@@ -310,7 +278,7 @@ variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsCtr 
         if (mState[cand] = "FRONTIER_RECLAIM_IN_PROGRESS") { mState[cand] := "DEALLOCATED_PENDING"; };
         goto RW_bload;
  RW_bdone:
-        if (SerializeReclaim) { reclaimBusy := FALSE; };
+        reclaimBusy := FALSE;
  \* ---- process_pending_batch: publish the rest of this batch to the free bins
  RW_publish:
         while (batch # {}) {
@@ -324,7 +292,7 @@ variables stolen = <<>>, batch = {}, nstolen = 0, cand = NULL, bsPtr = 0, bsCtr 
         };
     };
  RW_reduce:                                                     \* reduce_pending_deallocation_count
-    assert PendingCountFirst => pendingCount[rs] >= nstolen;    \* N5's MINIMAL_STD_ASSERT
+    assert pendingCount[rs] >= nstolen;                         \* the MINIMAL_STD_ASSERT in the C++
     pendingCount[rs] := IF pendingCount[rs] > nstolen THEN pendingCount[rs] - nstolen ELSE 0;
     stolenOutstanding[rs] := stolenOutstanding[rs] - nstolen;
     goto RW_steal;
@@ -432,7 +400,6 @@ variables gc = 0, gk = 0, gtail = 0;
  GM_bcas:
     if (metaCount = gc) {
         metaCount := gc + 1;
-        if (~FixedBoundary) { rvIdx[self] := gc; return; };
     } else { gc := metaCount; goto GM_brelease; };
  GM_brecheck:                                                   \* grow_metadata_region: fence, then re-check the frontier
     if (MS - (gc + 1) > fwPtr) { rvIdx[self] := gc; return; };  \* GROWN
@@ -450,37 +417,29 @@ variables gc = 0, gk = 0, gtail = 0;
 
 \* ------------------------------------------------------------------ get_next_empty_memory_block
 procedure GetEmptyBlock(gsz)
-variables sPtr = 0, sCtr = 0, sPred = NULL, nxt = 0;
+variables sPtr = 0, sPred = NULL, nxt = 0;
 {
  FB_load:
     guard_enter();
-    sPtr := fwPtr; sCtr := fwCtr; sPred := fwPred;
+    sPtr := fwPtr; sPred := fwPred;
  FB_check:
     if (sPtr + gsz >= MS - (metaCount + 1)) {                   \* would intrude into metadata
         guard_exit();
         rvBlk[self] := NULL;
         return;
     } else { nxt := sPtr + gsz; };
- FB_pre:
-    if (FrontierMode = "pre_cas_backlink") {                    \* next->previous_block_ = current BEFORE the CAS
-        assert ~InUserRegion(nxt);
-        hdrPrev[nxt] := sPtr;
-    };
  FB_cas:
-    if (fwPtr = sPtr /\ fwCtr = sCtr /\ fwPred = sPred) {
+    if (fwPtr = sPtr /\ fwPred = sPred) {
         fwPtr := nxt;
-        fwCtr := IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1;
-        fwPred := IF FrontierMode = "packed" THEN sPtr ELSE NULL;
-        if (FrontierMode = "pre_cas_backlink") { guard_exit(); };   \* original: size written after the guard
-        if (~FixedBoundary) { goto FB_size; };
+        fwPred := sPtr;
     } else {
-        sPtr := fwPtr; sCtr := fwCtr; sPred := fwPred;           \* CAS failure returns the current value
+        sPtr := fwPtr; sPred := fwPred;                         \* CAS failure returns the current value
         goto FB_check;
     };
  FB_recheck:                                                    \* fence, then re-check the metadata count
     if (nxt < MS - (metaCount + 1)) { goto FB_size; };
  FB_undo:                                                       \* overlap: roll the frontier back while our block is on top
-    if (fwPtr = nxt /\ fwPred = sPtr /\ fwCtr = sCtr) {
+    if (fwPtr = nxt /\ fwPred = sPtr) {
         fwPtr := sPtr; fwPred := sPred;
         guard_exit();
         rvBlk[self] := NULL;
@@ -491,13 +450,8 @@ variables sPtr = 0, sCtr = 0, sPred = NULL, nxt = 0;
     assert ~InUserRegion(sPtr);
     hdrSize[sPtr] := gsz;                                       \* current->size_including_header_
  FB_link:
-    if (FrontierMode = "post_cas_hint") {                       \* N3: next->previous_block_ after the CAS
-        assert ~InUserRegion(nxt);
-        hdrPrev[nxt] := sPtr;
-    } else if (FrontierMode = "packed") {                       \* N4: current->previous_block_ = predecessor
-        hdrPrev[sPtr] := sPred;
-    };
-    if (FrontierMode # "pre_cas_backlink") { guard_exit(); };
+    hdrPrev[sPtr] := sPred;                                     \* current->previous_block_ = predecessor
+    guard_exit();
     rvBlk[self] := sPtr;
     return;
 }
@@ -567,17 +521,10 @@ variables dmi = NULL, dtarget = 1;
  DA_pending:
     mState[dmi] := "DEALLOCATED_PENDING";
     dtarget := mShard[dmi];
-    if (PendingCountFirst) { goto DA_count1; };
- DA_push0:                                                      \* original: push, then count
-    assert ~InAnyList(dmi);
-    pending[dtarget] := <<dmi>> \o pending[dtarget];
- DA_count0:
-    pendingCount[dtarget] := pendingCount[dtarget] + 1;
-    goto DA_window;
- DA_count1:                                                     \* N5: count, then push (one guard)
+ DA_count:                                                      \* count, then push (one guard)
     guard_enter();
     pendingCount[dtarget] := pendingCount[dtarget] + 1;
- DA_push1:
+ DA_push:
     assert ~InAnyList(dmi);
     pending[dtarget] := <<dmi>> \o pending[dtarget];
     guard_exit();
@@ -629,11 +576,10 @@ variables iops = 0, iasel = 0, idsel = NoBlock;
 
 \* BEGIN TRANSLATION
 CONSTANT defaultInitValue
-VARIABLES pc, fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, hdrPrev, mState, mPtr, 
-          mSize, mShard, metaCount, mgrActive, mgrTrimming, mgrFree, bins, 
-          pending, pendingCount, windowOpen, reclaimBusy, guardDepth, 
-          irqActive, rvMeta, rvIdx, rvBlk, live, held, stolenOutstanding, 
-          stack
+VARIABLES pc, fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, mState, mPtr, mSize, 
+          mShard, metaCount, mgrActive, mgrTrimming, mgrFree, bins, pending, 
+          pendingCount, windowOpen, reclaimBusy, guardDepth, irqActive, 
+          rvMeta, rvIdx, rvBlk, live, held, stolenOutstanding, stack
 
 (* define statement *)
 InUserRegion(u) == \E a \in live : a.start < u /\ u < a.start + a.size
@@ -643,27 +589,26 @@ InPending(m) == \E c \in CPUs : m \in PendSet(c)
 InMgrFree(m) == \E k \in Managers : m \in mgrFree[k]
 InAnyList(m) == InBins(m) \/ InPending(m) \/ InMgrFree(m)
 
-VARIABLES rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
-          batch, nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-          qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
-          sCtr, sPred, nxt, asz, ameta, ablk, areserved, da, dmi, dtarget, 
-          ops, asel, dsel, iops, iasel, idsel
+VARIABLES rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+          batch, nstolen, cand, bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+          qshard, qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+          nxt, asz, ameta, ablk, areserved, da, dmi, dtarget, ops, asel, dsel, 
+          iops, iasel, idsel
 
-vars == << pc, fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, hdrPrev, mState, mPtr, 
-           mSize, mShard, metaCount, mgrActive, mgrTrimming, mgrFree, bins, 
-           pending, pendingCount, windowOpen, reclaimBusy, guardDepth, 
-           irqActive, rvMeta, rvIdx, rvBlk, live, held, stolenOutstanding, 
-           stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-           stolen, batch, nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-           wforce, wa, qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, gtail, 
-           gsz, sPtr, sCtr, sPred, nxt, asz, ameta, ablk, areserved, da, dmi, 
-           dtarget, ops, asel, dsel, iops, iasel, idsel >>
+vars == << pc, fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, mState, mPtr, mSize, 
+           mShard, metaCount, mgrActive, mgrTrimming, mgrFree, bins, pending, 
+           pendingCount, windowOpen, reclaimBusy, guardDepth, irqActive, 
+           rvMeta, rvIdx, rvBlk, live, held, stolenOutstanding, stack, rm, 
+           tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, batch, 
+           nstolen, cand, bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+           qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+           asz, ameta, ablk, areserved, da, dmi, dtarget, ops, asel, dsel, 
+           iops, iasel, idsel >>
 
 ProcSet == (MainProcs) \cup (IrqProcs)
 
 Init == (* Global variables *)
         /\ fwPtr = 0
-        /\ fwCtr = 0
         /\ fwPred = NULL
         /\ hdrMeta = [u \in Units |-> NULL]
         /\ hdrSize = [u \in Units |-> 0]
@@ -693,7 +638,6 @@ Init == (* Global variables *)
         /\ rm = [ self \in ProcSet |-> defaultInitValue]
         (* Procedure TryReclaim *)
         /\ tPtr = [ self \in ProcSet |-> 0]
-        /\ tCtr = [ self \in ProcSet |-> 0]
         /\ tPred = [ self \in ProcSet |-> NULL]
         /\ tPrev = [ self \in ProcSet |-> NULL]
         /\ tMi = [ self \in ProcSet |-> NULL]
@@ -709,7 +653,6 @@ Init == (* Global variables *)
         /\ nstolen = [ self \in ProcSet |-> 0]
         /\ cand = [ self \in ProcSet |-> NULL]
         /\ bsPtr = [ self \in ProcSet |-> 0]
-        /\ bsCtr = [ self \in ProcSet |-> 0]
         /\ bsPred = [ self \in ProcSet |-> NULL]
         /\ bpp = [ self \in ProcSet |-> NULL]
         /\ pm = [ self \in ProcSet |-> NULL]
@@ -732,7 +675,6 @@ Init == (* Global variables *)
         (* Procedure GetEmptyBlock *)
         /\ gsz = [ self \in ProcSet |-> defaultInitValue]
         /\ sPtr = [ self \in ProcSet |-> 0]
-        /\ sCtr = [ self \in ProcSet |-> 0]
         /\ sPred = [ self \in ProcSet |-> NULL]
         /\ nxt = [ self \in ProcSet |-> 0]
         (* Procedure Allocate *)
@@ -760,220 +702,163 @@ RM_state(self) == /\ pc[self] = "RM_state"
                   /\ mState' = [mState EXCEPT ![rm[self]] = "METADATA_AVAILABLE"]
                   /\ mPtr' = [mPtr EXCEPT ![rm[self]] = NULL]
                   /\ pc' = [pc EXCEPT ![self] = "RM_push"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mSize, mShard, metaCount, mgrActive, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mSize, mShard, metaCount, mgrActive, 
                                   mgrTrimming, mgrFree, bins, pending, 
                                   pendingCount, windowOpen, reclaimBusy, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                   live, held, stolenOutstanding, stack, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
-                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 RM_push(self) == /\ pc[self] = "RM_push"
                  /\ Assert(~InAnyList(rm[self]), 
-                           "Failure of assertion at line 181, column 5.")
+                           "Failure of assertion at line 168, column 5.")
                  /\ mgrFree' = [mgrFree EXCEPT ![ManagerOf(rm[self])] = mgrFree[ManagerOf(rm[self])] \cup {rm[self]}]
                  /\ pc' = [pc EXCEPT ![self] = "RM_release"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, bins, 
-                                 pending, pendingCount, windowOpen, 
-                                 reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                 rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                 idsel >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, bins, pending, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                 live, held, stolenOutstanding, stack, rm, 
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 RM_release(self) == /\ pc[self] = "RM_release"
                     /\ mgrActive' = [mgrActive EXCEPT ![ManagerOf(rm[self])] = mgrActive[ManagerOf(rm[self])] - 1]
                     /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                     /\ rm' = [rm EXCEPT ![self] = Head(stack[self]).rm]
                     /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrTrimming, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                    rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, tPtr, tCtr, tPred, 
-                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                    stolen, batch, nstolen, cand, bsPtr, bsCtr, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrTrimming, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    guardDepth, irqActive, rvMeta, rvIdx, 
+                                    rvBlk, live, held, stolenOutstanding, tPtr, 
+                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                    rs, stolen, batch, nstolen, cand, bsPtr, 
                                     bsPred, bpp, pm, ws, wforce, wa, qsz, 
                                     qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                    gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                    ameta, ablk, areserved, da, dmi, dtarget, 
-                                    ops, asel, dsel, iops, iasel, idsel >>
+                                    gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                    ablk, areserved, da, dmi, dtarget, ops, 
+                                    asel, dsel, iops, iasel, idsel >>
 
 RecycleMetadata(self) == RM_state(self) \/ RM_push(self)
                             \/ RM_release(self)
 
 TR_flag(self) == /\ pc[self] = "TR_flag"
-                 /\ IF SerializeReclaim
-                       THEN /\ IF reclaimBusy
-                                  THEN /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-                                       /\ tPtr' = [tPtr EXCEPT ![self] = Head(stack[self]).tPtr]
-                                       /\ tCtr' = [tCtr EXCEPT ![self] = Head(stack[self]).tCtr]
-                                       /\ tPred' = [tPred EXCEPT ![self] = Head(stack[self]).tPred]
-                                       /\ tPrev' = [tPrev EXCEPT ![self] = Head(stack[self]).tPrev]
-                                       /\ tMi' = [tMi EXCEPT ![self] = Head(stack[self]).tMi]
-                                       /\ tPP' = [tPP EXCEPT ![self] = Head(stack[self]).tPP]
-                                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                       /\ UNCHANGED reclaimBusy
-                                  ELSE /\ reclaimBusy' = TRUE
-                                       /\ pc' = [pc EXCEPT ![self] = "TR_load"]
-                                       /\ UNCHANGED << stack, tPtr, tCtr, 
-                                                       tPred, tPrev, tMi, tPP >>
-                       ELSE /\ pc' = [pc EXCEPT ![self] = "TR_load"]
-                            /\ UNCHANGED << reclaimBusy, stack, tPtr, tCtr, 
-                                            tPred, tPrev, tMi, tPP >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
-                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                 live, held, stolenOutstanding, rm, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                 /\ IF reclaimBusy
+                       THEN /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                            /\ tPtr' = [tPtr EXCEPT ![self] = Head(stack[self]).tPtr]
+                            /\ tPred' = [tPred EXCEPT ![self] = Head(stack[self]).tPred]
+                            /\ tPrev' = [tPrev EXCEPT ![self] = Head(stack[self]).tPrev]
+                            /\ tMi' = [tMi EXCEPT ![self] = Head(stack[self]).tMi]
+                            /\ tPP' = [tPP EXCEPT ![self] = Head(stack[self]).tPP]
+                            /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                            /\ UNCHANGED reclaimBusy
+                       ELSE /\ reclaimBusy' = TRUE
+                            /\ pc' = [pc EXCEPT ![self] = "TR_load"]
+                            /\ UNCHANGED << stack, tPtr, tPred, tPrev, tMi, 
+                                            tPP >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, guardDepth, 
+                                 irqActive, rvMeta, rvIdx, rvBlk, live, held, 
+                                 stolenOutstanding, rm, xc, xk, xshrunk, rs, 
+                                 stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                 bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
+                                 qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 TR_load(self) == /\ pc[self] = "TR_load"
                  /\ tPtr' = [tPtr EXCEPT ![self] = fwPtr]
-                 /\ tCtr' = [tCtr EXCEPT ![self] = fwCtr]
                  /\ tPred' = [tPred EXCEPT ![self] = fwPred]
-                 /\ IF FrontierMode = "packed"
-                       THEN /\ tPrev' = [tPrev EXCEPT ![self] = fwPred]
-                            /\ IF fwPred = NULL
-                                  THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
-                                  ELSE /\ pc' = [pc EXCEPT ![self] = "TR_meta"]
-                       ELSE /\ pc' = [pc EXCEPT ![self] = "TR_hint"]
-                            /\ tPrev' = tPrev
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ tPrev' = [tPrev EXCEPT ![self] = fwPred]
+                 /\ IF fwPred = NULL
+                       THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
+                       ELSE /\ pc' = [pc EXCEPT ![self] = "TR_meta"]
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
                                  stack, rm, tMi, tPP, xc, xk, xshrunk, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
-
-TR_hint(self) == /\ pc[self] = "TR_hint"
-                 /\ Assert(~InUserRegion(tPtr[self]), 
-                           "Failure of assertion at line 203, column 5.")
-                 /\ tPrev' = [tPrev EXCEPT ![self] = hdrPrev[tPtr[self]]]
-                 /\ IF hdrPrev[tPtr[self]] = NULL \/ (FrontierMode = "post_cas_hint" /\ ~(hdrPrev[tPtr[self]] < tPtr[self]))
-                       THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
-                       ELSE /\ pc' = [pc EXCEPT ![self] = "TR_meta"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
-                                 reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                 rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tMi, tPP, xc, 
-                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                 bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
+                                 qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 TR_meta(self) == /\ pc[self] = "TR_meta"
                  /\ Assert(~InUserRegion(tPrev[self]), 
-                           "Failure of assertion at line 209, column 5.")
+                           "Failure of assertion at line 186, column 5.")
                  /\ tMi' = [tMi EXCEPT ![self] = hdrMeta[tPrev[self]]]
                  /\ pc' = [pc EXCEPT ![self] = "TR_count"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tPP, xc, 
-                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 stack, rm, tPtr, tPred, tPrev, tPP, xc, xk, 
+                                 xshrunk, rs, stolen, batch, nstolen, cand, 
+                                 bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                 qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                 gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                 ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                 dsel, iops, iasel, idsel >>
 
 TR_count(self) == /\ pc[self] = "TR_count"
                   /\ IF tMi[self] = NULL \/ tMi[self] >= metaCount
                         THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "TR_state"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                                  stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                  xk, xshrunk, rs, stolen, batch, nstolen, 
+                                  cand, bsPtr, bsPred, bpp, pm, ws, wforce, wa, 
+                                  qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
+                                  gk, gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 TR_state(self) == /\ pc[self] = "TR_state"
                   /\ IF mPtr[tMi[self]] # tPrev[self] \/ mState[tMi[self]] # "AVAILABLE"
                         THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
-                        ELSE /\ pc' = [pc EXCEPT ![self] = "TR_adj"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                        ELSE /\ pc' = [pc EXCEPT ![self] = "TR_claim"]
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
-
-TR_adj(self) == /\ pc[self] = "TR_adj"
-                /\ IF FrontierMode = "post_cas_hint"
-                      THEN /\ Assert(~InUserRegion(tPrev[self]), 
-                                     "Failure of assertion at line 217, column 9.")
-                           /\ IF tPrev[self] + hdrSize[tPrev[self]] # tPtr[self]
-                                 THEN /\ pc' = [pc EXCEPT ![self] = "TR_done"]
-                                 ELSE /\ pc' = [pc EXCEPT ![self] = "TR_claim"]
-                      ELSE /\ pc' = [pc EXCEPT ![self] = "TR_claim"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                idsel >>
+                                  stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                  xk, xshrunk, rs, stolen, batch, nstolen, 
+                                  cand, bsPtr, bsPred, bpp, pm, ws, wforce, wa, 
+                                  qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
+                                  gk, gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 TR_claim(self) == /\ pc[self] = "TR_claim"
                   /\ IF mState[tMi[self]] = "AVAILABLE" /\ mPtr[tMi[self]] = tPrev[self]
@@ -981,83 +866,75 @@ TR_claim(self) == /\ pc[self] = "TR_claim"
                              /\ pc' = [pc EXCEPT ![self] = "TR_pp"]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "TR_done"]
                              /\ UNCHANGED mState
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                  mgrActive, mgrTrimming, mgrFree, bins, 
-                                  pending, pendingCount, windowOpen, 
-                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mPtr, mSize, mShard, metaCount, mgrActive, 
+                                  mgrTrimming, mgrFree, bins, pending, 
+                                  pendingCount, windowOpen, reclaimBusy, 
+                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                  live, held, stolenOutstanding, stack, rm, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 TR_pp(self) == /\ pc[self] = "TR_pp"
-               /\ IF FrontierMode = "packed"
-                     THEN /\ tPP' = [tPP EXCEPT ![self] = hdrPrev[tPrev[self]]]
-                     ELSE /\ TRUE
-                          /\ tPP' = tPP
+               /\ tPP' = [tPP EXCEPT ![self] = hdrPrev[tPrev[self]]]
                /\ pc' = [pc EXCEPT ![self] = "TR_cas"]
-               /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+               /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
                                mState, mPtr, mSize, mShard, metaCount, 
                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
                                pendingCount, windowOpen, reclaimBusy, 
                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                live, held, stolenOutstanding, stack, rm, tPtr, 
-                               tCtr, tPred, tPrev, tMi, xc, xk, xshrunk, rs, 
-                               stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                               bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                               qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                               sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                               areserved, da, dmi, dtarget, ops, asel, dsel, 
-                               iops, iasel, idsel >>
+                               tPred, tPrev, tMi, xc, xk, xshrunk, rs, stolen, 
+                               batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                               ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                               qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                               asz, ameta, ablk, areserved, da, dmi, dtarget, 
+                               ops, asel, dsel, iops, iasel, idsel >>
 
 TR_cas(self) == /\ pc[self] = "TR_cas"
-                /\ IF fwPtr = tPtr[self] /\ fwCtr = tCtr[self] /\ fwPred = tPred[self]
+                /\ IF fwPtr = tPtr[self] /\ fwPred = tPred[self]
                       THEN /\ fwPtr' = tPrev[self]
-                           /\ fwCtr' = (IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1)
-                           /\ fwPred' = (IF FrontierMode = "packed" THEN tPP[self] ELSE NULL)
+                           /\ fwPred' = tPP[self]
                            /\ pc' = [pc EXCEPT ![self] = "TR_reclaimed"]
                       ELSE /\ pc' = [pc EXCEPT ![self] = "TR_restore"]
-                           /\ UNCHANGED << fwPtr, fwCtr, fwPred >>
+                           /\ UNCHANGED << fwPtr, fwPred >>
                 /\ UNCHANGED << hdrMeta, hdrSize, hdrPrev, mState, mPtr, mSize, 
                                 mShard, metaCount, mgrActive, mgrTrimming, 
                                 mgrFree, bins, pending, pendingCount, 
                                 windowOpen, reclaimBusy, guardDepth, irqActive, 
                                 rvMeta, rvIdx, rvBlk, live, held, 
-                                stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                iops, iasel, idsel >>
+                                stolenOutstanding, stack, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                asz, ameta, ablk, areserved, da, dmi, dtarget, 
+                                ops, asel, dsel, iops, iasel, idsel >>
 
 TR_reclaimed(self) == /\ pc[self] = "TR_reclaimed"
                       /\ Assert(mState[tMi[self]] = "FRONTIER_RECLAIM_IN_PROGRESS", 
-                                "Failure of assertion at line 233, column 5.")
+                                "Failure of assertion at line 204, column 5.")
                       /\ mState' = [mState EXCEPT ![tMi[self]] = "FRONTIER_RECLAIMED"]
                       /\ pc' = [pc EXCEPT ![self] = "TR_load"]
-                      /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                      hdrPrev, mPtr, mSize, mShard, metaCount, 
+                      /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                      mPtr, mSize, mShard, metaCount, 
                                       mgrActive, mgrTrimming, mgrFree, bins, 
                                       pending, pendingCount, windowOpen, 
                                       reclaimBusy, guardDepth, irqActive, 
                                       rvMeta, rvIdx, rvBlk, live, held, 
-                                      stolenOutstanding, stack, rm, tPtr, tCtr, 
+                                      stolenOutstanding, stack, rm, tPtr, 
                                       tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
                                       rs, stolen, batch, nstolen, cand, bsPtr, 
-                                      bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                      qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                      gc, gk, gtail, gsz, sPtr, sCtr, sPred, 
-                                      nxt, asz, ameta, ablk, areserved, da, 
-                                      dmi, dtarget, ops, asel, dsel, iops, 
-                                      iasel, idsel >>
+                                      bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                      qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                      gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                      ablk, areserved, da, dmi, dtarget, ops, 
+                                      asel, dsel, iops, iasel, idsel >>
 
 TR_restore(self) == /\ pc[self] = "TR_restore"
                     /\ IF mState[tMi[self]] = "FRONTIER_RECLAIM_IN_PROGRESS"
@@ -1065,53 +942,48 @@ TR_restore(self) == /\ pc[self] = "TR_restore"
                           ELSE /\ TRUE
                                /\ UNCHANGED mState
                     /\ pc' = [pc EXCEPT ![self] = "TR_done"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                    mgrActive, mgrTrimming, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                    rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                    asz, ameta, ablk, areserved, da, dmi, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mPtr, mSize, mShard, metaCount, mgrActive, 
+                                    mgrTrimming, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    guardDepth, irqActive, rvMeta, rvIdx, 
+                                    rvBlk, live, held, stolenOutstanding, 
+                                    stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                    xc, xk, xshrunk, rs, stolen, batch, 
+                                    nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                    wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                    qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                    nxt, asz, ameta, ablk, areserved, da, dmi, 
                                     dtarget, ops, asel, dsel, iops, iasel, 
                                     idsel >>
 
 TR_done(self) == /\ pc[self] = "TR_done"
-                 /\ IF SerializeReclaim
-                       THEN /\ reclaimBusy' = FALSE
-                       ELSE /\ TRUE
-                            /\ UNCHANGED reclaimBusy
+                 /\ reclaimBusy' = FALSE
                  /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                  /\ tPtr' = [tPtr EXCEPT ![self] = Head(stack[self]).tPtr]
-                 /\ tCtr' = [tCtr EXCEPT ![self] = Head(stack[self]).tCtr]
                  /\ tPred' = [tPred EXCEPT ![self] = Head(stack[self]).tPred]
                  /\ tPrev' = [tPrev EXCEPT ![self] = Head(stack[self]).tPrev]
                  /\ tMi' = [tMi EXCEPT ![self] = Head(stack[self]).tMi]
                  /\ tPP' = [tPP EXCEPT ![self] = Head(stack[self]).tPP]
                  /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
-                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                 live, held, stolenOutstanding, rm, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, guardDepth, 
+                                 irqActive, rvMeta, rvIdx, rvBlk, live, held, 
+                                 stolenOutstanding, rm, xc, xk, xshrunk, rs, 
+                                 stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                 bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
+                                 qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
-TryReclaim(self) == TR_flag(self) \/ TR_load(self) \/ TR_hint(self)
-                       \/ TR_meta(self) \/ TR_count(self) \/ TR_state(self)
-                       \/ TR_adj(self) \/ TR_claim(self) \/ TR_pp(self)
-                       \/ TR_cas(self) \/ TR_reclaimed(self)
-                       \/ TR_restore(self) \/ TR_done(self)
+TryReclaim(self) == TR_flag(self) \/ TR_load(self) \/ TR_meta(self)
+                       \/ TR_count(self) \/ TR_state(self)
+                       \/ TR_claim(self) \/ TR_pp(self) \/ TR_cas(self)
+                       \/ TR_reclaimed(self) \/ TR_restore(self)
+                       \/ TR_done(self)
 
 TM_load(self) == /\ pc[self] = "TM_load"
                  /\ IF metaCount = 0
@@ -1124,27 +996,23 @@ TM_load(self) == /\ pc[self] = "TM_load"
                             /\ xk' = [xk EXCEPT ![self] = (metaCount - 1) \div RecordsPerManager]
                             /\ pc' = [pc EXCEPT ![self] = "TM_claim"]
                             /\ UNCHANGED << stack, xshrunk >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                                 rm, tPtr, tPred, tPrev, tMi, tPP, rs, stolen, 
+                                 batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 TM_claim(self) == /\ pc[self] = "TM_claim"
                   /\ IF mgrActive[xk[self]] = 0 /\ ~mgrTrimming[xk[self]]
                         THEN /\ mgrTrimming' = [mgrTrimming EXCEPT ![xk[self]] = TRUE]
-                             /\ IF GuardTrim
-                                   THEN /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
-                                   ELSE /\ TRUE
-                                        /\ UNCHANGED guardDepth
+                             /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
                              /\ pc' = [pc EXCEPT ![self] = "TM_recheck"]
                              /\ UNCHANGED << stack, xc, xk, xshrunk >>
                         ELSE /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -1153,39 +1021,37 @@ TM_claim(self) == /\ pc[self] = "TM_claim"
                              /\ xshrunk' = [xshrunk EXCEPT ![self] = Head(stack[self]).xshrunk]
                              /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                              /\ UNCHANGED << mgrTrimming, guardDepth >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrFree, bins, pending, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrFree, bins, pending, 
                                   pendingCount, windowOpen, reclaimBusy, 
                                   irqActive, rvMeta, rvIdx, rvBlk, live, held, 
-                                  stolenOutstanding, rm, tPtr, tCtr, tPred, 
-                                  tPrev, tMi, tPP, rs, stolen, batch, nstolen, 
-                                  cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                  wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                                  stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                  tMi, tPP, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 TM_recheck(self) == /\ pc[self] = "TM_recheck"
                     /\ IF metaCount # xc[self]
                           THEN /\ pc' = [pc EXCEPT ![self] = "TM_release"]
                           ELSE /\ pc' = [pc EXCEPT ![self] = "TM_shrink"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, guardDepth, irqActive, rvMeta, 
                                     rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                    asz, ameta, ablk, areserved, da, dmi, 
-                                    dtarget, ops, asel, dsel, iops, iasel, 
-                                    idsel >>
+                                    stolenOutstanding, stack, rm, tPtr, tPred, 
+                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                    stolen, batch, nstolen, cand, bsPtr, 
+                                    bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                    qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                    gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                    ablk, areserved, da, dmi, dtarget, ops, 
+                                    asel, dsel, iops, iasel, idsel >>
 
 TM_shrink(self) == /\ pc[self] = "TM_shrink"
                    /\ IF metaCount = xc[self]
@@ -1194,20 +1060,19 @@ TM_shrink(self) == /\ pc[self] = "TM_shrink"
                          ELSE /\ xshrunk' = [xshrunk EXCEPT ![self] = FALSE]
                               /\ UNCHANGED metaCount
                    /\ pc' = [pc EXCEPT ![self] = "TM_reset"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   mgrActive, mgrTrimming, mgrFree, bins, 
-                                   pending, pendingCount, windowOpen, 
-                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                   tPP, xc, xk, rs, stolen, batch, nstolen, 
-                                   cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                   wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                   qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                   sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                   dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, mgrActive, 
+                                   mgrTrimming, mgrFree, bins, pending, 
+                                   pendingCount, windowOpen, reclaimBusy, 
+                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                   live, held, stolenOutstanding, stack, rm, 
+                                   tPtr, tPred, tPrev, tMi, tPP, xc, xk, rs, 
+                                   stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                   bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
+                                   qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                   sPtr, sPred, nxt, asz, ameta, ablk, 
+                                   areserved, da, dmi, dtarget, ops, asel, 
+                                   dsel, iops, iasel, idsel >>
 
 TM_reset(self) == /\ pc[self] = "TM_reset"
                   /\ IF xshrunk[self]
@@ -1215,42 +1080,37 @@ TM_reset(self) == /\ pc[self] = "TM_reset"
                         ELSE /\ TRUE
                              /\ UNCHANGED mgrFree
                   /\ pc' = [pc EXCEPT ![self] = "TM_release"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, bins, 
-                                  pending, pendingCount, windowOpen, 
-                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, bins, pending, 
+                                  pendingCount, windowOpen, reclaimBusy, 
+                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                  live, held, stolenOutstanding, stack, rm, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 TM_release(self) == /\ pc[self] = "TM_release"
                     /\ mgrTrimming' = [mgrTrimming EXCEPT ![xk[self]] = FALSE]
-                    /\ IF GuardTrim
-                          THEN /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
-                          ELSE /\ TRUE
-                               /\ UNCHANGED guardDepth
+                    /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
                     /\ pc' = [pc EXCEPT ![self] = "TM_load"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, irqActive, rvMeta, rvIdx, 
-                                    rvBlk, live, held, stolenOutstanding, 
-                                    stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                    tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                    nstolen, cand, bsPtr, bsCtr, bsPred, bpp, 
-                                    pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                    qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
-                                    sCtr, sPred, nxt, asz, ameta, ablk, 
-                                    areserved, da, dmi, dtarget, ops, asel, 
-                                    dsel, iops, iasel, idsel >>
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    irqActive, rvMeta, rvIdx, rvBlk, live, 
+                                    held, stolenOutstanding, stack, rm, tPtr, 
+                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                    rs, stolen, batch, nstolen, cand, bsPtr, 
+                                    bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                    qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                    gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                    ablk, areserved, da, dmi, dtarget, ops, 
+                                    asel, dsel, iops, iasel, idsel >>
 
 Trim(self) == TM_load(self) \/ TM_claim(self) \/ TM_recheck(self)
                  \/ TM_shrink(self) \/ TM_reset(self) \/ TM_release(self)
@@ -1263,19 +1123,18 @@ RW_steal(self) == /\ pc[self] = "RW_steal"
                   /\ IF stolen'[self] = <<>>
                         THEN /\ pc' = [pc EXCEPT ![self] = "RW_tail"]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "RW_chunk"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pendingCount, windowOpen, reclaimBusy, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pendingCount, windowOpen, reclaimBusy, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                  live, held, stack, rm, tPtr, tCtr, tPred, 
-                                  tPrev, tMi, tPP, xc, xk, xshrunk, rs, batch, 
-                                  cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                  wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                                  live, held, stack, rm, tPtr, tPred, tPrev, 
+                                  tMi, tPP, xc, xk, xshrunk, rs, batch, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 RW_chunk(self) == /\ pc[self] = "RW_chunk"
                   /\ IF stolen[self] # <<>>
@@ -1284,61 +1143,57 @@ RW_chunk(self) == /\ pc[self] = "RW_chunk"
                              /\ pc' = [pc EXCEPT ![self] = "RW_bflag"]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "RW_reduce"]
                              /\ UNCHANGED << stolen, batch >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
-                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                                  stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                  xk, xshrunk, rs, nstolen, cand, bsPtr, 
+                                  bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                  qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                  sPtr, sPred, nxt, asz, ameta, ablk, 
+                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                  iops, iasel, idsel >>
 
 RW_bflag(self) == /\ pc[self] = "RW_bflag"
-                  /\ IF SerializeReclaim
-                        THEN /\ IF reclaimBusy
-                                   THEN /\ pc' = [pc EXCEPT ![self] = "RW_publish"]
-                                        /\ UNCHANGED reclaimBusy
-                                   ELSE /\ reclaimBusy' = TRUE
-                                        /\ pc' = [pc EXCEPT ![self] = "RW_bload"]
-                        ELSE /\ pc' = [pc EXCEPT ![self] = "RW_bload"]
+                  /\ IF reclaimBusy
+                        THEN /\ pc' = [pc EXCEPT ![self] = "RW_publish"]
                              /\ UNCHANGED reclaimBusy
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                        ELSE /\ reclaimBusy' = TRUE
+                             /\ pc' = [pc EXCEPT ![self] = "RW_bload"]
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                   live, held, stolenOutstanding, stack, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
-                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 RW_bload(self) == /\ pc[self] = "RW_bload"
                   /\ bsPtr' = [bsPtr EXCEPT ![self] = fwPtr]
-                  /\ bsCtr' = [bsCtr EXCEPT ![self] = fwCtr]
                   /\ bsPred' = [bsPred EXCEPT ![self] = fwPred]
                   /\ pc' = [pc EXCEPT ![self] = "RW_bfind"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bpp, pm, ws, wforce, wa, qsz, 
-                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                  gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                  ameta, ablk, areserved, da, dmi, dtarget, 
-                                  ops, asel, dsel, iops, iasel, idsel >>
+                                  stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                  xk, xshrunk, rs, stolen, batch, nstolen, 
+                                  cand, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                  qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                  sPtr, sPred, nxt, asz, ameta, ablk, 
+                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                  iops, iasel, idsel >>
 
 RW_bfind(self) == /\ pc[self] = "RW_bfind"
                   /\ LET C == {m \in batch[self] : mState[m] = "DEALLOCATED_PENDING" /\ mPtr[m] + mSize[m] = bsPtr[self]} IN
@@ -1347,20 +1202,19 @@ RW_bfind(self) == /\ pc[self] = "RW_bfind"
                                /\ cand' = cand
                           ELSE /\ cand' = [cand EXCEPT ![self] = Min(C)]
                                /\ pc' = [pc EXCEPT ![self] = "RW_bclaim"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                  wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                                  stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                  xk, xshrunk, rs, stolen, batch, nstolen, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 RW_bclaim(self) == /\ pc[self] = "RW_bclaim"
                    /\ IF mState[cand[self]] = "DEALLOCATED_PENDING"
@@ -1368,62 +1222,57 @@ RW_bclaim(self) == /\ pc[self] = "RW_bclaim"
                               /\ pc' = [pc EXCEPT ![self] = "RW_bpp"]
                          ELSE /\ pc' = [pc EXCEPT ![self] = "RW_bload"]
                               /\ UNCHANGED mState
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                   mgrActive, mgrTrimming, mgrFree, bins, 
-                                   pending, pendingCount, windowOpen, 
-                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                   tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                   nstolen, cand, bsPtr, bsCtr, bsPred, bpp, 
-                                   pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                   qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
-                                   sCtr, sPred, nxt, asz, ameta, ablk, 
-                                   areserved, da, dmi, dtarget, ops, asel, 
-                                   dsel, iops, iasel, idsel >>
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mPtr, mSize, mShard, metaCount, mgrActive, 
+                                   mgrTrimming, mgrFree, bins, pending, 
+                                   pendingCount, windowOpen, reclaimBusy, 
+                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                   live, held, stolenOutstanding, stack, rm, 
+                                   tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                   gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                   ablk, areserved, da, dmi, dtarget, ops, 
+                                   asel, dsel, iops, iasel, idsel >>
 
 RW_bpp(self) == /\ pc[self] = "RW_bpp"
-                /\ IF FrontierMode = "packed"
-                      THEN /\ bpp' = [bpp EXCEPT ![self] = hdrPrev[mPtr[cand[self]]]]
-                      ELSE /\ TRUE
-                           /\ bpp' = bpp
+                /\ bpp' = [bpp EXCEPT ![self] = hdrPrev[mPtr[cand[self]]]]
                 /\ pc' = [pc EXCEPT ![self] = "RW_bcas"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                cand, bsPtr, bsCtr, bsPred, pm, ws, wforce, wa, 
-                                qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                gtail, gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
-                                ablk, areserved, da, dmi, dtarget, ops, asel, 
-                                dsel, iops, iasel, idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, stack, rm, tPtr, 
+                                tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
+                                sPred, nxt, asz, ameta, ablk, areserved, da, 
+                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                idsel >>
 
 RW_bcas(self) == /\ pc[self] = "RW_bcas"
-                 /\ IF fwPtr = bsPtr[self] /\ fwCtr = bsCtr[self] /\ fwPred = bsPred[self]
+                 /\ IF fwPtr = bsPtr[self] /\ fwPred = bsPred[self]
                        THEN /\ fwPtr' = mPtr[cand[self]]
-                            /\ fwCtr' = (IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1)
-                            /\ fwPred' = (IF FrontierMode = "packed" THEN bpp[self] ELSE NULL)
+                            /\ fwPred' = bpp[self]
                             /\ pc' = [pc EXCEPT ![self] = "RW_brecycle"]
                        ELSE /\ pc' = [pc EXCEPT ![self] = "RW_brestore"]
-                            /\ UNCHANGED << fwPtr, fwCtr, fwPred >>
+                            /\ UNCHANGED << fwPtr, fwPred >>
                  /\ UNCHANGED << hdrMeta, hdrSize, hdrPrev, mState, mPtr, 
                                  mSize, mShard, metaCount, mgrActive, 
                                  mgrTrimming, mgrFree, bins, pending, 
                                  pendingCount, windowOpen, reclaimBusy, 
                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                  live, held, stolenOutstanding, stack, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 RW_brecycle(self) == /\ pc[self] = "RW_brecycle"
                      /\ batch' = [batch EXCEPT ![self] = batch[self] \ {cand[self]}]
@@ -1433,20 +1282,20 @@ RW_brecycle(self) == /\ pc[self] = "RW_brecycle"
                                                                  rm        |->  rm[self] ] >>
                                                              \o stack[self]]
                      /\ pc' = [pc EXCEPT ![self] = "RM_state"]
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrActive, mgrTrimming, 
-                                     mgrFree, bins, pending, pendingCount, 
-                                     windowOpen, reclaimBusy, guardDepth, 
-                                     irqActive, rvMeta, rvIdx, rvBlk, live, 
-                                     held, stolenOutstanding, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, nstolen, cand, bsPtr, bsCtr, 
-                                     bsPred, bpp, pm, ws, wforce, wa, qsz, 
-                                     qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                     gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                     ameta, ablk, areserved, da, dmi, dtarget, 
-                                     ops, asel, dsel, iops, iasel, idsel >>
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrActive, mgrTrimming, mgrFree, bins, 
+                                     pending, pendingCount, windowOpen, 
+                                     reclaimBusy, guardDepth, irqActive, 
+                                     rvMeta, rvIdx, rvBlk, live, held, 
+                                     stolenOutstanding, tPtr, tPred, tPrev, 
+                                     tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                     nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                     wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                     nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                     dtarget, ops, asel, dsel, iops, iasel, 
+                                     idsel >>
 
 RW_brestore(self) == /\ pc[self] = "RW_brestore"
                      /\ IF mState[cand[self]] = "FRONTIER_RECLAIM_IN_PROGRESS"
@@ -1454,41 +1303,37 @@ RW_brestore(self) == /\ pc[self] = "RW_brestore"
                            ELSE /\ TRUE
                                 /\ UNCHANGED mState
                      /\ pc' = [pc EXCEPT ![self] = "RW_bload"]
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                     mgrActive, mgrTrimming, mgrFree, bins, 
-                                     pending, pendingCount, windowOpen, 
-                                     reclaimBusy, guardDepth, irqActive, 
-                                     rvMeta, rvIdx, rvBlk, live, held, 
-                                     stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                     qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                     gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                     asz, ameta, ablk, areserved, da, dmi, 
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mPtr, mSize, mShard, metaCount, mgrActive, 
+                                     mgrTrimming, mgrFree, bins, pending, 
+                                     pendingCount, windowOpen, reclaimBusy, 
+                                     guardDepth, irqActive, rvMeta, rvIdx, 
+                                     rvBlk, live, held, stolenOutstanding, 
+                                     stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                     xc, xk, xshrunk, rs, stolen, batch, 
+                                     nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                     wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                     nxt, asz, ameta, ablk, areserved, da, dmi, 
                                      dtarget, ops, asel, dsel, iops, iasel, 
                                      idsel >>
 
 RW_bdone(self) == /\ pc[self] = "RW_bdone"
-                  /\ IF SerializeReclaim
-                        THEN /\ reclaimBusy' = FALSE
-                        ELSE /\ TRUE
-                             /\ UNCHANGED reclaimBusy
+                  /\ reclaimBusy' = FALSE
                   /\ pc' = [pc EXCEPT ![self] = "RW_publish"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                   live, held, stolenOutstanding, stack, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
-                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 RW_publish(self) == /\ pc[self] = "RW_publish"
                     /\ IF batch[self] # {}
@@ -1497,20 +1342,20 @@ RW_publish(self) == /\ pc[self] = "RW_publish"
                                /\ pc' = [pc EXCEPT ![self] = "RW_pub_state"]
                           ELSE /\ pc' = [pc EXCEPT ![self] = "RW_chunk"]
                                /\ UNCHANGED << batch, pm >>
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, guardDepth, irqActive, rvMeta, 
                                     rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, nstolen, cand, bsPtr, bsCtr, 
-                                    bsPred, bpp, ws, wforce, wa, qsz, qshard, 
-                                    qi, qpop, qdef, qclaimed, gc, gk, gtail, 
-                                    gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
-                                    ablk, areserved, da, dmi, dtarget, ops, 
-                                    asel, dsel, iops, iasel, idsel >>
+                                    stolenOutstanding, stack, rm, tPtr, tPred, 
+                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                    stolen, nstolen, cand, bsPtr, bsPred, bpp, 
+                                    ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                    qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
+                                    sPred, nxt, asz, ameta, ablk, areserved, 
+                                    da, dmi, dtarget, ops, asel, dsel, iops, 
+                                    iasel, idsel >>
 
 RW_pub_state(self) == /\ pc[self] = "RW_pub_state"
                       /\ IF mState[pm[self]] = "DEALLOCATED_PENDING"
@@ -1518,93 +1363,88 @@ RW_pub_state(self) == /\ pc[self] = "RW_pub_state"
                                  /\ pc' = [pc EXCEPT ![self] = "RW_pub_push"]
                             ELSE /\ pc' = [pc EXCEPT ![self] = "RW_publish"]
                                  /\ UNCHANGED mState
-                      /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                      hdrPrev, mPtr, mSize, mShard, metaCount, 
+                      /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                      mPtr, mSize, mShard, metaCount, 
                                       mgrActive, mgrTrimming, mgrFree, bins, 
                                       pending, pendingCount, windowOpen, 
                                       reclaimBusy, guardDepth, irqActive, 
                                       rvMeta, rvIdx, rvBlk, live, held, 
-                                      stolenOutstanding, stack, rm, tPtr, tCtr, 
+                                      stolenOutstanding, stack, rm, tPtr, 
                                       tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
                                       rs, stolen, batch, nstolen, cand, bsPtr, 
-                                      bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                      qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                      gc, gk, gtail, gsz, sPtr, sCtr, sPred, 
-                                      nxt, asz, ameta, ablk, areserved, da, 
-                                      dmi, dtarget, ops, asel, dsel, iops, 
-                                      iasel, idsel >>
+                                      bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                      qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                      gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                      ablk, areserved, da, dmi, dtarget, ops, 
+                                      asel, dsel, iops, iasel, idsel >>
 
 RW_pub_push(self) == /\ pc[self] = "RW_pub_push"
                      /\ Assert(~InAnyList(pm[self]), 
-                               "Failure of assertion at line 322, column 13.")
+                               "Failure of assertion at line 290, column 13.")
                      /\ bins' = [bins EXCEPT ![mSize[pm[self]]][mShard[pm[self]]] = bins[mSize[pm[self]]][mShard[pm[self]]] \cup {pm[self]}]
                      /\ pc' = [pc EXCEPT ![self] = "RW_publish"]
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrActive, mgrTrimming, 
-                                     mgrFree, pending, pendingCount, 
-                                     windowOpen, reclaimBusy, guardDepth, 
-                                     irqActive, rvMeta, rvIdx, rvBlk, live, 
-                                     held, stolenOutstanding, stack, rm, tPtr, 
-                                     tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                     xshrunk, rs, stolen, batch, nstolen, cand, 
-                                     bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                     wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                     gc, gk, gtail, gsz, sPtr, sCtr, sPred, 
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrActive, mgrTrimming, mgrFree, pending, 
+                                     pendingCount, windowOpen, reclaimBusy, 
+                                     guardDepth, irqActive, rvMeta, rvIdx, 
+                                     rvBlk, live, held, stolenOutstanding, 
+                                     stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                     xc, xk, xshrunk, rs, stolen, batch, 
+                                     nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                     wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
                                      nxt, asz, ameta, ablk, areserved, da, dmi, 
                                      dtarget, ops, asel, dsel, iops, iasel, 
                                      idsel >>
 
 RW_reduce(self) == /\ pc[self] = "RW_reduce"
-                   /\ Assert(PendingCountFirst => pendingCount[rs[self]] >= nstolen[self], 
-                             "Failure of assertion at line 327, column 5.")
+                   /\ Assert(pendingCount[rs[self]] >= nstolen[self], 
+                             "Failure of assertion at line 295, column 5.")
                    /\ pendingCount' = [pendingCount EXCEPT ![rs[self]] = IF pendingCount[rs[self]] > nstolen[self] THEN pendingCount[rs[self]] - nstolen[self] ELSE 0]
                    /\ stolenOutstanding' = [stolenOutstanding EXCEPT ![rs[self]] = stolenOutstanding[rs[self]] - nstolen[self]]
                    /\ pc' = [pc EXCEPT ![self] = "RW_steal"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, windowOpen, reclaimBusy, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, windowOpen, reclaimBusy, 
                                    guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                   live, held, stack, rm, tPtr, tCtr, tPred, 
-                                   tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                   stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                   bsPred, bpp, pm, ws, wforce, wa, qsz, 
-                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                   gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                   ameta, ablk, areserved, da, dmi, dtarget, 
-                                   ops, asel, dsel, iops, iasel, idsel >>
+                                   live, held, stack, rm, tPtr, tPred, tPrev, 
+                                   tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                   batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                   pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                   qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
+                                   sPred, nxt, asz, ameta, ablk, areserved, da, 
+                                   dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                   idsel >>
 
 RW_tail(self) == /\ pc[self] = "RW_tail"
                  /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "TryReclaim",
                                                           pc        |->  "RW_trim",
                                                           tPtr      |->  tPtr[self],
-                                                          tCtr      |->  tCtr[self],
                                                           tPred     |->  tPred[self],
                                                           tPrev     |->  tPrev[self],
                                                           tMi       |->  tMi[self],
                                                           tPP       |->  tPP[self] ] >>
                                                       \o stack[self]]
                  /\ tPtr' = [tPtr EXCEPT ![self] = 0]
-                 /\ tCtr' = [tCtr EXCEPT ![self] = 0]
                  /\ tPred' = [tPred EXCEPT ![self] = NULL]
                  /\ tPrev' = [tPrev EXCEPT ![self] = NULL]
                  /\ tMi' = [tMi EXCEPT ![self] = NULL]
                  /\ tPP' = [tPP EXCEPT ![self] = NULL]
                  /\ pc' = [pc EXCEPT ![self] = "TR_flag"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
                                  rm, xc, xk, xshrunk, rs, stolen, batch, 
-                                 nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                 idsel >>
+                                 nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 RW_trim(self) == /\ pc[self] = "RW_trim"
                  /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Trim",
@@ -1617,19 +1457,18 @@ RW_trim(self) == /\ pc[self] = "RW_trim"
                  /\ xk' = [xk EXCEPT ![self] = 0]
                  /\ xshrunk' = [xshrunk EXCEPT ![self] = FALSE]
                  /\ pc' = [pc EXCEPT ![self] = "TM_load"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                                 rm, tPtr, tPred, tPrev, tMi, tPP, rs, stolen, 
+                                 batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 RW_ret(self) == /\ pc[self] = "RW_ret"
                 /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -1638,24 +1477,22 @@ RW_ret(self) == /\ pc[self] = "RW_ret"
                 /\ nstolen' = [nstolen EXCEPT ![self] = Head(stack[self]).nstolen]
                 /\ cand' = [cand EXCEPT ![self] = Head(stack[self]).cand]
                 /\ bsPtr' = [bsPtr EXCEPT ![self] = Head(stack[self]).bsPtr]
-                /\ bsCtr' = [bsCtr EXCEPT ![self] = Head(stack[self]).bsCtr]
                 /\ bsPred' = [bsPred EXCEPT ![self] = Head(stack[self]).bsPred]
                 /\ bpp' = [bpp EXCEPT ![self] = Head(stack[self]).bpp]
                 /\ pm' = [pm EXCEPT ![self] = Head(stack[self]).pm]
                 /\ rs' = [rs EXCEPT ![self] = Head(stack[self]).rs]
                 /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                xshrunk, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, ws, wforce, 
+                                wa, qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
+                                gk, gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                dsel, iops, iasel, idsel >>
 
 RunWindow(self) == RW_steal(self) \/ RW_chunk(self) \/ RW_bflag(self)
                       \/ RW_bload(self) \/ RW_bfind(self)
@@ -1674,19 +1511,19 @@ MW_count(self) == /\ pc[self] = "MW_count"
                              /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "MW_open"]
                              /\ UNCHANGED << stack, ws, wforce >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                  xk, xshrunk, rs, stolen, batch, nstolen, 
-                                  cand, bsPtr, bsCtr, bsPred, bpp, pm, wa, qsz, 
-                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                  gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                  ameta, ablk, areserved, da, dmi, dtarget, 
-                                  ops, asel, dsel, iops, iasel, idsel >>
+                                  rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, wa, qsz, qshard, qi, 
+                                  qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                  sPtr, sPred, nxt, asz, ameta, ablk, 
+                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                  iops, iasel, idsel >>
 
 MW_open(self) == /\ pc[self] = "MW_open"
                  /\ IF windowOpen[ws[self]]
@@ -1698,19 +1535,18 @@ MW_open(self) == /\ pc[self] = "MW_open"
                        ELSE /\ windowOpen' = [windowOpen EXCEPT ![ws[self]] = TRUE]
                             /\ pc' = [pc EXCEPT ![self] = "MW_run"]
                             /\ UNCHANGED << stack, ws, wforce >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, reclaimBusy, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, reclaimBusy, 
                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                 live, held, stolenOutstanding, rm, tPtr, tCtr, 
+                                 live, held, stolenOutstanding, rm, tPtr, 
                                  tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, wa, qsz, qshard, qi, qpop, 
-                                 qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
-                                 sCtr, sPred, nxt, asz, ameta, ablk, areserved, 
-                                 da, dmi, dtarget, ops, asel, dsel, iops, 
-                                 iasel, idsel >>
+                                 stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                 bpp, pm, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 MW_run(self) == /\ pc[self] = "MW_run"
                 /\ /\ rs' = [rs EXCEPT ![self] = ws[self]]
@@ -1721,7 +1557,6 @@ MW_run(self) == /\ pc[self] = "MW_run"
                                                             nstolen   |->  nstolen[self],
                                                             cand      |->  cand[self],
                                                             bsPtr     |->  bsPtr[self],
-                                                            bsCtr     |->  bsCtr[self],
                                                             bsPred    |->  bsPred[self],
                                                             bpp       |->  bpp[self],
                                                             pm        |->  pm[self],
@@ -1732,23 +1567,21 @@ MW_run(self) == /\ pc[self] = "MW_run"
                 /\ nstolen' = [nstolen EXCEPT ![self] = 0]
                 /\ cand' = [cand EXCEPT ![self] = NULL]
                 /\ bsPtr' = [bsPtr EXCEPT ![self] = 0]
-                /\ bsCtr' = [bsCtr EXCEPT ![self] = 0]
                 /\ bsPred' = [bsPred EXCEPT ![self] = NULL]
                 /\ bpp' = [bpp EXCEPT ![self] = NULL]
                 /\ pm' = [pm EXCEPT ![self] = NULL]
                 /\ pc' = [pc EXCEPT ![self] = "RW_steal"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                xshrunk, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, ws, wforce, 
+                                wa, qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
+                                gk, gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                dsel, iops, iasel, idsel >>
 
 MW_close(self) == /\ pc[self] = "MW_close"
                   /\ windowOpen' = [windowOpen EXCEPT ![ws[self]] = FALSE]
@@ -1756,19 +1589,18 @@ MW_close(self) == /\ pc[self] = "MW_close"
                   /\ ws' = [ws EXCEPT ![self] = Head(stack[self]).ws]
                   /\ wforce' = [wforce EXCEPT ![self] = Head(stack[self]).wforce]
                   /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, reclaimBusy, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, reclaimBusy, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                   live, held, stolenOutstanding, rm, tPtr, 
-                                  tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                  xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, wa, qsz, 
-                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                  gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                  ameta, ablk, areserved, da, dmi, dtarget, 
-                                  ops, asel, dsel, iops, iasel, idsel >>
+                                  tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                  stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                  bpp, pm, wa, qsz, qshard, qi, qpop, qdef, 
+                                  qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                  nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 MaybeWindow(self) == MW_count(self) \/ MW_open(self) \/ MW_run(self)
                         \/ MW_close(self)
@@ -1783,7 +1615,6 @@ WA_loop(self) == /\ pc[self] = "WA_loop"
                                                                         nstolen   |->  nstolen[self],
                                                                         cand      |->  cand[self],
                                                                         bsPtr     |->  bsPtr[self],
-                                                                        bsCtr     |->  bsCtr[self],
                                                                         bsPred    |->  bsPred[self],
                                                                         bpp       |->  bpp[self],
                                                                         pm        |->  pm[self],
@@ -1794,62 +1625,59 @@ WA_loop(self) == /\ pc[self] = "WA_loop"
                             /\ nstolen' = [nstolen EXCEPT ![self] = 0]
                             /\ cand' = [cand EXCEPT ![self] = NULL]
                             /\ bsPtr' = [bsPtr EXCEPT ![self] = 0]
-                            /\ bsCtr' = [bsCtr EXCEPT ![self] = 0]
                             /\ bsPred' = [bsPred EXCEPT ![self] = NULL]
                             /\ bpp' = [bpp EXCEPT ![self] = NULL]
                             /\ pm' = [pm EXCEPT ![self] = NULL]
                             /\ pc' = [pc EXCEPT ![self] = "RW_steal"]
                        ELSE /\ pc' = [pc EXCEPT ![self] = "WA_ret"]
                             /\ UNCHANGED << stack, rs, stolen, batch, nstolen, 
-                                            cand, bsPtr, bsCtr, bsPred, bpp, 
-                                            pm >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                                            cand, bsPtr, bsPred, bpp, pm >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                 xk, xshrunk, ws, wforce, wa, qsz, qshard, qi, 
+                                 rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                 xshrunk, ws, wforce, wa, qsz, qshard, qi, 
                                  qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 WA_next(self) == /\ pc[self] = "WA_next"
                  /\ wa' = [wa EXCEPT ![self] = wa[self] + 1]
                  /\ pc' = [pc EXCEPT ![self] = "WA_loop"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                 gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                 asz, ameta, ablk, areserved, da, dmi, dtarget, 
-                                 ops, asel, dsel, iops, iasel, idsel >>
+                                 stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
+                                 bsPtr, bsPred, bpp, pm, ws, wforce, qsz, 
+                                 qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                 gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                 ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                 dsel, iops, iasel, idsel >>
 
 WA_ret(self) == /\ pc[self] = "WA_ret"
                 /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                 /\ wa' = [wa EXCEPT ![self] = Head(stack[self]).wa]
                 /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                xshrunk, rs, stolen, batch, nstolen, cand, 
-                                bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, qsz, 
-                                qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                gtail, gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
-                                ablk, areserved, da, dmi, dtarget, ops, asel, 
-                                dsel, iops, iasel, idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                asz, ameta, ablk, areserved, da, dmi, dtarget, 
+                                ops, asel, dsel, iops, iasel, idsel >>
 
 RunWindowAll(self) == WA_loop(self) \/ WA_next(self) \/ WA_ret(self)
 
@@ -1859,39 +1687,37 @@ SR_restart(self) == /\ pc[self] = "SR_restart"
                     /\ qdef' = [qdef EXCEPT ![self] = NULL]
                     /\ qclaimed' = [qclaimed EXCEPT ![self] = NULL]
                     /\ pc' = [pc EXCEPT ![self] = "SR_scan"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, irqActive, rvMeta, rvIdx, 
                                     rvBlk, live, held, stolenOutstanding, 
-                                    stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                    tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                    nstolen, cand, bsPtr, bsCtr, bsPred, bpp, 
-                                    pm, ws, wforce, wa, qsz, qshard, qpop, gc, 
-                                    gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                    asz, ameta, ablk, areserved, da, dmi, 
-                                    dtarget, ops, asel, dsel, iops, iasel, 
-                                    idsel >>
+                                    stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                    xc, xk, xshrunk, rs, stolen, batch, 
+                                    nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                    wforce, wa, qsz, qshard, qpop, gc, gk, 
+                                    gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                    ablk, areserved, da, dmi, dtarget, ops, 
+                                    asel, dsel, iops, iasel, idsel >>
 
 SR_scan(self) == /\ pc[self] = "SR_scan"
                  /\ IF qi[self] <= NumCPUs
                        THEN /\ pc' = [pc EXCEPT ![self] = "SR_pop"]
                        ELSE /\ pc' = [pc EXCEPT ![self] = "SR_exit"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                 idsel >>
+                                 stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
+                                 bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                 qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                 gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                 ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                 dsel, iops, iasel, idsel >>
 
 SR_pop(self) == /\ pc[self] = "SR_pop"
                 /\ LET sh == ShardOrder(qshard[self])[qi[self]] IN
@@ -1906,19 +1732,18 @@ SR_pop(self) == /\ pc[self] = "SR_pop"
                            /\ pc' = [pc EXCEPT ![self] = "SR_scan"]
                       ELSE /\ pc' = [pc EXCEPT ![self] = "SR_claim"]
                            /\ qi' = qi
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                pending, pendingCount, windowOpen, reclaimBusy, 
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                 live, held, stolenOutstanding, stack, rm, tPtr, 
-                                tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                rs, stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                idsel >>
+                                tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                bpp, pm, ws, wforce, wa, qsz, qshard, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                asz, ameta, ablk, areserved, da, dmi, dtarget, 
+                                ops, asel, dsel, iops, iasel, idsel >>
 
 SR_claim(self) == /\ pc[self] = "SR_claim"
                   /\ IF mState[qpop[self]] = "AVAILABLE"
@@ -1937,41 +1762,40 @@ SR_claim(self) == /\ pc[self] = "SR_claim"
                                                    /\ pc' = [pc EXCEPT ![self] = "SR_scan"]
                                                    /\ qdef' = qdef
                              /\ UNCHANGED << mState, qclaimed >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                  mgrActive, mgrTrimming, mgrFree, bins, 
-                                  pending, pendingCount, windowOpen, 
-                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qpop, gc, gk, 
-                                  gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                  ameta, ablk, areserved, da, dmi, dtarget, 
-                                  ops, asel, dsel, iops, iasel, idsel >>
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mPtr, mSize, mShard, metaCount, mgrActive, 
+                                  mgrTrimming, mgrFree, bins, pending, 
+                                  pendingCount, windowOpen, reclaimBusy, 
+                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                  live, held, stolenOutstanding, stack, rm, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qpop, gc, gk, gtail, gsz, sPtr, 
+                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
+                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                  idsel >>
 
 SR_repush(self) == /\ pc[self] = "SR_repush"
                    /\ Assert(~InAnyList(qpop[self]), 
-                             "Failure of assertion at line 388, column 9.")
+                             "Failure of assertion at line 356, column 9.")
                    /\ LET sh == ShardOrder(qshard[self])[qi[self]] IN
                         bins' = [bins EXCEPT ![qsz[self]][sh] = bins[qsz[self]][sh] \cup {qpop[self]}]
                    /\ qi' = [qi EXCEPT ![self] = qi[self] + 1]
                    /\ pc' = [pc EXCEPT ![self] = "SR_scan"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   pending, pendingCount, windowOpen, 
-                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                   tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                   nstolen, cand, bsPtr, bsCtr, bsPred, bpp, 
-                                   pm, ws, wforce, wa, qsz, qshard, qpop, qdef, 
-                                   qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                   sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                   dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, pending, 
+                                   pendingCount, windowOpen, reclaimBusy, 
+                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                   live, held, stolenOutstanding, stack, rm, 
+                                   tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                   qshard, qpop, qdef, qclaimed, gc, gk, gtail, 
+                                   gsz, sPtr, sPred, nxt, asz, ameta, ablk, 
+                                   areserved, da, dmi, dtarget, ops, asel, 
+                                   dsel, iops, iasel, idsel >>
 
 SR_exit(self) == /\ pc[self] = "SR_exit"
                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
@@ -2004,18 +1828,17 @@ SR_exit(self) == /\ pc[self] = "SR_exit"
                                        /\ qshard' = [qshard EXCEPT ![self] = Head(stack[self]).qshard]
                                        /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                             /\ rm' = rm
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, irqActive, rvIdx, rvBlk, live, 
-                                 held, stolenOutstanding, tPtr, tCtr, tPred, 
-                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
-                                 batch, nstolen, cand, bsPtr, bsCtr, bsPred, 
-                                 bpp, pm, ws, wforce, wa, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                                 held, stolenOutstanding, tPtr, tPred, tPrev, 
+                                 tMi, tPP, xc, xk, xshrunk, rs, stolen, batch, 
+                                 nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                 wforce, wa, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 Search(self) == SR_restart(self) \/ SR_scan(self) \/ SR_pop(self)
                    \/ SR_claim(self) \/ SR_repush(self) \/ SR_exit(self)
@@ -2028,38 +1851,37 @@ GM_load(self) == /\ pc[self] = "GM_load"
                        ELSE /\ gtail' = [gtail EXCEPT ![self] = (metaCount - 1) \div RecordsPerManager]
                             /\ gk' = [gk EXCEPT ![self] = 0]
                             /\ pc' = [pc EXCEPT ![self] = "GM_scan"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
+                                 bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                 qshard, qi, qpop, qdef, qclaimed, gsz, sPtr, 
+                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
+                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                 idsel >>
 
 GM_scan(self) == /\ pc[self] = "GM_scan"
                  /\ IF gk[self] <= gtail[self]
                        THEN /\ pc' = [pc EXCEPT ![self] = "GM_reserve"]
                        ELSE /\ pc' = [pc EXCEPT ![self] = "GM_bump"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                 idsel >>
+                                 stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                 xk, xshrunk, rs, stolen, batch, nstolen, cand, 
+                                 bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                 qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                 gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                 ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                 dsel, iops, iasel, idsel >>
 
 GM_reserve(self) == /\ pc[self] = "GM_reserve"
                     /\ IF mgrTrimming[gk[self]]
@@ -2069,20 +1891,20 @@ GM_reserve(self) == /\ pc[self] = "GM_reserve"
                           ELSE /\ mgrActive' = [mgrActive EXCEPT ![gk[self]] = mgrActive[gk[self]] + 1]
                                /\ pc' = [pc EXCEPT ![self] = "GM_pop"]
                                /\ gk' = gk
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrTrimming, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                    rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                    ameta, ablk, areserved, da, dmi, dtarget, 
-                                    ops, asel, dsel, iops, iasel, idsel >>
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrTrimming, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    guardDepth, irqActive, rvMeta, rvIdx, 
+                                    rvBlk, live, held, stolenOutstanding, 
+                                    stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                    xc, xk, xshrunk, rs, stolen, batch, 
+                                    nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                    wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                    qclaimed, gc, gtail, gsz, sPtr, sPred, nxt, 
+                                    asz, ameta, ablk, areserved, da, dmi, 
+                                    dtarget, ops, asel, dsel, iops, iasel, 
+                                    idsel >>
 
 GM_pop(self) == /\ pc[self] = "GM_pop"
                 /\ IF mgrFree[gk[self]] # {}
@@ -2097,37 +1919,37 @@ GM_pop(self) == /\ pc[self] = "GM_pop"
                       ELSE /\ pc' = [pc EXCEPT ![self] = "GM_release"]
                            /\ UNCHANGED << mgrFree, rvIdx, stack, gc, gk, 
                                            gtail >>
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, bins, 
-                                pending, pendingCount, windowOpen, reclaimBusy, 
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
                                 guardDepth, irqActive, rvMeta, rvBlk, live, 
-                                held, stolenOutstanding, rm, tPtr, tCtr, tPred, 
+                                held, stolenOutstanding, rm, tPtr, tPred, 
                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
-                                batch, nstolen, cand, bsPtr, bsCtr, bsPred, 
-                                bpp, pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                qdef, qclaimed, gsz, sPtr, sCtr, sPred, nxt, 
-                                asz, ameta, ablk, areserved, da, dmi, dtarget, 
-                                ops, asel, dsel, iops, iasel, idsel >>
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                dsel, iops, iasel, idsel >>
 
 GM_release(self) == /\ pc[self] = "GM_release"
                     /\ mgrActive' = [mgrActive EXCEPT ![gk[self]] = mgrActive[gk[self]] - 1]
                     /\ gk' = [gk EXCEPT ![self] = gk[self] + 1]
                     /\ pc' = [pc EXCEPT ![self] = "GM_scan"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrTrimming, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                    rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                    ameta, ablk, areserved, da, dmi, dtarget, 
-                                    ops, asel, dsel, iops, iasel, idsel >>
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrTrimming, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    guardDepth, irqActive, rvMeta, rvIdx, 
+                                    rvBlk, live, held, stolenOutstanding, 
+                                    stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                    xc, xk, xshrunk, rs, stolen, batch, 
+                                    nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                    wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                    qclaimed, gc, gtail, gsz, sPtr, sPred, nxt, 
+                                    asz, ameta, ablk, areserved, da, dmi, 
+                                    dtarget, ops, asel, dsel, iops, iasel, 
+                                    idsel >>
 
 GM_bump(self) == /\ pc[self] = "GM_bump"
                  /\ IF gc[self] \div RecordsPerManager >= NumManagers
@@ -2140,19 +1962,18 @@ GM_bump(self) == /\ pc[self] = "GM_bump"
                        ELSE /\ gk' = [gk EXCEPT ![self] = gc[self] \div RecordsPerManager]
                             /\ pc' = [pc EXCEPT ![self] = "GM_breserve"]
                             /\ UNCHANGED << rvIdx, stack, gc, gtail >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvBlk, live, held, stolenOutstanding, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 GM_breserve(self) == /\ pc[self] = "GM_breserve"
                      /\ ~mgrTrimming[gk[self]] \/ metaCount # gc[self]
@@ -2163,69 +1984,60 @@ GM_breserve(self) == /\ pc[self] = "GM_breserve"
                            ELSE /\ mgrActive' = [mgrActive EXCEPT ![gk[self]] = mgrActive[gk[self]] + 1]
                                 /\ pc' = [pc EXCEPT ![self] = "GM_bcheck"]
                                 /\ gc' = gc
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrTrimming, mgrFree, bins, 
-                                     pending, pendingCount, windowOpen, 
-                                     reclaimBusy, guardDepth, irqActive, 
-                                     rvMeta, rvIdx, rvBlk, live, held, 
-                                     stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                     qsz, qshard, qi, qpop, qdef, qclaimed, gk, 
-                                     gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                     ameta, ablk, areserved, da, dmi, dtarget, 
-                                     ops, asel, dsel, iops, iasel, idsel >>
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrTrimming, mgrFree, bins, pending, 
+                                     pendingCount, windowOpen, reclaimBusy, 
+                                     guardDepth, irqActive, rvMeta, rvIdx, 
+                                     rvBlk, live, held, stolenOutstanding, 
+                                     stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                     xc, xk, xshrunk, rs, stolen, batch, 
+                                     nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                     wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gk, gtail, gsz, sPtr, sPred, 
+                                     nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                     dtarget, ops, asel, dsel, iops, iasel, 
+                                     idsel >>
 
 GM_bcheck(self) == /\ pc[self] = "GM_bcheck"
                    /\ IF MS - (gc[self] + 1) <= fwPtr
                          THEN /\ pc' = [pc EXCEPT ![self] = "GM_bfail"]
                          ELSE /\ pc' = [pc EXCEPT ![self] = "GM_bcas"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                   tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                   nstolen, cand, bsPtr, bsCtr, bsPred, bpp, 
-                                   pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
-                                   qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
-                                   sCtr, sPred, nxt, asz, ameta, ablk, 
-                                   areserved, da, dmi, dtarget, ops, asel, 
-                                   dsel, iops, iasel, idsel >>
+                                   stack, rm, tPtr, tPred, tPrev, tMi, tPP, xc, 
+                                   xk, xshrunk, rs, stolen, batch, nstolen, 
+                                   cand, bsPtr, bsPred, bpp, pm, ws, wforce, 
+                                   wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
+                                   gc, gk, gtail, gsz, sPtr, sPred, nxt, asz, 
+                                   ameta, ablk, areserved, da, dmi, dtarget, 
+                                   ops, asel, dsel, iops, iasel, idsel >>
 
 GM_bcas(self) == /\ pc[self] = "GM_bcas"
                  /\ IF metaCount = gc[self]
                        THEN /\ metaCount' = gc[self] + 1
-                            /\ IF ~FixedBoundary
-                                  THEN /\ rvIdx' = [rvIdx EXCEPT ![self] = gc[self]]
-                                       /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-                                       /\ gc' = [gc EXCEPT ![self] = Head(stack[self]).gc]
-                                       /\ gk' = [gk EXCEPT ![self] = Head(stack[self]).gk]
-                                       /\ gtail' = [gtail EXCEPT ![self] = Head(stack[self]).gtail]
-                                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                                  ELSE /\ pc' = [pc EXCEPT ![self] = "GM_brecheck"]
-                                       /\ UNCHANGED << rvIdx, stack, gc, gk, 
-                                                       gtail >>
+                            /\ pc' = [pc EXCEPT ![self] = "GM_brecheck"]
+                            /\ gc' = gc
                        ELSE /\ gc' = [gc EXCEPT ![self] = metaCount]
                             /\ pc' = [pc EXCEPT ![self] = "GM_brelease"]
-                            /\ UNCHANGED << metaCount, rvIdx, stack, gk, gtail >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 mgrActive, mgrTrimming, mgrFree, bins, 
-                                 pending, pendingCount, windowOpen, 
-                                 reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                 rvBlk, live, held, stolenOutstanding, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gsz, 
-                                 sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                 iops, iasel, idsel >>
+                            /\ UNCHANGED metaCount
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, mgrActive, 
+                                 mgrTrimming, mgrFree, bins, pending, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                 live, held, stolenOutstanding, stack, rm, 
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 GM_brecheck(self) == /\ pc[self] = "GM_brecheck"
                      /\ IF MS - (gc[self] + 1) > fwPtr
@@ -2237,20 +2049,20 @@ GM_brecheck(self) == /\ pc[self] = "GM_brecheck"
                                 /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                            ELSE /\ pc' = [pc EXCEPT ![self] = "GM_bundo"]
                                 /\ UNCHANGED << rvIdx, stack, gc, gk, gtail >>
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrActive, mgrTrimming, 
-                                     mgrFree, bins, pending, pendingCount, 
-                                     windowOpen, reclaimBusy, guardDepth, 
-                                     irqActive, rvMeta, rvBlk, live, held, 
-                                     stolenOutstanding, rm, tPtr, tCtr, tPred, 
-                                     tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                     stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                     qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                     gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
-                                     ablk, areserved, da, dmi, dtarget, ops, 
-                                     asel, dsel, iops, iasel, idsel >>
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrActive, mgrTrimming, mgrFree, bins, 
+                                     pending, pendingCount, windowOpen, 
+                                     reclaimBusy, guardDepth, irqActive, 
+                                     rvMeta, rvBlk, live, held, 
+                                     stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                     tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                     batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                     pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                     qdef, qclaimed, gsz, sPtr, sPred, nxt, 
+                                     asz, ameta, ablk, areserved, da, dmi, 
+                                     dtarget, ops, asel, dsel, iops, iasel, 
+                                     idsel >>
 
 GM_bundo(self) == /\ pc[self] = "GM_bundo"
                   /\ IF metaCount = gc[self] + 1
@@ -2258,37 +2070,35 @@ GM_bundo(self) == /\ pc[self] = "GM_bundo"
                              /\ pc' = [pc EXCEPT ![self] = "GM_bfail"]
                         ELSE /\ pc' = [pc EXCEPT ![self] = "GM_brecheck"]
                              /\ UNCHANGED metaCount
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  mgrActive, mgrTrimming, mgrFree, bins, 
-                                  pending, pendingCount, windowOpen, 
-                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                  rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  stack, rm, tPtr, tCtr, tPred, tPrev, tMi, 
-                                  tPP, xc, xk, xshrunk, rs, stolen, batch, 
-                                  nstolen, cand, bsPtr, bsCtr, bsPred, bpp, pm, 
-                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                  sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                  dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                  idsel >>
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, mgrActive, 
+                                  mgrTrimming, mgrFree, bins, pending, 
+                                  pendingCount, windowOpen, reclaimBusy, 
+                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                  live, held, stolenOutstanding, stack, rm, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 GM_brelease(self) == /\ pc[self] = "GM_brelease"
                      /\ mgrActive' = [mgrActive EXCEPT ![gk[self]] = mgrActive[gk[self]] - 1]
                      /\ pc' = [pc EXCEPT ![self] = "GM_bump"]
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrTrimming, mgrFree, bins, 
-                                     pending, pendingCount, windowOpen, 
-                                     reclaimBusy, guardDepth, irqActive, 
-                                     rvMeta, rvIdx, rvBlk, live, held, 
-                                     stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                     qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                     gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                     asz, ameta, ablk, areserved, da, dmi, 
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrTrimming, mgrFree, bins, pending, 
+                                     pendingCount, windowOpen, reclaimBusy, 
+                                     guardDepth, irqActive, rvMeta, rvIdx, 
+                                     rvBlk, live, held, stolenOutstanding, 
+                                     stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                     xc, xk, xshrunk, rs, stolen, batch, 
+                                     nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                     wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                     nxt, asz, ameta, ablk, areserved, da, dmi, 
                                      dtarget, ops, asel, dsel, iops, iasel, 
                                      idsel >>
 
@@ -2300,17 +2110,16 @@ GM_bfail(self) == /\ pc[self] = "GM_bfail"
                   /\ gk' = [gk EXCEPT ![self] = Head(stack[self]).gk]
                   /\ gtail' = [gtail EXCEPT ![self] = Head(stack[self]).gtail]
                   /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrTrimming, mgrFree, bins, 
-                                  pending, pendingCount, windowOpen, 
-                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                  rvBlk, live, held, stolenOutstanding, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                  xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrTrimming, mgrFree, bins, pending, 
+                                  pendingCount, windowOpen, reclaimBusy, 
+                                  guardDepth, irqActive, rvMeta, rvBlk, live, 
+                                  held, stolenOutstanding, rm, tPtr, tPred, 
+                                  tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                  batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                  qclaimed, gsz, sPtr, sPred, nxt, asz, ameta, 
                                   ablk, areserved, da, dmi, dtarget, ops, asel, 
                                   dsel, iops, iasel, idsel >>
 
@@ -2324,22 +2133,20 @@ GetMetaIndex(self) == GM_load(self) \/ GM_scan(self) \/ GM_reserve(self)
 FB_load(self) == /\ pc[self] = "FB_load"
                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
                  /\ sPtr' = [sPtr EXCEPT ![self] = fwPtr]
-                 /\ sCtr' = [sCtr EXCEPT ![self] = fwCtr]
                  /\ sPred' = [sPred EXCEPT ![self] = fwPred]
                  /\ pc' = [pc EXCEPT ![self] = "FB_check"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, irqActive, rvMeta, rvIdx, rvBlk, 
                                  live, held, stolenOutstanding, stack, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, nxt, asz, ameta, ablk, areserved, 
-                                 da, dmi, dtarget, ops, asel, dsel, iops, 
-                                 iasel, idsel >>
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 FB_check(self) == /\ pc[self] = "FB_check"
                   /\ IF sPtr[self] + gsz[self] >= MS - (metaCount + 1)
@@ -2347,77 +2154,46 @@ FB_check(self) == /\ pc[self] = "FB_check"
                              /\ rvBlk' = [rvBlk EXCEPT ![self] = NULL]
                              /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                              /\ sPtr' = [sPtr EXCEPT ![self] = Head(stack[self]).sPtr]
-                             /\ sCtr' = [sCtr EXCEPT ![self] = Head(stack[self]).sCtr]
                              /\ sPred' = [sPred EXCEPT ![self] = Head(stack[self]).sPred]
                              /\ nxt' = [nxt EXCEPT ![self] = Head(stack[self]).nxt]
                              /\ gsz' = [gsz EXCEPT ![self] = Head(stack[self]).gsz]
                              /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                         ELSE /\ nxt' = [nxt EXCEPT ![self] = sPtr[self] + gsz[self]]
-                             /\ pc' = [pc EXCEPT ![self] = "FB_pre"]
+                             /\ pc' = [pc EXCEPT ![self] = "FB_cas"]
                              /\ UNCHANGED << guardDepth, rvBlk, stack, gsz, 
-                                             sPtr, sCtr, sPred >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                                             sPtr, sPred >>
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, irqActive, rvMeta, rvIdx, live, 
-                                  held, stolenOutstanding, rm, tPtr, tCtr, 
-                                  tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                  stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                  bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                  qi, qpop, qdef, qclaimed, gc, gk, gtail, asz, 
-                                  ameta, ablk, areserved, da, dmi, dtarget, 
-                                  ops, asel, dsel, iops, iasel, idsel >>
-
-FB_pre(self) == /\ pc[self] = "FB_pre"
-                /\ IF FrontierMode = "pre_cas_backlink"
-                      THEN /\ Assert(~InUserRegion(nxt[self]), 
-                                     "Failure of assertion at line 466, column 9.")
-                           /\ hdrPrev' = [hdrPrev EXCEPT ![nxt[self]] = sPtr[self]]
-                      ELSE /\ TRUE
-                           /\ UNCHANGED hdrPrev
-                /\ pc' = [pc EXCEPT ![self] = "FB_cas"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, mState, 
-                                mPtr, mSize, mShard, metaCount, mgrActive, 
-                                mgrTrimming, mgrFree, bins, pending, 
-                                pendingCount, windowOpen, reclaimBusy, 
-                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                live, held, stolenOutstanding, stack, rm, tPtr, 
-                                tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                rs, stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                iops, iasel, idsel >>
+                                  held, stolenOutstanding, rm, tPtr, tPred, 
+                                  tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                  batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                  qclaimed, gc, gk, gtail, asz, ameta, ablk, 
+                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                  iops, iasel, idsel >>
 
 FB_cas(self) == /\ pc[self] = "FB_cas"
-                /\ IF fwPtr = sPtr[self] /\ fwCtr = sCtr[self] /\ fwPred = sPred[self]
+                /\ IF fwPtr = sPtr[self] /\ fwPred = sPred[self]
                       THEN /\ fwPtr' = nxt[self]
-                           /\ fwCtr' = (IF FrontierMode = "packed" THEN fwCtr ELSE fwCtr + 1)
-                           /\ fwPred' = (IF FrontierMode = "packed" THEN sPtr[self] ELSE NULL)
-                           /\ IF FrontierMode = "pre_cas_backlink"
-                                 THEN /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
-                                 ELSE /\ TRUE
-                                      /\ UNCHANGED guardDepth
-                           /\ IF ~FixedBoundary
-                                 THEN /\ pc' = [pc EXCEPT ![self] = "FB_size"]
-                                 ELSE /\ pc' = [pc EXCEPT ![self] = "FB_recheck"]
-                           /\ UNCHANGED << sPtr, sCtr, sPred >>
+                           /\ fwPred' = sPtr[self]
+                           /\ pc' = [pc EXCEPT ![self] = "FB_recheck"]
+                           /\ UNCHANGED << sPtr, sPred >>
                       ELSE /\ sPtr' = [sPtr EXCEPT ![self] = fwPtr]
-                           /\ sCtr' = [sCtr EXCEPT ![self] = fwCtr]
                            /\ sPred' = [sPred EXCEPT ![self] = fwPred]
                            /\ pc' = [pc EXCEPT ![self] = "FB_check"]
-                           /\ UNCHANGED << fwPtr, fwCtr, fwPred, guardDepth >>
+                           /\ UNCHANGED << fwPtr, fwPred >>
                 /\ UNCHANGED << hdrMeta, hdrSize, hdrPrev, mState, mPtr, mSize, 
                                 mShard, metaCount, mgrActive, mgrTrimming, 
                                 mgrFree, bins, pending, pendingCount, 
-                                windowOpen, reclaimBusy, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                windowOpen, reclaimBusy, guardDepth, irqActive, 
+                                rvMeta, rvIdx, rvBlk, live, held, 
+                                stolenOutstanding, stack, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
                                 qclaimed, gc, gk, gtail, gsz, nxt, asz, ameta, 
                                 ablk, areserved, da, dmi, dtarget, ops, asel, 
                                 dsel, iops, iasel, idsel >>
@@ -2426,31 +2202,29 @@ FB_recheck(self) == /\ pc[self] = "FB_recheck"
                     /\ IF nxt[self] < MS - (metaCount + 1)
                           THEN /\ pc' = [pc EXCEPT ![self] = "FB_size"]
                           ELSE /\ pc' = [pc EXCEPT ![self] = "FB_undo"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, guardDepth, irqActive, rvMeta, 
                                     rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                    asz, ameta, ablk, areserved, da, dmi, 
-                                    dtarget, ops, asel, dsel, iops, iasel, 
-                                    idsel >>
+                                    stolenOutstanding, stack, rm, tPtr, tPred, 
+                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                    stolen, batch, nstolen, cand, bsPtr, 
+                                    bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                    qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                    gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                    ablk, areserved, da, dmi, dtarget, ops, 
+                                    asel, dsel, iops, iasel, idsel >>
 
 FB_undo(self) == /\ pc[self] = "FB_undo"
-                 /\ IF fwPtr = nxt[self] /\ fwPred = sPtr[self] /\ fwCtr = sCtr[self]
+                 /\ IF fwPtr = nxt[self] /\ fwPred = sPtr[self]
                        THEN /\ fwPtr' = sPtr[self]
                             /\ fwPred' = sPred[self]
                             /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
                             /\ rvBlk' = [rvBlk EXCEPT ![self] = NULL]
                             /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                             /\ sPtr' = [sPtr EXCEPT ![self] = Head(stack[self]).sPtr]
-                            /\ sCtr' = [sCtr EXCEPT ![self] = Head(stack[self]).sCtr]
                             /\ sPred' = [sPred EXCEPT ![self] = Head(stack[self]).sPred]
                             /\ nxt' = [nxt EXCEPT ![self] = Head(stack[self]).nxt]
                             /\ gsz' = [gsz EXCEPT ![self] = Head(stack[self]).gsz]
@@ -2459,78 +2233,65 @@ FB_undo(self) == /\ pc[self] = "FB_undo"
                                   THEN /\ pc' = [pc EXCEPT ![self] = "FB_size"]
                                   ELSE /\ pc' = [pc EXCEPT ![self] = "FB_undo"]
                             /\ UNCHANGED << fwPtr, fwPred, guardDepth, rvBlk, 
-                                            stack, gsz, sPtr, sCtr, sPred, nxt >>
-                 /\ UNCHANGED << fwCtr, hdrMeta, hdrSize, hdrPrev, mState, 
-                                 mPtr, mSize, mShard, metaCount, mgrActive, 
+                                            stack, gsz, sPtr, sPred, nxt >>
+                 /\ UNCHANGED << hdrMeta, hdrSize, hdrPrev, mState, mPtr, 
+                                 mSize, mShard, metaCount, mgrActive, 
                                  mgrTrimming, mgrFree, bins, pending, 
                                  pendingCount, windowOpen, reclaimBusy, 
                                  irqActive, rvMeta, rvIdx, live, held, 
-                                 stolenOutstanding, rm, tPtr, tCtr, tPred, 
-                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
-                                 batch, nstolen, cand, bsPtr, bsCtr, bsPred, 
-                                 bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
-                                 qpop, qdef, qclaimed, gc, gk, gtail, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                 tMi, tPP, xc, xk, xshrunk, rs, stolen, batch, 
+                                 nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, asz, ameta, ablk, 
+                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                 iops, iasel, idsel >>
 
 FB_size(self) == /\ pc[self] = "FB_size"
                  /\ Assert(~InUserRegion(sPtr[self]), 
-                           "Failure of assertion at line 491, column 5.")
+                           "Failure of assertion at line 450, column 5.")
                  /\ hdrSize' = [hdrSize EXCEPT ![sPtr[self]] = gsz[self]]
                  /\ pc' = [pc EXCEPT ![self] = "FB_link"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrPrev, 
-                                 mState, mPtr, mSize, mShard, metaCount, 
-                                 mgrActive, mgrTrimming, mgrFree, bins, 
-                                 pending, pendingCount, windowOpen, 
-                                 reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                 rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                 stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                 xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                 cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                 qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                 dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                 idsel >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrPrev, mState, mPtr, 
+                                 mSize, mShard, metaCount, mgrActive, 
+                                 mgrTrimming, mgrFree, bins, pending, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                 live, held, stolenOutstanding, stack, rm, 
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 FB_link(self) == /\ pc[self] = "FB_link"
-                 /\ IF FrontierMode = "post_cas_hint"
-                       THEN /\ Assert(~InUserRegion(nxt[self]), 
-                                      "Failure of assertion at line 495, column 9.")
-                            /\ hdrPrev' = [hdrPrev EXCEPT ![nxt[self]] = sPtr[self]]
-                       ELSE /\ IF FrontierMode = "packed"
-                                  THEN /\ hdrPrev' = [hdrPrev EXCEPT ![sPtr[self]] = sPred[self]]
-                                  ELSE /\ TRUE
-                                       /\ UNCHANGED hdrPrev
-                 /\ IF FrontierMode # "pre_cas_backlink"
-                       THEN /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
-                       ELSE /\ TRUE
-                            /\ UNCHANGED guardDepth
+                 /\ hdrPrev' = [hdrPrev EXCEPT ![sPtr[self]] = sPred[self]]
+                 /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
                  /\ rvBlk' = [rvBlk EXCEPT ![self] = sPtr[self]]
                  /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                  /\ sPtr' = [sPtr EXCEPT ![self] = Head(stack[self]).sPtr]
-                 /\ sCtr' = [sCtr EXCEPT ![self] = Head(stack[self]).sCtr]
                  /\ sPred' = [sPred EXCEPT ![self] = Head(stack[self]).sPred]
                  /\ nxt' = [nxt EXCEPT ![self] = Head(stack[self]).nxt]
                  /\ gsz' = [gsz EXCEPT ![self] = Head(stack[self]).gsz]
                  /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 mState, mPtr, mSize, mShard, metaCount, 
-                                 mgrActive, mgrTrimming, mgrFree, bins, 
-                                 pending, pendingCount, windowOpen, 
-                                 reclaimBusy, irqActive, rvMeta, rvIdx, live, 
-                                 held, stolenOutstanding, rm, tPtr, tCtr, 
-                                 tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, mState, mPtr, 
+                                 mSize, mShard, metaCount, mgrActive, 
+                                 mgrTrimming, mgrFree, bins, pending, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 irqActive, rvMeta, rvIdx, live, held, 
+                                 stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                 tMi, tPP, xc, xk, xshrunk, rs, stolen, batch, 
+                                 nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                 wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, asz, ameta, ablk, 
+                                 areserved, da, dmi, dtarget, ops, asel, dsel, 
+                                 iops, iasel, idsel >>
 
-GetEmptyBlock(self) == FB_load(self) \/ FB_check(self) \/ FB_pre(self)
-                          \/ FB_cas(self) \/ FB_recheck(self)
-                          \/ FB_undo(self) \/ FB_size(self)
-                          \/ FB_link(self)
+GetEmptyBlock(self) == FB_load(self) \/ FB_check(self) \/ FB_cas(self)
+                          \/ FB_recheck(self) \/ FB_undo(self)
+                          \/ FB_size(self) \/ FB_link(self)
 
 AL_window(self) == /\ pc[self] = "AL_window"
                    /\ /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "MaybeWindow",
@@ -2541,19 +2302,19 @@ AL_window(self) == /\ pc[self] = "AL_window"
                       /\ wforce' = [wforce EXCEPT ![self] = FALSE]
                       /\ ws' = [ws EXCEPT ![self] = CpuOf(self)]
                    /\ pc' = [pc EXCEPT ![self] = "MW_count"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                   xk, xshrunk, rs, stolen, batch, nstolen, 
-                                   cand, bsPtr, bsCtr, bsPred, bpp, pm, wa, 
-                                   qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                   gk, gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                   ameta, ablk, areserved, da, dmi, dtarget, 
-                                   ops, asel, dsel, iops, iasel, idsel >>
+                                   rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, wa, qsz, qshard, qi, 
+                                   qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                   sPtr, sPred, nxt, asz, ameta, ablk, 
+                                   areserved, da, dmi, dtarget, ops, asel, 
+                                   dsel, iops, iasel, idsel >>
 
 AL_search(self) == /\ pc[self] = "AL_search"
                    /\ /\ qshard' = [qshard EXCEPT ![self] = CpuOf(self)]
@@ -2572,19 +2333,18 @@ AL_search(self) == /\ pc[self] = "AL_search"
                    /\ qdef' = [qdef EXCEPT ![self] = NULL]
                    /\ qclaimed' = [qclaimed EXCEPT ![self] = NULL]
                    /\ pc' = [pc EXCEPT ![self] = "SR_restart"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                   xk, xshrunk, rs, stolen, batch, nstolen, 
-                                   cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                   wforce, wa, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                   sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                   dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                                   rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, wa, gc, 
+                                   gk, gtail, gsz, sPtr, sPred, nxt, asz, 
+                                   ameta, ablk, areserved, da, dmi, dtarget, 
+                                   ops, asel, dsel, iops, iasel, idsel >>
 
 AL_found(self) == /\ pc[self] = "AL_found"
                   /\ IF rvMeta[self] # NULL
@@ -2603,54 +2363,50 @@ AL_found(self) == /\ pc[self] = "AL_found"
                              /\ gtail' = [gtail EXCEPT ![self] = 0]
                              /\ pc' = [pc EXCEPT ![self] = "GM_load"]
                              /\ UNCHANGED << ameta, ablk >>
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                  xk, xshrunk, rs, stolen, batch, nstolen, 
-                                  cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                  wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                  qclaimed, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                  iops, iasel, idsel >>
+                                  rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  xshrunk, rs, stolen, batch, nstolen, cand, 
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gsz, sPtr, 
+                                  sPred, nxt, asz, areserved, da, dmi, dtarget, 
+                                  ops, asel, dsel, iops, iasel, idsel >>
 
 AL_reserved(self) == /\ pc[self] = "AL_reserved"
                      /\ IF rvIdx[self] = NULL
                            THEN /\ pc' = [pc EXCEPT ![self] = "AL_out"]
-                                /\ UNCHANGED << stack, gsz, sPtr, sCtr, sPred, 
-                                                nxt, areserved >>
+                                /\ UNCHANGED << stack, gsz, sPtr, sPred, nxt, 
+                                                areserved >>
                            ELSE /\ areserved' = [areserved EXCEPT ![self] = rvIdx[self]]
                                 /\ /\ gsz' = [gsz EXCEPT ![self] = asz[self]]
                                    /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "GetEmptyBlock",
                                                                             pc        |->  "AL_frontier",
                                                                             sPtr      |->  sPtr[self],
-                                                                            sCtr      |->  sCtr[self],
                                                                             sPred     |->  sPred[self],
                                                                             nxt       |->  nxt[self],
                                                                             gsz       |->  gsz[self] ] >>
                                                                         \o stack[self]]
                                 /\ sPtr' = [sPtr EXCEPT ![self] = 0]
-                                /\ sCtr' = [sCtr EXCEPT ![self] = 0]
                                 /\ sPred' = [sPred EXCEPT ![self] = NULL]
                                 /\ nxt' = [nxt EXCEPT ![self] = 0]
                                 /\ pc' = [pc EXCEPT ![self] = "FB_load"]
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrActive, mgrTrimming, 
-                                     mgrFree, bins, pending, pendingCount, 
-                                     windowOpen, reclaimBusy, guardDepth, 
-                                     irqActive, rvMeta, rvIdx, rvBlk, live, 
-                                     held, stolenOutstanding, rm, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                     qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                     gk, gtail, asz, ameta, ablk, da, dmi, 
-                                     dtarget, ops, asel, dsel, iops, iasel, 
-                                     idsel >>
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrActive, mgrTrimming, mgrFree, bins, 
+                                     pending, pendingCount, windowOpen, 
+                                     reclaimBusy, guardDepth, irqActive, 
+                                     rvMeta, rvIdx, rvBlk, live, held, 
+                                     stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                     tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                     batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                     pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                     qdef, qclaimed, gc, gk, gtail, asz, ameta, 
+                                     ablk, da, dmi, dtarget, ops, asel, dsel, 
+                                     iops, iasel, idsel >>
 
 AL_frontier(self) == /\ pc[self] = "AL_frontier"
                      /\ IF rvBlk[self] # NULL
@@ -2667,20 +2423,19 @@ AL_frontier(self) == /\ pc[self] = "AL_frontier"
                                    /\ ws' = [ws EXCEPT ![self] = CpuOf(self)]
                                 /\ pc' = [pc EXCEPT ![self] = "MW_count"]
                                 /\ UNCHANGED << ameta, ablk >>
-                     /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                     hdrPrev, mState, mPtr, mSize, mShard, 
-                                     metaCount, mgrActive, mgrTrimming, 
-                                     mgrFree, bins, pending, pendingCount, 
-                                     windowOpen, reclaimBusy, guardDepth, 
-                                     irqActive, rvMeta, rvIdx, rvBlk, live, 
-                                     held, stolenOutstanding, rm, tPtr, tCtr, 
-                                     tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                     rs, stolen, batch, nstolen, cand, bsPtr, 
-                                     bsCtr, bsPred, bpp, pm, wa, qsz, qshard, 
-                                     qi, qpop, qdef, qclaimed, gc, gk, gtail, 
-                                     gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                     areserved, da, dmi, dtarget, ops, asel, 
-                                     dsel, iops, iasel, idsel >>
+                     /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                     mState, mPtr, mSize, mShard, metaCount, 
+                                     mgrActive, mgrTrimming, mgrFree, bins, 
+                                     pending, pendingCount, windowOpen, 
+                                     reclaimBusy, guardDepth, irqActive, 
+                                     rvMeta, rvIdx, rvBlk, live, held, 
+                                     stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                     tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                     batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                     pm, wa, qsz, qshard, qi, qpop, qdef, 
+                                     qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                     nxt, asz, areserved, da, dmi, dtarget, 
+                                     ops, asel, dsel, iops, iasel, idsel >>
 
 AL_search2(self) == /\ pc[self] = "AL_search2"
                     /\ /\ qshard' = [qshard EXCEPT ![self] = CpuOf(self)]
@@ -2699,19 +2454,19 @@ AL_search2(self) == /\ pc[self] = "AL_search2"
                     /\ qdef' = [qdef EXCEPT ![self] = NULL]
                     /\ qclaimed' = [qclaimed EXCEPT ![self] = NULL]
                     /\ pc' = [pc EXCEPT ![self] = "SR_restart"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, guardDepth, irqActive, rvMeta, 
                                     rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, rm, tPtr, tCtr, tPred, 
-                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                    stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                    bsPred, bpp, pm, ws, wforce, wa, gc, gk, 
-                                    gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                    ameta, ablk, areserved, da, dmi, dtarget, 
-                                    ops, asel, dsel, iops, iasel, idsel >>
+                                    stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                    tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                    batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                    pm, ws, wforce, wa, gc, gk, gtail, gsz, 
+                                    sPtr, sPred, nxt, asz, ameta, ablk, 
+                                    areserved, da, dmi, dtarget, ops, asel, 
+                                    dsel, iops, iasel, idsel >>
 
 AL_found2(self) == /\ pc[self] = "AL_found2"
                    /\ IF rvMeta[self] # NULL
@@ -2723,20 +2478,19 @@ AL_found2(self) == /\ pc[self] = "AL_found2"
                                                                    \o stack[self]]
                               /\ wa' = [wa EXCEPT ![self] = 1]
                               /\ pc' = [pc EXCEPT ![self] = "WA_loop"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                   xk, xshrunk, rs, stolen, batch, nstolen, 
-                                   cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                   wforce, qsz, qshard, qi, qpop, qdef, 
-                                   qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
-                                   sPred, nxt, asz, ameta, ablk, areserved, da, 
-                                   dmi, dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                                   rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, qsz, 
+                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                   gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                   ablk, areserved, da, dmi, dtarget, ops, 
+                                   asel, dsel, iops, iasel, idsel >>
 
 AL_search3(self) == /\ pc[self] = "AL_search3"
                     /\ /\ qshard' = [qshard EXCEPT ![self] = CpuOf(self)]
@@ -2755,19 +2509,19 @@ AL_search3(self) == /\ pc[self] = "AL_search3"
                     /\ qdef' = [qdef EXCEPT ![self] = NULL]
                     /\ qclaimed' = [qclaimed EXCEPT ![self] = NULL]
                     /\ pc' = [pc EXCEPT ![self] = "SR_restart"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mState, mPtr, mSize, mShard, 
-                                    metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                    bins, pending, pendingCount, windowOpen, 
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mState, mPtr, mSize, mShard, metaCount, 
+                                    mgrActive, mgrTrimming, mgrFree, bins, 
+                                    pending, pendingCount, windowOpen, 
                                     reclaimBusy, guardDepth, irqActive, rvMeta, 
                                     rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, rm, tPtr, tCtr, tPred, 
-                                    tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                    stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                    bsPred, bpp, pm, ws, wforce, wa, gc, gk, 
-                                    gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                    ameta, ablk, areserved, da, dmi, dtarget, 
-                                    ops, asel, dsel, iops, iasel, idsel >>
+                                    stolenOutstanding, rm, tPtr, tPred, tPrev, 
+                                    tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                    batch, nstolen, cand, bsPtr, bsPred, bpp, 
+                                    pm, ws, wforce, wa, gc, gk, gtail, gsz, 
+                                    sPtr, sPred, nxt, asz, ameta, ablk, 
+                                    areserved, da, dmi, dtarget, ops, asel, 
+                                    dsel, iops, iasel, idsel >>
 
 AL_found3(self) == /\ pc[self] = "AL_found3"
                    /\ IF rvMeta[self] # NULL
@@ -2779,20 +2533,19 @@ AL_found3(self) == /\ pc[self] = "AL_found3"
                                                                           rm        |->  rm[self] ] >>
                                                                       \o stack[self]]
                               /\ pc' = [pc EXCEPT ![self] = "RM_state"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                    xshrunk, rs, stolen, batch, nstolen, cand, 
-                                   bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                   wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                   gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                   asz, ameta, ablk, areserved, da, dmi, 
-                                   dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                   gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                   ablk, areserved, da, dmi, dtarget, ops, 
+                                   asel, dsel, iops, iasel, idsel >>
 
 AL_reuse(self) == /\ pc[self] = "AL_reuse"
                   /\ ameta' = [ameta EXCEPT ![self] = rvMeta[self]]
@@ -2803,95 +2556,94 @@ AL_reuse(self) == /\ pc[self] = "AL_reuse"
                                                               rm        |->  rm[self] ] >>
                                                           \o stack[self]]
                   /\ pc' = [pc EXCEPT ![self] = "RM_state"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pending, pendingCount, windowOpen, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, pendingCount, windowOpen, 
                                   reclaimBusy, guardDepth, irqActive, rvMeta, 
                                   rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, areserved, da, dmi, dtarget, ops, asel, 
-                                  dsel, iops, iasel, idsel >>
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, areserved, 
+                                  da, dmi, dtarget, ops, asel, dsel, iops, 
+                                  iasel, idsel >>
 
 AL_fin(self) == /\ pc[self] = "AL_fin"
                 /\ Assert(~InUserRegion(ablk[self]), 
-                          "Failure of assertion at line 536, column 5.")
+                          "Failure of assertion at line 490, column 5.")
                 /\ Assert(hdrSize[ablk[self]] = asz[self], 
-                          "Failure of assertion at line 537, column 5.")
+                          "Failure of assertion at line 491, column 5.")
                 /\ hdrMeta' = [hdrMeta EXCEPT ![ablk[self]] = ameta[self]]
                 /\ pc' = [pc EXCEPT ![self] = "AL_inuse"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrSize, hdrPrev, mState, 
-                                mPtr, mSize, mShard, metaCount, mgrActive, 
+                /\ UNCHANGED << fwPtr, fwPred, hdrSize, hdrPrev, mState, mPtr, 
+                                mSize, mShard, metaCount, mgrActive, 
                                 mgrTrimming, mgrFree, bins, pending, 
                                 pendingCount, windowOpen, reclaimBusy, 
                                 guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                 live, held, stolenOutstanding, stack, rm, tPtr, 
-                                tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                rs, stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                iops, iasel, idsel >>
+                                tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                bpp, pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
+                                sPred, nxt, asz, ameta, ablk, areserved, da, 
+                                dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                idsel >>
 
 AL_inuse(self) == /\ pc[self] = "AL_inuse"
                   /\ mState' = [mState EXCEPT ![ameta[self]] = "IN_USE"]
                   /\ mPtr' = [mPtr EXCEPT ![ameta[self]] = ablk[self]]
                   /\ pc' = [pc EXCEPT ![self] = "AL_fields"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mSize, mShard, metaCount, mgrActive, 
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mSize, mShard, metaCount, mgrActive, 
                                   mgrTrimming, mgrFree, bins, pending, 
                                   pendingCount, windowOpen, reclaimBusy, 
                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                   live, held, stolenOutstanding, stack, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                  tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
-                                  dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                                  bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                  qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                  gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                  ablk, areserved, da, dmi, dtarget, ops, asel, 
+                                  dsel, iops, iasel, idsel >>
 
 AL_fields(self) == /\ pc[self] = "AL_fields"
                    /\ mSize' = [mSize EXCEPT ![ameta[self]] = hdrSize[ablk[self]]]
                    /\ mShard' = [mShard EXCEPT ![ameta[self]] = CpuOf(self)]
                    /\ pc' = [pc EXCEPT ![self] = "AL_live"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, metaCount, mgrActive, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, metaCount, mgrActive, 
                                    mgrTrimming, mgrFree, bins, pending, 
                                    pendingCount, windowOpen, reclaimBusy, 
                                    guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
                                    live, held, stolenOutstanding, stack, rm, 
-                                   tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
                                    xshrunk, rs, stolen, batch, nstolen, cand, 
-                                   bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                   wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                   gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                   asz, ameta, ablk, areserved, da, dmi, 
-                                   dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
+                                   bsPtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
+                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
+                                   gtail, gsz, sPtr, sPred, nxt, asz, ameta, 
+                                   ablk, areserved, da, dmi, dtarget, ops, 
+                                   asel, dsel, iops, iasel, idsel >>
 
 AL_live(self) == /\ pc[self] = "AL_live"
                  /\ live' = (live \cup {[start |-> ablk[self], size |-> asz[self]]})
                  /\ held' = [held EXCEPT ![self] = held[self] \cup {[start |-> ablk[self], size |-> asz[self]]}]
                  /\ pc' = [pc EXCEPT ![self] = "AL_out"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, stolenOutstanding, stack, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 AL_out(self) == /\ pc[self] = "AL_out"
                 /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -2900,18 +2652,18 @@ AL_out(self) == /\ pc[self] = "AL_out"
                 /\ areserved' = [areserved EXCEPT ![self] = Head(stack[self]).areserved]
                 /\ asz' = [asz EXCEPT ![self] = Head(stack[self]).asz]
                 /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                xshrunk, rs, stolen, batch, nstolen, cand, 
-                                bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                gtail, gsz, sPtr, sCtr, sPred, nxt, da, dmi, 
-                                dtarget, ops, asel, dsel, iops, iasel, idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                da, dmi, dtarget, ops, asel, dsel, iops, iasel, 
+                                idsel >>
 
 Allocate(self) == AL_window(self) \/ AL_search(self) \/ AL_found(self)
                      \/ AL_reserved(self) \/ AL_frontier(self)
@@ -2924,173 +2676,128 @@ DA_user(self) == /\ pc[self] = "DA_user"
                  /\ live' = live \ {da[self]}
                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
                  /\ pc' = [pc EXCEPT ![self] = "DA_idx"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, irqActive, rvMeta, rvIdx, rvBlk, 
                                  held, stolenOutstanding, stack, rm, tPtr, 
-                                 tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                 rs, stolen, batch, nstolen, cand, bsPtr, 
-                                 bsCtr, bsPred, bpp, pm, ws, wforce, wa, qsz, 
-                                 qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                                 tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                 stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                 bpp, pm, ws, wforce, wa, qsz, qshard, qi, 
+                                 qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, asz, ameta, ablk, areserved, 
+                                 da, dmi, dtarget, ops, asel, dsel, iops, 
+                                 iasel, idsel >>
 
 DA_idx(self) == /\ pc[self] = "DA_idx"
                 /\ dmi' = [dmi EXCEPT ![self] = hdrMeta[da[self].start]]
                 /\ pc' = [pc EXCEPT ![self] = "DA_count_check"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                stack, rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, 
-                                xc, xk, xshrunk, rs, stolen, batch, nstolen, 
-                                cand, bsPtr, bsCtr, bsPred, bpp, pm, ws, 
-                                wforce, wa, qsz, qshard, qi, qpop, qdef, 
-                                qclaimed, gc, gk, gtail, gsz, sPtr, sCtr, 
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, stack, rm, tPtr, 
+                                tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
+                                stolen, batch, nstolen, cand, bsPtr, bsPred, 
+                                bpp, pm, ws, wforce, wa, qsz, qshard, qi, qpop, 
+                                qdef, qclaimed, gc, gk, gtail, gsz, sPtr, 
                                 sPred, nxt, asz, ameta, ablk, areserved, da, 
                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 DA_count_check(self) == /\ pc[self] = "DA_count_check"
                         /\ Assert(dmi[self] # NULL /\ dmi[self] < metaCount, 
-                                  "Failure of assertion at line 562, column 5.")
+                                  "Failure of assertion at line 516, column 5.")
                         /\ pc' = [pc EXCEPT ![self] = "DA_lock"]
-                        /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
+                        /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, 
                                         hdrPrev, mState, mPtr, mSize, mShard, 
                                         metaCount, mgrActive, mgrTrimming, 
                                         mgrFree, bins, pending, pendingCount, 
                                         windowOpen, reclaimBusy, guardDepth, 
                                         irqActive, rvMeta, rvIdx, rvBlk, live, 
                                         held, stolenOutstanding, stack, rm, 
-                                        tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                        xk, xshrunk, rs, stolen, batch, 
-                                        nstolen, cand, bsPtr, bsCtr, bsPred, 
-                                        bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                        qi, qpop, qdef, qclaimed, gc, gk, 
-                                        gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                        asz, ameta, ablk, areserved, da, dmi, 
-                                        dtarget, ops, asel, dsel, iops, iasel, 
-                                        idsel >>
+                                        tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                        xshrunk, rs, stolen, batch, nstolen, 
+                                        cand, bsPtr, bsPred, bpp, pm, ws, 
+                                        wforce, wa, qsz, qshard, qi, qpop, 
+                                        qdef, qclaimed, gc, gk, gtail, gsz, 
+                                        sPtr, sPred, nxt, asz, ameta, ablk, 
+                                        areserved, da, dmi, dtarget, ops, asel, 
+                                        dsel, iops, iasel, idsel >>
 
 DA_lock(self) == /\ pc[self] = "DA_lock"
                  /\ Assert(mState[dmi[self]] = "IN_USE" /\ mPtr[dmi[self]] = da[self].start, 
-                           "Failure of assertion at line 564, column 5.")
+                           "Failure of assertion at line 518, column 5.")
                  /\ mState' = [mState EXCEPT ![dmi[self]] = "LOCKED"]
                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
                  /\ pc' = [pc EXCEPT ![self] = "DA_pending"]
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                 mgrActive, mgrTrimming, mgrFree, bins, 
-                                 pending, pendingCount, windowOpen, 
-                                 reclaimBusy, irqActive, rvMeta, rvIdx, rvBlk, 
-                                 live, held, stolenOutstanding, stack, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                 ameta, ablk, areserved, da, dmi, dtarget, ops, 
-                                 asel, dsel, iops, iasel, idsel >>
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mPtr, mSize, mShard, metaCount, mgrActive, 
+                                 mgrTrimming, mgrFree, bins, pending, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 irqActive, rvMeta, rvIdx, rvBlk, live, held, 
+                                 stolenOutstanding, stack, rm, tPtr, tPred, 
+                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                 batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 DA_pending(self) == /\ pc[self] = "DA_pending"
                     /\ mState' = [mState EXCEPT ![dmi[self]] = "DEALLOCATED_PENDING"]
                     /\ dtarget' = [dtarget EXCEPT ![self] = mShard[dmi[self]]]
-                    /\ IF PendingCountFirst
-                          THEN /\ pc' = [pc EXCEPT ![self] = "DA_count1"]
-                          ELSE /\ pc' = [pc EXCEPT ![self] = "DA_push0"]
-                    /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                    hdrPrev, mPtr, mSize, mShard, metaCount, 
-                                    mgrActive, mgrTrimming, mgrFree, bins, 
-                                    pending, pendingCount, windowOpen, 
-                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                    rvIdx, rvBlk, live, held, 
-                                    stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                    tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                    rs, stolen, batch, nstolen, cand, bsPtr, 
-                                    bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                    qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                    gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                    asz, ameta, ablk, areserved, da, dmi, ops, 
-                                    asel, dsel, iops, iasel, idsel >>
+                    /\ pc' = [pc EXCEPT ![self] = "DA_count"]
+                    /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                    mPtr, mSize, mShard, metaCount, mgrActive, 
+                                    mgrTrimming, mgrFree, bins, pending, 
+                                    pendingCount, windowOpen, reclaimBusy, 
+                                    guardDepth, irqActive, rvMeta, rvIdx, 
+                                    rvBlk, live, held, stolenOutstanding, 
+                                    stack, rm, tPtr, tPred, tPrev, tMi, tPP, 
+                                    xc, xk, xshrunk, rs, stolen, batch, 
+                                    nstolen, cand, bsPtr, bsPred, bpp, pm, ws, 
+                                    wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                    qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                    nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                    ops, asel, dsel, iops, iasel, idsel >>
 
-DA_push0(self) == /\ pc[self] = "DA_push0"
-                  /\ Assert(~InAnyList(dmi[self]), 
-                            "Failure of assertion at line 572, column 5.")
-                  /\ pending' = [pending EXCEPT ![dtarget[self]] = <<dmi[self]>> \o pending[dtarget[self]]]
-                  /\ pc' = [pc EXCEPT ![self] = "DA_count0"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pendingCount, windowOpen, reclaimBusy, 
-                                  guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                  live, held, stolenOutstanding, stack, rm, 
-                                  tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                  xshrunk, rs, stolen, batch, nstolen, cand, 
-                                  bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                  wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                  gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                  asz, ameta, ablk, areserved, da, dmi, 
+DA_count(self) == /\ pc[self] = "DA_count"
+                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
+                  /\ pendingCount' = [pendingCount EXCEPT ![dtarget[self]] = pendingCount[dtarget[self]] + 1]
+                  /\ pc' = [pc EXCEPT ![self] = "DA_push"]
+                  /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                  mState, mPtr, mSize, mShard, metaCount, 
+                                  mgrActive, mgrTrimming, mgrFree, bins, 
+                                  pending, windowOpen, reclaimBusy, irqActive, 
+                                  rvMeta, rvIdx, rvBlk, live, held, 
+                                  stolenOutstanding, stack, rm, tPtr, tPred, 
+                                  tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                  batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                  ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                  qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                  nxt, asz, ameta, ablk, areserved, da, dmi, 
                                   dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
-DA_count0(self) == /\ pc[self] = "DA_count0"
-                   /\ pendingCount' = [pendingCount EXCEPT ![dtarget[self]] = pendingCount[dtarget[self]] + 1]
-                   /\ pc' = [pc EXCEPT ![self] = "DA_window"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, windowOpen, reclaimBusy, 
-                                   guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
-                                   live, held, stolenOutstanding, stack, rm, 
-                                   tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                   xshrunk, rs, stolen, batch, nstolen, cand, 
-                                   bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, 
-                                   wa, qsz, qshard, qi, qpop, qdef, qclaimed, 
-                                   gc, gk, gtail, gsz, sPtr, sCtr, sPred, nxt, 
-                                   asz, ameta, ablk, areserved, da, dmi, 
-                                   dtarget, ops, asel, dsel, iops, iasel, 
-                                   idsel >>
-
-DA_count1(self) == /\ pc[self] = "DA_count1"
-                   /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] + 1]
-                   /\ pendingCount' = [pendingCount EXCEPT ![dtarget[self]] = pendingCount[dtarget[self]] + 1]
-                   /\ pc' = [pc EXCEPT ![self] = "DA_push1"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, windowOpen, reclaimBusy, 
-                                   irqActive, rvMeta, rvIdx, rvBlk, live, held, 
-                                   stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                   tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                   stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                   bsPred, bpp, pm, ws, wforce, wa, qsz, 
-                                   qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                   gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                   ameta, ablk, areserved, da, dmi, dtarget, 
-                                   ops, asel, dsel, iops, iasel, idsel >>
-
-DA_push1(self) == /\ pc[self] = "DA_push1"
-                  /\ Assert(~InAnyList(dmi[self]), 
-                            "Failure of assertion at line 581, column 5.")
-                  /\ pending' = [pending EXCEPT ![dtarget[self]] = <<dmi[self]>> \o pending[dtarget[self]]]
-                  /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
-                  /\ pc' = [pc EXCEPT ![self] = "DA_window"]
-                  /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                  hdrPrev, mState, mPtr, mSize, mShard, 
-                                  metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                  bins, pendingCount, windowOpen, reclaimBusy, 
-                                  irqActive, rvMeta, rvIdx, rvBlk, live, held, 
-                                  stolenOutstanding, stack, rm, tPtr, tCtr, 
-                                  tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                  stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                  bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                  qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                  sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                  areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                  iops, iasel, idsel >>
+DA_push(self) == /\ pc[self] = "DA_push"
+                 /\ Assert(~InAnyList(dmi[self]), 
+                           "Failure of assertion at line 528, column 5.")
+                 /\ pending' = [pending EXCEPT ![dtarget[self]] = <<dmi[self]>> \o pending[dtarget[self]]]
+                 /\ guardDepth' = [guardDepth EXCEPT ![CpuOf(self)] = guardDepth[CpuOf(self)] - 1]
+                 /\ pc' = [pc EXCEPT ![self] = "DA_window"]
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pendingCount, windowOpen, reclaimBusy, 
+                                 irqActive, rvMeta, rvIdx, rvBlk, live, held, 
+                                 stolenOutstanding, stack, rm, tPtr, tPred, 
+                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                 batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, asz, ameta, ablk, areserved, da, dmi, 
+                                 dtarget, ops, asel, dsel, iops, iasel, idsel >>
 
 DA_window(self) == /\ pc[self] = "DA_window"
                    /\ /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "MaybeWindow",
@@ -3101,19 +2808,19 @@ DA_window(self) == /\ pc[self] = "DA_window"
                       /\ wforce' = [wforce EXCEPT ![self] = FALSE]
                       /\ ws' = [ws EXCEPT ![self] = dtarget[self]]
                    /\ pc' = [pc EXCEPT ![self] = "MW_count"]
-                   /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                   hdrPrev, mState, mPtr, mSize, mShard, 
-                                   metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                   bins, pending, pendingCount, windowOpen, 
+                   /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                   mState, mPtr, mSize, mShard, metaCount, 
+                                   mgrActive, mgrTrimming, mgrFree, bins, 
+                                   pending, pendingCount, windowOpen, 
                                    reclaimBusy, guardDepth, irqActive, rvMeta, 
                                    rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                   rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, 
-                                   xk, xshrunk, rs, stolen, batch, nstolen, 
-                                   cand, bsPtr, bsCtr, bsPred, bpp, pm, wa, 
-                                   qsz, qshard, qi, qpop, qdef, qclaimed, gc, 
-                                   gk, gtail, gsz, sPtr, sCtr, sPred, nxt, asz, 
-                                   ameta, ablk, areserved, da, dmi, dtarget, 
-                                   ops, asel, dsel, iops, iasel, idsel >>
+                                   rm, tPtr, tPred, tPrev, tMi, tPP, xc, xk, 
+                                   xshrunk, rs, stolen, batch, nstolen, cand, 
+                                   bsPtr, bsPred, bpp, pm, wa, qsz, qshard, qi, 
+                                   qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                   sPtr, sPred, nxt, asz, ameta, ablk, 
+                                   areserved, da, dmi, dtarget, ops, asel, 
+                                   dsel, iops, iasel, idsel >>
 
 DA_ret(self) == /\ pc[self] = "DA_ret"
                 /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -3121,24 +2828,22 @@ DA_ret(self) == /\ pc[self] = "DA_ret"
                 /\ dtarget' = [dtarget EXCEPT ![self] = Head(stack[self]).dtarget]
                 /\ da' = [da EXCEPT ![self] = Head(stack[self]).da]
                 /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, irqActive, rvMeta, 
-                                rvIdx, rvBlk, live, held, stolenOutstanding, 
-                                rm, tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                xshrunk, rs, stolen, batch, nstolen, cand, 
-                                bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                gtail, gsz, sPtr, sCtr, sPred, nxt, asz, ameta, 
-                                ablk, areserved, ops, asel, dsel, iops, iasel, 
-                                idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, irqActive, rvMeta, rvIdx, rvBlk, 
+                                live, held, stolenOutstanding, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                asz, ameta, ablk, areserved, ops, asel, dsel, 
+                                iops, iasel, idsel >>
 
 Deallocate(self) == DA_user(self) \/ DA_idx(self) \/ DA_count_check(self)
                        \/ DA_lock(self) \/ DA_pending(self)
-                       \/ DA_push0(self) \/ DA_count0(self)
-                       \/ DA_count1(self) \/ DA_push1(self)
+                       \/ DA_count(self) \/ DA_push(self)
                        \/ DA_window(self) \/ DA_ret(self)
 
 MN_loop(self) == /\ pc[self] = "MN_loop"
@@ -3178,18 +2883,17 @@ MN_loop(self) == /\ pc[self] = "MN_loop"
                             /\ UNCHANGED << held, stack, asz, ameta, ablk, 
                                             areserved, da, dmi, dtarget, ops, 
                                             asel, dsel >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, irqActive, rvMeta, 
                                  rvIdx, rvBlk, live, stolenOutstanding, rm, 
-                                 tPtr, tCtr, tPred, tPrev, tMi, tPP, xc, xk, 
-                                 xshrunk, rs, stolen, batch, nstolen, cand, 
-                                 bsPtr, bsCtr, bsPred, bpp, pm, ws, wforce, wa, 
-                                 qsz, qshard, qi, qpop, qdef, qclaimed, gc, gk, 
-                                 gtail, gsz, sPtr, sCtr, sPred, nxt, iops, 
-                                 iasel, idsel >>
+                                 tPtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
+                                 rs, stolen, batch, nstolen, cand, bsPtr, 
+                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
+                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
+                                 sPtr, sPred, nxt, iops, iasel, idsel >>
 
 Main(self) == MN_loop(self)
 
@@ -3232,34 +2936,33 @@ IQ_loop(self) == /\ pc[self] = "IQ_loop"
                             /\ UNCHANGED << irqActive, held, stack, asz, ameta, 
                                             ablk, areserved, da, dmi, dtarget, 
                                             iops, iasel, idsel >>
-                 /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                 hdrPrev, mState, mPtr, mSize, mShard, 
-                                 metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                 bins, pending, pendingCount, windowOpen, 
+                 /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                 mState, mPtr, mSize, mShard, metaCount, 
+                                 mgrActive, mgrTrimming, mgrFree, bins, 
+                                 pending, pendingCount, windowOpen, 
                                  reclaimBusy, guardDepth, rvMeta, rvIdx, rvBlk, 
-                                 live, stolenOutstanding, rm, tPtr, tCtr, 
-                                 tPred, tPrev, tMi, tPP, xc, xk, xshrunk, rs, 
-                                 stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                 bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                 qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                 sPtr, sCtr, sPred, nxt, ops, asel, dsel >>
+                                 live, stolenOutstanding, rm, tPtr, tPred, 
+                                 tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                 batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                 ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                 qclaimed, gc, gk, gtail, gsz, sPtr, sPred, 
+                                 nxt, ops, asel, dsel >>
 
 IQ_end(self) == /\ pc[self] = "IQ_end"
                 /\ irqActive' = [irqActive EXCEPT ![CpuOf(self)] = FALSE]
                 /\ pc' = [pc EXCEPT ![self] = "IQ_loop"]
-                /\ UNCHANGED << fwPtr, fwCtr, fwPred, hdrMeta, hdrSize, 
-                                hdrPrev, mState, mPtr, mSize, mShard, 
-                                metaCount, mgrActive, mgrTrimming, mgrFree, 
-                                bins, pending, pendingCount, windowOpen, 
-                                reclaimBusy, guardDepth, rvMeta, rvIdx, rvBlk, 
-                                live, held, stolenOutstanding, stack, rm, tPtr, 
-                                tCtr, tPred, tPrev, tMi, tPP, xc, xk, xshrunk, 
-                                rs, stolen, batch, nstolen, cand, bsPtr, bsCtr, 
-                                bsPred, bpp, pm, ws, wforce, wa, qsz, qshard, 
-                                qi, qpop, qdef, qclaimed, gc, gk, gtail, gsz, 
-                                sPtr, sCtr, sPred, nxt, asz, ameta, ablk, 
-                                areserved, da, dmi, dtarget, ops, asel, dsel, 
-                                iops, iasel, idsel >>
+                /\ UNCHANGED << fwPtr, fwPred, hdrMeta, hdrSize, hdrPrev, 
+                                mState, mPtr, mSize, mShard, metaCount, 
+                                mgrActive, mgrTrimming, mgrFree, bins, pending, 
+                                pendingCount, windowOpen, reclaimBusy, 
+                                guardDepth, rvMeta, rvIdx, rvBlk, live, held, 
+                                stolenOutstanding, stack, rm, tPtr, tPred, 
+                                tPrev, tMi, tPP, xc, xk, xshrunk, rs, stolen, 
+                                batch, nstolen, cand, bsPtr, bsPred, bpp, pm, 
+                                ws, wforce, wa, qsz, qshard, qi, qpop, qdef, 
+                                qclaimed, gc, gk, gtail, gsz, sPtr, sPred, nxt, 
+                                asz, ameta, ablk, areserved, da, dmi, dtarget, 
+                                ops, asel, dsel, iops, iasel, idsel >>
 
 Irq(self) == IQ_loop(self) \/ IQ_end(self)
 
@@ -3340,17 +3043,17 @@ ListStatesConsistent ==
 NothingBeyondMetaCount ==
     \A m \in Metas : m >= metaCount => (mState[m] \in {"INVALID", "METADATA_AVAILABLE"} /\ ~InBins(m) /\ ~InPending(m))
 
-\* N5: once no deallocation is between its push and its count update for a shard,
+\* Once no deallocation is between its count update and its push for a shard,
 \*   the count equals the entries queued plus those stolen but not yet subtracted.
 DeallocInFlight(c) ==
-    \E p \in ProcSet : pc[p] \in {"DA_push0", "DA_count0", "DA_count1", "DA_push1"} /\ dtarget[p] = c
+    \E p \in ProcSet : pc[p] = "DA_push" /\ dtarget[p] = c
 PendingCountExact ==
     \A c \in CPUs : ~DeallocInFlight(c) => pendingCount[c] = Len(pending[c]) + stolenOutstanding[c]
 
 ActiveSlotsNonNegative == \A k \in Managers : mgrActive[k] >= 0
 
-\* Frontier/metadata boundary (record i is at unit MS - i).  With FixedBoundary a claim may overlap
-\*   the other region between its CAS and its re-check/undo, so the region check holds at rest.
+\* Frontier/metadata boundary (record i is at unit MS - i).  A claim may overlap the other region
+\*   between its CAS and its re-check/undo, so the region check holds at rest.
 BoundaryInFlight == \E p \in ProcSet : pc[p] \in {"FB_recheck", "FB_undo", "GM_brecheck", "GM_bundo"}
 FrontierBelowMetadata == ~BoundaryInFlight => fwPtr <= MS - metaCount + 1
 

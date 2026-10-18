@@ -1,185 +1,114 @@
 ---------------------------- MODULE LockfreeBitset ----------------------------
 (***************************************************************************)
-(* TLA+ specification of the lock-free bitset class.                      *)
-(*                                                                        *)
-(* Models the atomic fetch_or / fetch_and based acquire/release           *)
-(* operations on a shared atomic word where each bit can be independently *)
-(* acquired and released.                                                 *)
-(*                                                                        *)
-(* C++ operation modeled (acquire):                                       *)
-(*   uint64_t old = words_[w].fetch_or(mask, acquire);                    *)
-(*   return (old & mask) ? ALREADY_ACQUIRED : SUCCESS;                    *)
-(*                                                                        *)
-(* C++ operation modeled (release):                                       *)
-(*   uint64_t old = words_[w].fetch_and(~mask, release);                  *)
-(*   return ((old & mask) == 0) ? ALREADY_RELEASED : SUCCESS;             *)
-(*                                                                        *)
-(* Key properties of fetch_or / fetch_and:                                *)
-(* - Single atomic RMW instruction (LDSET/LDCLR on ARM64 with LSE)       *)
-(* - No CAS loop, no retry, no back_off                                  *)
-(* - Immune to contention from unrelated bits in the same word            *)
-(* - Cannot be preempted mid-operation (hardware atomicity guarantee)     *)
-(*                                                                        *)
-(* Since each operation is a single atomic step, there are no             *)
-(* intermediate states for interrupts to preempt. The interrupt model     *)
-(* verifies that interleaving complete operations from thread context     *)
-(* and ISR context (including on the same bit) preserves all invariants.  *)
-(*                                                                        *)
-(* Since bits in different words use different atomic variables and never  *)
-(* contend, modeling a single word captures all interesting               *)
-(* interleavings. Multi-word is just independent replication.             *)
+(* include/lockfree/bitset: acquire(i) and release(i) on one atomic word.  *)
+(*                                                                         *)
+(*   acquire: old = words_[w].fetch_or(mask, acquire);                     *)
+(*            return (old & mask) ? ALREADY_ACQUIRED : SUCCESS;            *)
+(*   release: old = words_[w].fetch_and(~mask, release);                   *)
+(*            return (old & mask) ? SUCCESS : ALREADY_RELEASED;            *)
+(*                                                                         *)
+(* Contexts are CPU x interrupt depth: a handler can run on a CPU between  *)
+(* any two steps of the code it interrupted, and only the innermost        *)
+(* context of a CPU runs.  Every context may try to acquire any bit (and   *)
+(* may fail); it releases only bits it owns, as callers must.  Ownership   *)
+(* comes from the value each RMW returns, so the invariants check what     *)
+(* callers rely on rather than restating the transitions.                  *)
+(*                                                                         *)
+(* Bits of different words never interact, so one word is enough.          *)
 (***************************************************************************)
-
 EXTENDS Integers, FiniteSets
 
 CONSTANTS
-    NumBits,            \* Number of bits in the modeled word
-    NumCPUs,            \* Number of CPUs (cores)
-    MaxInterruptDepth   \* Maximum interrupt nesting depth (0 = no interrupts)
+    NumBits,            \* bits in the modelled word
+    NumCPUs,
+    MaxInterruptDepth   \* 0 = no interrupts
+
+ASSUME NumBits \in 1..4 /\ NumCPUs \in 1..3 /\ MaxInterruptDepth \in 0..2
+
+CPUs == 1..NumCPUs
+Bits == 1..NumBits
+Depths == 0..MaxInterruptDepth
+Contexts == CPUs \X Depths
 
 VARIABLES
-    \* ===== SHARED ATOMIC WORD =====
-    \* Models one atomic<uint64_t> from the bitset.
-    bits,               \* [1..NumBits -> BOOLEAN]
+    bits,           \* the atomic word
+    activeDepth,    \* per CPU: depth of the running context
+    owners,         \* per bit: contexts whose acquire returned SUCCESS and that have not released it
+    lastRelease     \* ghost: result of the last release by an owner ("ok" / "failed" / "none")
 
-    \* ===== PER-CPU EXECUTION DEPTH =====
-    \* Tracks interrupt nesting. Depth 0 = thread context.
-    \* Depth d > 0 = interrupt handler at nesting level d.
-    activeDepth,        \* [1..NumCPUs -> 0..MaxInterruptDepth]
+vars == <<bits, activeDepth, owners, lastRelease>>
 
-    \* ===== OWNERSHIP TRACKING (verification only) =====
-    \* NOT part of the C++ implementation. Tracks which CPU successfully
-    \* acquired each bit, enabling mutual exclusion verification.
-    bitOwner            \* [1..NumBits -> 0..NumCPUs]
-
-DepthRange == 0..MaxInterruptDepth
-
-vars == <<bits, activeDepth, bitOwner>>
-
------------------------------------------------------------------------------
-(* Type invariant *)
+Running(ctx) == ctx[2] = activeDepth[ctx[1]]
 
 TypeOK ==
-    /\ bits \in [1..NumBits -> BOOLEAN]
-    /\ activeDepth \in [1..NumCPUs -> DepthRange]
-    /\ bitOwner \in [1..NumBits -> 0..NumCPUs]
-
------------------------------------------------------------------------------
-(* Initialization *)
+    /\ bits \in [Bits -> BOOLEAN]
+    /\ activeDepth \in [CPUs -> Depths]
+    /\ owners \in [Bits -> SUBSET Contexts]
+    /\ lastRelease \in {"none", "ok", "failed"}
 
 Init ==
-    /\ bits = [b \in 1..NumBits |-> FALSE]
-    /\ activeDepth = [c \in 1..NumCPUs |-> 0]
-    /\ bitOwner = [b \in 1..NumBits |-> 0]
+    /\ bits = [b \in Bits |-> FALSE]
+    /\ activeDepth = [c \in CPUs |-> 0]
+    /\ owners = [b \in Bits |-> {}]
+    /\ lastRelease = "none"
 
 -----------------------------------------------------------------------------
-(* ACQUIRE OPERATION                                                       *)
-(*                                                                         *)
-(* Models: old = fetch_or(mask, acquire); return (old & mask) ? FAIL : OK  *)
-(*                                                                         *)
-(* fetch_or is a single atomic RMW. It reads the old word value, writes    *)
-(* old | mask, and returns old. If the target bit was already set, the     *)
-(* word is unchanged (1 OR 1 = 1) and the acquire fails. If the bit was   *)
-(* clear, it is now set and the acquire succeeds.                          *)
-(*                                                                         *)
-(* Failed acquires (bit already set) are no-ops that produce no state      *)
-(* change, so they are not modeled as explicit transitions.                *)
+(* One atomic RMW each                                                     *)
 
-Acquire(cpu, bit) ==
-    /\ bits[bit] = FALSE
-    /\ bits' = [bits EXCEPT ![bit] = TRUE]
-    /\ bitOwner' = [bitOwner EXCEPT ![bit] = cpu]
+Acquire(ctx, b) ==
+    /\ Running(ctx)
+    /\ ctx \notin owners[b]
+    /\ bits' = [bits EXCEPT ![b] = TRUE]                                  \* fetch_or
+    /\ owners' = IF bits[b] THEN owners                                   \* old bit set: ALREADY_ACQUIRED
+                 ELSE [owners EXCEPT ![b] = @ \cup {ctx}]                 \* old bit clear: SUCCESS
+    /\ UNCHANGED <<activeDepth, lastRelease>>
+
+Release(ctx, b) ==
+    /\ Running(ctx)
+    /\ ctx \in owners[b]
+    /\ bits' = [bits EXCEPT ![b] = FALSE]                                 \* fetch_and
+    /\ owners' = [owners EXCEPT ![b] = @ \ {ctx}]
+    /\ lastRelease' = IF bits[b] THEN "ok" ELSE "failed"                  \* old bit set: SUCCESS
     /\ UNCHANGED activeDepth
 
 -----------------------------------------------------------------------------
-(* RELEASE OPERATION                                                       *)
-(*                                                                         *)
-(* Models: old = fetch_and(~mask, release); return !(old & mask) ? FAIL:OK *)
-(*                                                                         *)
-(* fetch_and is a single atomic RMW. It reads the old word value, writes   *)
-(* old & ~mask, and returns old. If the target bit was set, it is now      *)
-(* cleared and the release succeeds. If already clear, the word is         *)
-(* unchanged (0 AND ~mask = 0) and the release fails.                      *)
-(*                                                                         *)
-(* Note: any CPU can release any acquired bit (the bitset does not         *)
-(* enforce ownership). The hardware atomicity provides correctness.        *)
+(* Interrupts: a handler starts on a CPU between any two steps, and the    *)
+(* interrupted context resumes when it returns.                            *)
 
-Release(cpu, bit) ==
-    /\ bits[bit] = TRUE
-    /\ bits' = [bits EXCEPT ![bit] = FALSE]
-    /\ bitOwner' = [bitOwner EXCEPT ![bit] = 0]
-    /\ UNCHANGED activeDepth
+FireInterrupt(c) ==
+    /\ activeDepth[c] < MaxInterruptDepth
+    /\ activeDepth' = [activeDepth EXCEPT ![c] = @ + 1]
+    /\ UNCHANGED <<bits, owners, lastRelease>>
 
------------------------------------------------------------------------------
-(* INTERRUPT HANDLING                                                      *)
-(*                                                                         *)
-(* The bitset uses NO interrupt guards. With fetch_or/fetch_and, each     *)
-(* operation is a single atomic instruction that cannot be preempted.      *)
-(* Interrupts can only fire BETWEEN operations, not during them.           *)
-(*                                                                         *)
-(* The interrupt model verifies that interleaving ISR operations with      *)
-(* thread-level operations preserves all safety invariants, including      *)
-(* the scenario where an ISR operates on the same bit as the interrupted   *)
-(* thread was about to operate on.                                         *)
-
-\* Fire an interrupt on a CPU.
-FireInterrupt(cpu) ==
-    /\ activeDepth[cpu] < MaxInterruptDepth
-    /\ activeDepth' = [activeDepth EXCEPT ![cpu] = @ + 1]
-    /\ UNCHANGED <<bits, bitOwner>>
-
-\* Return from interrupt.
-ReturnFromInterrupt(cpu) ==
-    /\ activeDepth[cpu] > 0
-    /\ activeDepth' = [activeDepth EXCEPT ![cpu] = @ - 1]
-    /\ UNCHANGED <<bits, bitOwner>>
-
------------------------------------------------------------------------------
-(* Next state relation *)
+ReturnFromInterrupt(c) ==
+    /\ activeDepth[c] > 0
+    /\ activeDepth' = [activeDepth EXCEPT ![c] = @ - 1]
+    /\ UNCHANGED <<bits, owners, lastRelease>>
 
 Next ==
-    \E cpu \in 1..NumCPUs :
-        \/ \E bit \in 1..NumBits :
-            \/ Acquire(cpu, bit)
-            \/ Release(cpu, bit)
-        \/ FireInterrupt(cpu)
-        \/ ReturnFromInterrupt(cpu)
+    \/ \E ctx \in Contexts, b \in Bits : Acquire(ctx, b) \/ Release(ctx, b)
+    \/ \E c \in CPUs : FireInterrupt(c) \/ ReturnFromInterrupt(c)
 
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-(* SAFETY PROPERTIES                                                       *)
-(*                                                                         *)
-(* These invariants verify that the fetch_or / fetch_and based bitset     *)
-(* maintains consistency under all interleavings of multi-CPU execution   *)
-(* and interrupt preemption.                                               *)
+(* What callers rely on                                                    *)
 
-\* 1. Ownership implies set: if a CPU owns a bit, that bit must be set.
-BitOwnershipConsistent ==
-    \A b \in 1..NumBits :
-        bitOwner[b] # 0 => bits[b] = TRUE
+\* No two contexts hold the same bit
+MutualExclusion == \A b \in Bits : Cardinality(owners[b]) <= 1
 
-\* 2. Set implies ownership: if a bit is set, exactly one CPU owns it.
-\*    Together with (1), gives: bits[b] = TRUE <=> bitOwner[b] # 0
-SetBitsHaveOwner ==
-    \A b \in 1..NumBits :
-        bits[b] = TRUE => bitOwner[b] # 0
+\* A held bit is set, and a set bit is held
+OwnedImpliesSet == \A b \in Bits : owners[b] # {} => bits[b]
+SetImpliesOwned == \A b \in Bits : bits[b] => owners[b] # {}
 
-\* 3. Interrupt depth stays within bounds.
-InterruptDepthValid ==
-    \A cpu \in 1..NumCPUs :
-        activeDepth[cpu] \in DepthRange
+\* The owner's release finds its bit set (SUCCESS)
+ReleaseByOwnerSucceeds == lastRelease # "failed"
 
-\* Combined safety invariant
 Safety ==
     /\ TypeOK
-    /\ BitOwnershipConsistent
-    /\ SetBitsHaveOwner
-    /\ InterruptDepthValid
-
-\* Core safety (without TypeOK)
-CoreSafety ==
-    /\ BitOwnershipConsistent
-    /\ SetBitsHaveOwner
+    /\ MutualExclusion
+    /\ OwnedImpliesSet
+    /\ SetImpliesOwned
+    /\ ReleaseByOwnerSucceeds
 
 =============================================================================

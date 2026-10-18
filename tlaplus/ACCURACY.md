@@ -15,13 +15,13 @@ otherwise.
 
 | Class | Coverage | Deadlock / livelock | Races (C++ and AArch64) | Use-after-free / bad access |
 |-------|----------|---------------------|-------------------------|-----------------------------|
-| `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`fixed_small_live`, `fixed_irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
+| `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`small_live`, `irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
 | `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
-| `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | user writes vs. a stale popper's `load_link`: benign, see below | type-stable arena memory |
+| `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | **fixed:** links in a side table, so a stale `load_link` never reads caller memory | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
-| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `Safety` |
+| `bitset` | `lockfree_bitset/` | TLC deadlock check; single atomic RMWs | single-word RMWs | `MutualExclusion` from the RMW results, with interrupts |
 | `lockfree_bitblock_resource` | argument below + `bitblock_set` model | bounded retries | **fixed:** hint pointers now release/acquire (litmus E) | blocks never freed while live |
-| `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | see that README | litmus B, C, D | reader reachability, see below |
+| `skiplist` (lists, epochs) | `lockfree_skiplist/` (`LockfreeSkiplist.tla`, `upper_levels/`) | `GlobalProgress` (lock-freedom) with 2 threads; per-operation completion with 1 | litmus B, C, D | reader reachability, see below; **fixed:** `remove()` re-walk retargeting a re-inserted node |
 | `skiplist` slot blocks | `lockfree_skiplist/slot_blocks/` | `Termination` | litmus I, J | **fixed:** cross-list block use-after-free |
 | `skiplist` handles, iterators | `lockfree_skiplist/handles/` | `Termination` | acquire on table → generation re-check; retired mark + fence (litmus K) | **fixed:** stale handle resolved to a newer node; **fixed:** iterator `++` read a retired node being freed |
 | `mp_sc_growable_ring_queue` | `lockfree_mp_sc_queue/` | `Termination` | litmus G, H | no write to a freed buffer |
@@ -44,11 +44,11 @@ match the code.
 - **Address bins collapsed to a single bin per size and shard.** This is an over-approximation: any block can be
   found by any search of its size.
 - **Batch frontier reclaim is a single step.** The batch is private to the reclaimer once taken, and frontier
-  rollback is serialised by `frontier_reclaim_in_progress_` (N4), so nothing else can interleave with it.
-- **Undo loops** (`FB_undo`, `GM_bundo`, `GM_breserve`) wait only on a later or deeper context. `fixed_small_live`
-  and `fixed_irq_live` check that they terminate under weak fairness: no livelock.
+  rollback is serialised by `frontier_reclaim_in_progress_`, so nothing else can interleave with it.
+- **Undo loops** (`FB_undo`, `GM_bundo`, `GM_breserve`) wait only on a later or deeper context. `small_live`
+  and `irq_live` check that they terminate under weak fairness: no livelock.
 
-**Cross-CPU interrupts:** `fixed_irq2.cfg` is not exhaustive. `fixed_irq2_small.cfg` (one block size, smaller arena)
+**Cross-CPU interrupts:** `irq2.cfg` is not exhaustive. `irq2_small.cfg` (one block size, smaller arena)
 is exhaustive: no error and no deadlock in 31,195,287 distinct states.
 
 **Weak memory:**
@@ -68,25 +68,27 @@ Everything else is `intrusive_tagged_stack` operations:
 `scribble.cfg` lets owners overwrite link words with any value, which covers both the splice and user data written
 over a free block. It shows that a stale popper's CAS still fails.
 
-**Documented race (benign, not fixed):** `free_block_node::next` is the second word of the block.
-- A popper stalled after loading the head can atomically `load_link` a block that another thread has meanwhile
-  popped, handed to its caller, and started writing with plain stores.
-- That is a data race in C++ terms. It cannot fault, because arena memory stays mapped and the popper's CAS fails on
-  the advanced counter, so the value read is discarded.
-- Making it race-free would mean keeping user data off the link word (a header word per block), or a reclamation
-  scheme. Both cost memory or time this resource is built to avoid.
+**Fixed race:** the free-bin links used to be the second word of each free block.
+- A popper stalled after loading the head could atomically `load_link` a block that another thread had meanwhile
+  popped, handed to its caller, and started writing with plain stores: a data race in C++ terms, reported by TSan
+  in `AllocatorModelTests.ConcurrentStaticArena`.
+- The links now live in a side table after the blocks, one 4-byte `link_cell` per 64-byte block (1/17 of the
+  buffer). A stale popper reads only a cell, which no caller ever writes. The block keeps only its size word, which
+  is written by the freeing owner and read only by the thread that stole bin 7.
 
 **Bin 7:** it can look empty to a concurrent large allocation while one is being searched. That is a false
 out-of-memory for large blocks, not a safety issue. It is documented in the header.
 
 ## `bitblock_set` (`lockfree_bitblock_set/`) and `bitset` (`lockfree_bitset/`)
 
-- **`bitset`:** the model matches the code (single-word atomic set/clear/test).
+- **`bitset`:** each acquire/release is one RMW whose returned value decides ownership; every context (CPU ×
+  interrupt depth) may try any bit, and failed acquires are modelled. `MutualExclusion` holds.
 - **`bitblock_set`:** the model covers acquire and release of any range of at most 16 bits across at most two words.
   That includes the unconditional `fetch_or` with rollback of only the newly set bits.
   - The scan paths (`acquire_first_available`, `acquire_first_available_contiguous`) pick a candidate range from
     relaxed loads and then run exactly that acquire, so they are covered by the model's arbitrary choice of range.
-  - The search hint is only an index, so a stale value costs a longer scan and nothing else.
+  - The search hint is only an index (now: the position after the last acquire, or the last freed position), so a
+    stale or racing value costs a longer scan and nothing else.
 
 ## `lockfree_bitblock_resource` (argument; no separate model)
 
@@ -113,8 +115,12 @@ out-of-memory for large blocks, not a safety issue. It is documented in the head
 
 ## Skip list
 
-**`LockfreeSkiplist.tla`** models control flow, the key set, epochs and tombstone helping. It does not model memory
-reclamation, so it says nothing about use-after-free. That is covered by:
+**`LockfreeSkiplist.tla`** models control flow, the key set, epochs and tombstone helping, at the level of keys. It
+was re-derived from the current `remove()`: the level-0 mark is the deletion, bounded retries return `false`, and a
+CAS fails only after another thread changed a link (so two threads cannot fail each other forever without either
+changing anything). With two threads it checks lock-freedom (`GlobalProgress`: some operation keeps completing) and
+that a `remove()` call deletes at most one node. It does not model memory reclamation, so it says nothing about
+use-after-free. That is covered by:
 - **The retire point.** `retire_node` is called only by the thread whose CAS removes the node from level 0, after the
   upper levels have drained (`upper_levels/` and litmus B). So a node is unreachable from the list when it is stamped.
 - **The stamp ordering.** The final unlink must be ordered before the `retired_epoch_` read. Otherwise a reader that
@@ -124,6 +130,11 @@ reclamation, so it says nothing about use-after-free. That is covered by:
   - C++ promises it only with a seq_cst fence, which `retire_node` now issues. The same holds for stamping retired slot
     blocks in `advance_and_reclaim` (litmus J).
 - **The reclaimer's reader check:** litmus C.
+- **`remove()` retargeting (fixed):** after a failed level-0 mark, `remove()`'s re-walk could land on a node that
+  re-inserted its key after another thread removed the original, and mark only its level 0. That node then either
+  leaked (never drained) or, if its inserter was still publishing, was retired and then published at an upper level
+  (use-after-free). `remove()` now restarts instead (`upper_levels/`; regression test
+  `RemoveThatLandsOnAReinsertedNodeReclaimsIt`).
 - **`slot_blocks/`:** slot blocks shared between lists of one type (fixed).
 - **`handles/`:** stale-handle resolution (fixed), and iterators resolving a handle kept between read sections
   (fixed: a use-after-free found by the stress test, see that README).
@@ -145,4 +156,3 @@ See `lockfree_mp_sc_queue/README.md` and `lockfree_small/README.md`.
 | `sp_mc_value_stack` generation | 32 bits | a popper does not stall across 2^32 pushes |
 | skip-list slot generation | `GENERATION_MASK` bits, seeded per block incarnation | a handle does not outlive a full wrap of its slot's generation |
 
-The models with small tag widths (`tag_wraps.cfg`, `SpMcValueStack_genwrap.cfg`) show what each counter prevents.

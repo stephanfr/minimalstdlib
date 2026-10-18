@@ -53,7 +53,7 @@ namespace MINIMAL_STD_NAMESPACE
             : number_of_tokens_(number_of_tokens),
               token_counter_(0)
         {
-            assert(number_of_tokens <= 64);
+            assert((number_of_tokens >= 1) && (number_of_tokens <= 64)); //  get_token() divides by the count
 
             tokens_ = 0;
         }

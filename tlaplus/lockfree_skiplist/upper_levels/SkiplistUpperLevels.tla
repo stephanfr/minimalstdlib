@@ -10,7 +10,7 @@
 (* inserter's CAS on a predecessor lands after that, a retired node is     *)
 (* reachable at an upper level and is freed while still linked.           *)
 (*                                                                         *)
-(* The protocol (DrainGate = TRUE):                                        *)
+(* The protocol:                                                          *)
 (*   inserter, per upper level l:                                          *)
 (*     upper_levels_remaining_ += 1; seq_cst fence      (reserve)         *)
 (*     re-aim own link at l; abandon (-1) if it is tombstoned             *)
@@ -22,9 +22,9 @@
 (*       no:  leave level 0 linked                                         *)
 (*   traversal helpers: unlink a tombstoned upper link (-1); if drained   *)
 (*     and level 0 is tombstoned, unlink level 0 and retire.               *)
-(* DrainGate = FALSE models the code before 68ab76f: no reservation; the  *)
-(* remover unlinks the upper links it sees, then always unlinks level 0   *)
-(* and retires, so a publish that lands after that pass is missed.       *)
+(*                                                                         *)
+(* A remove whose level-0 mark fails restarts, so every remover that marks *)
+(* level 0 has tombstoned the upper levels first.                          *)
 (*                                                                         *)
 (* TLA+ steps are sequentially consistent: the seq_cst fences in the C++  *)
 (* are what make this hold on hardware.                                   *)
@@ -34,10 +34,9 @@ EXTENDS Integers, FiniteSets
 CONSTANTS
     Height,         \* the node's top level; upper levels are 1..Height-1
     NumHelpers,     \* concurrent traversals (find/remove/gc) that help unlink
-    MaxCasFailures, \* upper-level CAS failures the inserter tolerates per level
-    DrainGate       \* TRUE: current code; FALSE: before 68ab76f
+    MaxCasFailures  \* upper-level CAS failures the inserter tolerates per level
 
-ASSUME Height \in 2..4 /\ NumHelpers \in 1..3 /\ MaxCasFailures \in 0..2 /\ DrainGate \in BOOLEAN
+ASSUME Height \in 2..4 /\ NumHelpers \in 1..3 /\ MaxCasFailures \in 0..2
 
 Upper == 1..(Height - 1)
 INSERTER == 0
@@ -56,15 +55,12 @@ variables
 define {
     Drained == remaining <= 0
     UnlinkableUpper == {l \in Upper : linked[l] /\ ownMark[l]}
-    \* When a traversal may unlink level 0 and retire.  Before 68ab76f a traversal descending top-down
-    \*   retired once it had unlinked every tombstoned upper link it met (nothing left above).
-    HelperMayRetire == IF DrainGate THEN Drained ELSE UnlinkableUpper = {}
 
     \* A retired node is unreachable at every level (else it is freed while linked)
     RetiredUnreachable == retired => (~level0Linked /\ \A l \in Upper : ~linked[l])
     RetiredOnce == retirements <= 1
-    \* With the gate, every published link is still counted
-    CountCoversLinks == DrainGate => remaining >= Cardinality({l \in Upper : linked[l]})
+    \* Every published link is still counted
+    CountCoversLinks == remaining >= Cardinality({l \in Upper : linked[l]})
     Safety == RetiredUnreachable /\ RetiredOnce /\ CountCoversLinks
 }
 
@@ -83,10 +79,10 @@ variables lvl = 1, failures = 0;
  I_level:
     while (lvl <= Height - 1) {
  I_reserve:
-        if (DrainGate) { remaining := remaining + 1; };      \* fetch_add(1, seq_cst); fence
+        remaining := remaining + 1;                          \* fetch_add(1, seq_cst); fence
  I_own:
         if (ownMark[lvl]) {                                  \* own link tombstoned: a remove owns the node
-            if (DrainGate) { remaining := remaining - 1; };
+            remaining := remaining - 1;
             goto I_done;
         };
  I_cas:
@@ -94,7 +90,7 @@ variables lvl = 1, failures = 0;
             linked[lvl] := TRUE;                             \* pred.next[lvl] CAS succeeds
             lvl := lvl + 1; failures := 0;
         } or {
-            if (DrainGate) { remaining := remaining - 1; };  \* CAS failed: give the reservation back
+            remaining := remaining - 1;                      \* CAS failed: give the reservation back
             if (failures < MaxCasFailures) { failures := failures + 1; }
             else { lvl := lvl + 1; failures := 0; };         \* MAX_INSERT_UPPER_LEVEL_RETRIES: skip level
         };
@@ -117,10 +113,10 @@ variables mlvl = Height - 1, rl = 0;
     while (UnlinkableUpper # {}) {                           \* its own traversal unlinks the marked upper links
         with (l \in UnlinkableUpper) { rl := l; };
         linked[rl] := FALSE;
-        if (DrainGate) { remaining := remaining - 1; };
+        remaining := remaining - 1;
     };
  R_check:
-    if (~DrainGate \/ Drained) {                             \* upper_levels_drained()
+    if (Drained) {                                           \* upper_levels_drained()
         unlink_level0_and_retire();
     };
 }
@@ -137,19 +133,19 @@ variables hl = 0;
             if (linked[hl]) {                                \* CAS pred.next[hl]: node -> node.next[hl]
                 linked[hl] := FALSE;
  H_dec:
-                if (DrainGate) { remaining := remaining - 1; };   \* fetch_sub(1); then upper_levels_drained()
+                remaining := remaining - 1;                      \* fetch_sub(1); then upper_levels_drained()
  H_check:
-                if (ownMark[0] /\ HelperMayRetire) { unlink_level0_and_retire(); };
+                if (ownMark[0] /\ Drained) { unlink_level0_and_retire(); };
             };
         } or {
             \* a traversal finding the node tombstoned at level 0 with its upper levels drained
-            await ownMark[0] /\ level0Linked /\ HelperMayRetire;
+            await ownMark[0] /\ level0Linked /\ Drained;
  H_bottom:
-            if (ownMark[0] /\ HelperMayRetire) { unlink_level0_and_retire(); };
+            if (ownMark[0] /\ Drained) { unlink_level0_and_retire(); };
         } or {
             \* no work left once the inserter and remover have finished
             await pc[INSERTER] = "Done" /\ pc[REMOVER] = "Done" /\ UnlinkableUpper = {}
-                  /\ ~(ownMark[0] /\ level0Linked /\ HelperMayRetire);
+                  /\ ~(ownMark[0] /\ level0Linked /\ Drained);
             goto H_end;
         };
     };
@@ -166,13 +162,10 @@ Drained == remaining <= 0
 UnlinkableUpper == {l \in Upper : linked[l] /\ ownMark[l]}
 
 
-HelperMayRetire == IF DrainGate THEN Drained ELSE UnlinkableUpper = {}
-
-
 RetiredUnreachable == retired => (~level0Linked /\ \A l \in Upper : ~linked[l])
 RetiredOnce == retirements <= 1
 
-CountCoversLinks == DrainGate => remaining >= Cardinality({l \in Upper : linked[l]})
+CountCoversLinks == remaining >= Cardinality({l \in Upper : linked[l]})
 Safety == RetiredUnreachable /\ RetiredOnce /\ CountCoversLinks
 
 VARIABLES lvl, failures, mlvl, rl, hl
@@ -209,20 +202,14 @@ I_level == /\ pc[INSERTER] = "I_level"
                            retirements, lvl, failures, mlvl, rl, hl >>
 
 I_reserve == /\ pc[INSERTER] = "I_reserve"
-             /\ IF DrainGate
-                   THEN /\ remaining' = remaining + 1
-                   ELSE /\ TRUE
-                        /\ UNCHANGED remaining
+             /\ remaining' = remaining + 1
              /\ pc' = [pc EXCEPT ![INSERTER] = "I_own"]
              /\ UNCHANGED << linked, ownMark, level0Linked, retired, 
                              retirements, lvl, failures, mlvl, rl, hl >>
 
 I_own == /\ pc[INSERTER] = "I_own"
          /\ IF ownMark[lvl]
-               THEN /\ IF DrainGate
-                          THEN /\ remaining' = remaining - 1
-                          ELSE /\ TRUE
-                               /\ UNCHANGED remaining
+               THEN /\ remaining' = remaining - 1
                     /\ pc' = [pc EXCEPT ![INSERTER] = "I_done"]
                ELSE /\ pc' = [pc EXCEPT ![INSERTER] = "I_cas"]
                     /\ UNCHANGED remaining
@@ -234,10 +221,7 @@ I_cas == /\ pc[INSERTER] = "I_cas"
                /\ lvl' = lvl + 1
                /\ failures' = 0
                /\ UNCHANGED remaining
-            \/ /\ IF DrainGate
-                     THEN /\ remaining' = remaining - 1
-                     ELSE /\ TRUE
-                          /\ UNCHANGED remaining
+            \/ /\ remaining' = remaining - 1
                /\ IF failures < MaxCasFailures
                      THEN /\ failures' = failures + 1
                           /\ lvl' = lvl
@@ -277,10 +261,7 @@ R_unlink == /\ pc[REMOVER] = "R_unlink"
                   THEN /\ \E l \in UnlinkableUpper:
                             rl' = l
                        /\ linked' = [linked EXCEPT ![rl'] = FALSE]
-                       /\ IF DrainGate
-                             THEN /\ remaining' = remaining - 1
-                             ELSE /\ TRUE
-                                  /\ UNCHANGED remaining
+                       /\ remaining' = remaining - 1
                        /\ pc' = [pc EXCEPT ![REMOVER] = "R_unlink"]
                   ELSE /\ pc' = [pc EXCEPT ![REMOVER] = "R_check"]
                        /\ UNCHANGED << linked, remaining, rl >>
@@ -288,7 +269,7 @@ R_unlink == /\ pc[REMOVER] = "R_unlink"
                             failures, mlvl, hl >>
 
 R_check == /\ pc[REMOVER] = "R_check"
-           /\ IF ~DrainGate \/ Drained
+           /\ IF Drained
                  THEN /\ IF level0Linked
                             THEN /\ level0Linked' = FALSE
                                  /\ retired' = TRUE
@@ -309,11 +290,11 @@ H_loop(self) == /\ pc[self] = "H_loop"
                       /\ \E l \in UnlinkableUpper:
                            hl' = [hl EXCEPT ![self] = l]
                       /\ pc' = [pc EXCEPT ![self] = "H_unlink"]
-                   \/ /\ ownMark[0] /\ level0Linked /\ HelperMayRetire
+                   \/ /\ ownMark[0] /\ level0Linked /\ Drained
                       /\ pc' = [pc EXCEPT ![self] = "H_bottom"]
                       /\ hl' = hl
                    \/ /\ pc[INSERTER] = "Done" /\ pc[REMOVER] = "Done" /\ UnlinkableUpper = {}
-                         /\ ~(ownMark[0] /\ level0Linked /\ HelperMayRetire)
+                         /\ ~(ownMark[0] /\ level0Linked /\ Drained)
                       /\ pc' = [pc EXCEPT ![self] = "H_end"]
                       /\ hl' = hl
                 /\ UNCHANGED << linked, ownMark, level0Linked, remaining, 
@@ -329,16 +310,13 @@ H_unlink(self) == /\ pc[self] = "H_unlink"
                                   retirements, lvl, failures, mlvl, rl, hl >>
 
 H_dec(self) == /\ pc[self] = "H_dec"
-               /\ IF DrainGate
-                     THEN /\ remaining' = remaining - 1
-                     ELSE /\ TRUE
-                          /\ UNCHANGED remaining
+               /\ remaining' = remaining - 1
                /\ pc' = [pc EXCEPT ![self] = "H_check"]
                /\ UNCHANGED << linked, ownMark, level0Linked, retired, 
                                retirements, lvl, failures, mlvl, rl, hl >>
 
 H_check(self) == /\ pc[self] = "H_check"
-                 /\ IF ownMark[0] /\ HelperMayRetire
+                 /\ IF ownMark[0] /\ Drained
                        THEN /\ IF level0Linked
                                   THEN /\ level0Linked' = FALSE
                                        /\ retired' = TRUE
@@ -353,7 +331,7 @@ H_check(self) == /\ pc[self] = "H_check"
                                  mlvl, rl, hl >>
 
 H_bottom(self) == /\ pc[self] = "H_bottom"
-                  /\ IF ownMark[0] /\ HelperMayRetire
+                  /\ IF ownMark[0] /\ Drained
                         THEN /\ IF level0Linked
                                    THEN /\ level0Linked' = FALSE
                                         /\ retired' = TRUE

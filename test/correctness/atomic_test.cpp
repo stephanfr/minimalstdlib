@@ -6,6 +6,7 @@
 
 #include <minstdconfig.h>
 #include <atomic>
+#include <new>
 
 namespace
 {
@@ -39,5 +40,49 @@ namespace
         expected = 1;
         CHECK_FALSE(value.compare_exchange_weak(expected, 2, minstd::memory_order_release));
         CHECK_EQUAL(11u, expected);
+    }
+
+    TEST(AtomicTests, PointerArithmeticCountsElements)
+    {
+        //  fetch_add on atomic<T *> took a T * argument (so it did not compile with a count), and the builtin adds
+        //      bytes, not elements.
+        static uint64_t values[8] = {};
+
+        minstd::atomic<uint64_t *> cursor(&values[0]);
+
+        POINTERS_EQUAL(&values[0], cursor.fetch_add(2));
+        POINTERS_EQUAL(&values[2], cursor.load());
+
+        cursor += 3;
+        POINTERS_EQUAL(&values[5], cursor.load());
+
+        ++cursor;
+        POINTERS_EQUAL(&values[6], cursor.load());
+
+        POINTERS_EQUAL(&values[6], cursor.fetch_sub(4));
+        POINTERS_EQUAL(&values[2], cursor.load());
+
+        cursor--;
+        POINTERS_EQUAL(&values[1], cursor.load());
+    }
+
+    TEST(AtomicTests, DefaultConstructedIsValueInitialised)
+    {
+        //  C++20 value-initialises a default-constructed atomic; this one used to hold whatever the storage held
+
+        alignas(minstd::atomic<uint64_t>) unsigned char storage[sizeof(minstd::atomic<uint64_t>)];
+
+        volatile unsigned char *fill = storage; //  volatile, so the compiler cannot drop the fill as dead stores
+
+        for (size_t i = 0; i < sizeof(storage); i++)
+        {
+            fill[i] = 0xA5;
+        }
+
+        auto *value = new (storage) minstd::atomic<uint64_t>();
+
+        CHECK_EQUAL(0u, value->load());
+
+        value->~atomic();
     }
 }

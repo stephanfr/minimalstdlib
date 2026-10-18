@@ -77,3 +77,88 @@ namespace
         }
     }
 }
+
+namespace
+{
+    //  A 32-bit engine (xorshift), narrower than a 64-bit distribution range.
+    struct engine32
+    {
+        using result_type = uint32_t;
+        static constexpr result_type min() { return 0; }
+        static constexpr result_type max() { return 0xFFFFFFFFu; }
+
+        uint64_t state = 88172645463325252ULL;
+
+        result_type operator()()
+        {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return static_cast<uint32_t>(state);
+        }
+    };
+}
+
+TEST_GROUP(RandomWideRanges)
+{
+};
+
+TEST(RandomWideRanges, SeedSeqMatchesTheStandardAlgorithm)
+{
+    //  Reference values from std::seed_seq (libstdc++); the previous implementation differed in every word.
+    uint32_t out[4];
+    minstd::seed_seq three{1u, 2u, 3u};
+    three.generate(out, out + 4);
+    CHECK_EQUAL(2494033729u, out[0]);
+    CHECK_EQUAL(3915881101u, out[1]);
+    CHECK_EQUAL(1602617867u, out[2]);
+    CHECK_EQUAL(764004082u, out[3]);
+
+    uint32_t one[1];
+    minstd::seed_seq five{0xdeadbeefu, 7u, 0u, 99u, 1234567u};
+    five.generate(one, one + 1);
+    CHECK_EQUAL(1160567067u, one[0]);
+
+    uint32_t eight[8];
+    minstd::seed_seq empty;
+    empty.generate(eight, eight + 8);
+    CHECK_EQUAL(3071959997u, eight[0]);
+    CHECK_EQUAL(2235109613u, eight[7]);
+}
+
+TEST_GROUP(XoroshiroFork){};
+
+TEST(XoroshiroFork, SuccessiveForksDoNotOverlap)
+{
+    //  fork() stepped the parent only 128 times and returned a copy jumped 2^64 ahead, so a second fork returned
+    //      the first fork's stream shifted by 128 outputs.
+    minstd::xoroshiro128_plus_plus parent(2024);
+    const minstd::xoroshiro128_plus_plus original = parent;
+
+    minstd::xoroshiro128_plus_plus first = parent.fork();
+    minstd::xoroshiro128_plus_plus second = parent.fork();
+
+    CHECK(first == original); //  the first fork starts where the parent was
+    CHECK(first != second);
+    CHECK(second != parent);
+
+    constexpr int SAMPLES = 1024;
+    static uint64_t first_values[SAMPLES];
+
+    for (auto &v : first_values)
+    {
+        v = first();
+    }
+
+    //  None of the second fork's first outputs (well past the old 128-step shift) appears in the first fork's
+
+    for (int i = 0; i < SAMPLES + 256; i++)
+    {
+        const uint64_t v = second();
+
+        for (const uint64_t f : first_values)
+        {
+            CHECK(v != f);
+        }
+    }
+}

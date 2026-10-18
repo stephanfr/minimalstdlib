@@ -25,7 +25,9 @@ namespace MINIMAL_STD_NAMESPACE
     {
         struct Type
         {
-            T &operator[](size_t) const noexcept { return nullptr; }
+            //  There is no element to refer to, so indexing an empty array traps (the standard leaves it undefined)
+
+            [[noreturn]] T &operator[](size_t) const noexcept { __builtin_trap(); }
             constexpr explicit operator T *() const noexcept { return nullptr; } //  Always return a null pointer
         };
     };

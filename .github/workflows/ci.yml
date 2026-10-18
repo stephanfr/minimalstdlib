@@ -36,3 +36,11 @@ jobs:
 
       - name: Build and run performance tests
         run: make test-performance
+
+      - name: Install clang
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev
+
+      - name: Build and run correctness tests with clang
+        run: make test-correctness-clang CLANG_CXX=clang++-18

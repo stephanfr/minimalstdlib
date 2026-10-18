@@ -46,13 +46,49 @@
 
 #pragma GCC system_header
 
-//  A couple of preprocessor defs to forward or simply get the value of a tuple element
+//  A couple of preprocessor defs to forward or simply get the value of a tuple element.  They reach the element through
+//      a cast to its base rather than as tup.BaseType::value: clang does not see a pack that appears only in the
+//      qualifier of a member access, so a fold over tup.B::value fails to expand there.
 
-#define _TUPLE_FWD_M(TupleType, BaseType, tup, value) static_cast<TupleType &&>(tup).BaseType::value
-#define _TUPLE_GET_M(BaseType, tup, value) tup.BaseType::value
+#define _TUPLE_FWD_M(TupleType, BaseType, tup, value) \
+    ::MINIMAL_STD_NAMESPACE::tuple_internal::_forward_base<BaseType, TupleType>(tup).value
+#define _TUPLE_GET_M(BaseType, tup, value) ::MINIMAL_STD_NAMESPACE::tuple_internal::_as_base<BaseType>(tup).value
 
 namespace MINIMAL_STD_NAMESPACE
 {
+    namespace tuple_internal
+    {
+        //  tup as its BaseType subobject, with tup's constness: what tup.BaseType:: names
+        template <class BaseType, class T>
+        constexpr BaseType &_as_base(T &tup) noexcept
+        {
+            return tup;
+        }
+
+        template <class BaseType, class T>
+        constexpr const BaseType &_as_base(const T &tup) noexcept
+        {
+            return tup;
+        }
+
+        //  static_cast<TupleType &&>(tup) as its BaseType subobject: an lvalue for an lvalue-reference TupleType, else
+        //      an xvalue, const if the tuple type is
+        template <class BaseType, class TupleType, class T>
+        constexpr auto &&_forward_base(T &tup) noexcept
+        {
+            using qualified_base = conditional_t<is_const_v<remove_reference_t<TupleType>>, const BaseType, BaseType>;
+
+            if constexpr (is_lvalue_reference_v<TupleType>)
+            {
+                return static_cast<qualified_base &>(tup);
+            }
+            else
+            {
+                return static_cast<qualified_base &&>(tup);
+            }
+        }
+    } // namespace tuple_internal
+
     //
     //  type_list
     //

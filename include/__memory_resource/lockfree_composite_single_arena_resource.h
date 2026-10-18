@@ -22,7 +22,7 @@ namespace MINIMAL_STD_NAMESPACE
                   size_t ELEMENTS_PER_BLOCK = 1024,
                   size_t MAX_NUMBER_OF_ARENAS = 32,
                   size_t MAX_NUMBER_OF_BLOCKS = 48,
-                  bool include_statistics = true,
+                  bool include_statistics = false,
                   size_t LARGE_RESOURCE_MAX_BIN_BYTES = 32 * 1024 * 1024,
                   size_t LARGE_RESOURCE_MAX_WASTE_PERCENT = 5>
             requires(THRESHOLD_BYTES > 0)
@@ -30,6 +30,10 @@ namespace MINIMAL_STD_NAMESPACE
         {
         public:
             static constexpr size_t DEFAULT_CPU_SHARDS = 8;
+
+            //  The small pool serves at most 16 elements per allocation, each with a HEADER_SIZE (16 byte) header.
+            static_assert(THRESHOLD_BYTES + 16 <= 16 * ELEMENT_SIZE_IN_BYTES,
+                          "THRESHOLD_BYTES must fit in 16 elements of ELEMENT_SIZE_IN_BYTES (including the 16-byte header)");
 
             static_assert(LARGE_RESOURCE_MAX_BIN_BYTES >= 1024,
                           "LARGE_RESOURCE_MAX_BIN_BYTES must be at least 1024 bytes");
@@ -89,13 +93,16 @@ namespace MINIMAL_STD_NAMESPACE
                     return;
                 }
 
+                //  Frees are routed by the caller's size and alignment, which must match the allocation (as for any
+                //      memory_resource): a mismatch can send a block to the wrong pool.
+
                 if (should_use_small_pool(bytes, alignment))
                 {
                     small_resource_.deallocate(block, bytes, alignment);
                 }
-                else
+                else if (!large_resource_.try_deallocate(block, bytes, alignment))
                 {
-                    large_resource_.deallocate(block, bytes, alignment);
+                    return; //  rejected (e.g. a double free): nothing was freed, so nothing to count
                 }
 
                 this->deallocation_made(bytes);

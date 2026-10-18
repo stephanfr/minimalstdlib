@@ -30,11 +30,9 @@
 (*  - A destructor runs only when its instance has no operation in flight *)
 (*    (the C++ precondition).                                              *)
 (*                                                                         *)
-(* Fix = "none": the code at d5d12c1.                                      *)
-(* Fix = "sole": advance_and_reclaim extracts the shared list only while   *)
-(*   its instance is the only live one; a destructor frees only its own   *)
-(*   stamped blocks while other instances are live, and the last instance *)
-(*   frees everything.                                                     *)
+(* advance_and_reclaim extracts the shared list only while its instance  *)
+(* is the only live one; a destructor frees only its own stamped blocks    *)
+(* while other instances are live, and the last instance frees everything. *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -42,10 +40,9 @@ CONSTANTS
     Instances,      \* instance ids in 1..9
     ReadersPer,     \* reader threads per instance
     MaxBlocks,      \* block incarnations installed at the index over the run
-    LateStart,      \* instances constructed only after the run has started
-    Fix             \* "none" | "sole"
+    LateStart       \* instances constructed only after the run has started
 
-ASSUME Fix \in {"none", "sole"} /\ \A i \in Instances : i \in 1..9 /\ LateStart \subseteq Instances
+ASSUME \A i \in Instances : i \in 1..9 /\ LateStart \subseteq Instances
 
 \* Process ids are integers so TLC can compare them: reader k of instance i is 10*i + k,
 \* the slot allocator is 0, and instance i's own process (reclaim, destructor) is i.
@@ -66,7 +63,7 @@ variables
 define {
     InstanceOf(r) == r \div 10
     MyReaders(i) == {r \in Readers : InstanceOf(r) = i}
-    MayExtract(i) == (Fix = "none") \/ (live = {i})
+    MayExtract(i) == live = {i}
 }
 
 macro free_blocks(bs) {
@@ -145,8 +142,8 @@ variables rec = {};
         };
     };
  I_destroy:
-    \* reclaim_all_retired_nodes(): this instance's stamped blocks, and (d5d12c1) the shared list
-    if (Fix = "none" \/ live = {self}) {
+    \* reclaim_all_retired_nodes(): this instance's stamped blocks, and the shared list if it is the last instance
+    if (live = {self}) {
         free_blocks(unlinked \cup {x.b : x \in retiredBlocks[self]});
         unlinked := {};
     } else {
@@ -172,7 +169,7 @@ VARIABLES pc, installed, nextBlock, freed, unlinked, retiredBlocks, active,
 (* define statement *)
 InstanceOf(r) == r \div 10
 MyReaders(i) == {r \in Readers : InstanceOf(r) = i}
-MayExtract(i) == (Fix = "none") \/ (live = {i})
+MayExtract(i) == live = {i}
 
 VARIABLES held, rounds, rec
 
@@ -291,20 +288,20 @@ I_loop(self) == /\ pc[self] = "I_loop"
 
 I_free(self) == /\ pc[self] = "I_free"
                 /\ Assert(rec[self] \cap freed = {}, 
-                          "Failure of assertion at line 73, column 5 of macro called at line 140, column 13.")
+                          "Failure of assertion at line 70, column 5 of macro called at line 137, column 13.")
                 /\ freed' = (freed \cup rec[self])
                 /\ pc' = [pc EXCEPT ![self] = "I_loop"]
                 /\ UNCHANGED << installed, nextBlock, unlinked, retiredBlocks, 
                                 active, live, destroyed, held, rounds, rec >>
 
 I_destroy(self) == /\ pc[self] = "I_destroy"
-                   /\ IF Fix = "none" \/ live = {self}
+                   /\ IF live = {self}
                          THEN /\ Assert((unlinked \cup {x.b : x \in retiredBlocks[self]}) \cap freed = {}, 
-                                        "Failure of assertion at line 73, column 5 of macro called at line 150, column 9.")
+                                        "Failure of assertion at line 70, column 5 of macro called at line 147, column 9.")
                               /\ freed' = (freed \cup (unlinked \cup {x.b : x \in retiredBlocks[self]}))
                               /\ unlinked' = {}
                          ELSE /\ Assert(({x.b : x \in retiredBlocks[self]}) \cap freed = {}, 
-                                        "Failure of assertion at line 73, column 5 of macro called at line 153, column 9.")
+                                        "Failure of assertion at line 70, column 5 of macro called at line 150, column 9.")
                               /\ freed' = (freed \cup ({x.b : x \in retiredBlocks[self]}))
                               /\ UNCHANGED unlinked
                    /\ retiredBlocks' = [retiredBlocks EXCEPT ![self] = {}]
@@ -317,7 +314,7 @@ I_last(self) == /\ pc[self] = "I_last"
                 /\ destroyed' = (destroyed \cup {self})
                 /\ IF live' = {}
                       THEN /\ Assert((unlinked \cup (IF installed # 0 THEN {installed} ELSE {})) \cap freed = {}, 
-                                     "Failure of assertion at line 73, column 5 of macro called at line 161, column 9.")
+                                     "Failure of assertion at line 70, column 5 of macro called at line 158, column 9.")
                            /\ freed' = (freed \cup (unlinked \cup (IF installed # 0 THEN {installed} ELSE {})))
                            /\ unlinked' = {}
                            /\ installed' = 0

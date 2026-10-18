@@ -152,8 +152,8 @@ namespace
     TEST(LockfreeCompositeSingleArenaResourcePerformanceTests, ThreadScalabilitySensitivityAnalysis)
     {
         printf("\n=== Thread Scalability Analysis: Composite vs Lockfree vs Malloc/Free ===\n");
-        printf("Threads | Composite Ops/sec | Lockfree Ops/sec | Malloc Ops/sec | CP Eff | LF Eff | Malloc Eff | CP Scale | LF Scale\n");
-        printf("--------|-------------------|---------------------|----------------|--------|--------|------------|----------|----------\n");
+        printf("Threads | Composite Ops/sec | Lockfree Ops/sec | Malloc Ops/sec | CP Eff | LF Eff | Malloc Eff | CP Scale | LF Scale | CP/Malloc | LF/Malloc\n");
+        printf("--------|-------------------|---------------------|----------------|--------|--------|------------|----------|----------|-----------|-----------\n");
 
         static double baseline_composite_efficiency = 0.0;
         static double baseline_lockfree_efficiency = 0.0;
@@ -315,8 +315,14 @@ namespace
             double lockfree_scalability = baseline_lockfree_efficiency > 0
                 ? (lockfree_efficiency / baseline_lockfree_efficiency)
                 : 1.0;
+            double composite_vs_malloc = malloc_total_ops_per_second > 0
+                ? (composite_total_ops_per_second / malloc_total_ops_per_second)
+                : 0.0;
+            double lockfree_vs_malloc = malloc_total_ops_per_second > 0
+                ? (lockfree_total_ops_per_second / malloc_total_ops_per_second)
+                : 0.0;
 
-            printf("  %2zu   | %15.0f | %16.0f | %12.0f | %6.0f | %6.0f | %10.0f | %8.2fx | %8.2fx\n",
+            printf("  %2zu   | %15.0f | %16.0f | %12.0f | %6.0f | %6.0f | %10.0f | %8.2fx | %8.2fx | %8.2fx | %8.2fx\n",
                    num_threads,
                    composite_total_ops_per_second,
                    lockfree_total_ops_per_second,
@@ -325,7 +331,9 @@ namespace
                    lockfree_efficiency,
                    malloc_efficiency,
                    composite_scalability,
-                   lockfree_scalability);
+                   lockfree_scalability,
+                   composite_vs_malloc,
+                   lockfree_vs_malloc);
 
             CHECK(composite_elapsed_time > 0);
             CHECK(lockfree_elapsed_time > 0);
@@ -342,12 +350,14 @@ namespace
         printf("- Efficiency: Total operations per second per thread\n");
         printf("- CP Scale: Composite efficiency relative to single-thread baseline\n");
         printf("- LF Scale: Lockfree efficiency relative to single-thread baseline\n");
+        printf("- CP/Malloc: Composite ops/sec divided by malloc ops/sec (>1 = faster than malloc)\n");
+        printf("- LF/Malloc: Lockfree ops/sec divided by malloc ops/sec (>1 = faster than malloc)\n");
         printf("- Each thread performs %zu initial allocations + %zu repetitions\n",
                NUM_ALLOCATIONS_PER_THREAD, REPETITIONS);
         printf("- Allocation sizes: lognormal(5.4, 1.2) distribution, clamped to [1, %zu] bytes\n",
                MAX_ALLOCATION_SIZE);
-         printf("- Composite settings: threshold=3072B, element=256B, arenas<=32, blocks<=512, stats=off, max_bin=32MB, max_waste=5%%\n");
-        printf("- Composite routes allocations <= 3072 bytes to fixed_size pool\n");
+        printf("- Composite settings: threshold=3072B, element=256B, elements/block=2048, arenas<=32, blocks<=512, stats=off, max_bin=32MB, max_waste=5%%\n");
+        printf("- Composite routes allocations <= 3072 bytes to the bitblock pool\n");
         printf("- All allocators tested with identical workloads for fair comparison\n");
     }
 }

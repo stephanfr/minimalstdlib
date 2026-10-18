@@ -69,7 +69,10 @@ namespace
         size_t thread_id;
         size_t successful_eliminations;
         size_t failed_operations;
+        size_t null_retrievals; //  checked on the main thread: CppUTest's CHECK is not safe in worker threads
     };
+
+    constexpr uint64_t TEST_SEED = 0x5eed'1234'abcdULL; //  fixed rather than time(nullptr), so runs repeat
 
     TEST(EliminationArrayTests, BasicConstruction)
     {
@@ -157,6 +160,7 @@ namespace
         
         args->successful_eliminations = 0;
         args->failed_operations = 0;
+        args->null_retrievals = 0;
         
         for (size_t i = 0; i < args->num_elements && !stop_threads; ++i)
         {
@@ -186,6 +190,7 @@ namespace
         
         args->successful_eliminations = 0;
         args->failed_operations = 0;
+        args->null_retrievals = 0;
         
         test_element *retrieved_element = nullptr;
         
@@ -194,8 +199,11 @@ namespace
             if (args->array->get_element(retrieved_element))
             {
                 args->successful_eliminations++;
-                // Verify we got a valid element
-                CHECK(retrieved_element != nullptr);
+
+                if (retrieved_element == nullptr)
+                {
+                    args->null_retrievals++;
+                }
             }
             else
             {
@@ -210,7 +218,7 @@ namespace
     {
         static const size_t NUM_OPERATIONS = 10000;
         
-        test_elimination_array elimination_array(time(nullptr));
+        test_elimination_array elimination_array(TEST_SEED); //  fixed, so a failure can be reproduced
         
         // Create test elements
         test_element elements[NUM_OPERATIONS];
@@ -259,9 +267,12 @@ namespace
         printf("Get thread - successful eliminations: %zu, failed: %zu\n", 
                get_args.successful_eliminations, get_args.failed_operations);
         
-        // There should be at least some successful eliminations
-        CHECK(put_args.successful_eliminations > 0 || get_args.successful_eliminations > 0);
-        
+        //  Whether any elimination happens depends on the two threads overlapping in time, which the scheduler
+        //      does not promise (one vCPU, taskset, TSan), so only conservation is checked: every element handed
+        //      over was received, and no receive produced a null.
+
+        CHECK_EQUAL(0u, get_args.null_retrievals);
+
         // The number of successful put and get eliminations should be equal
         CHECK_EQUAL(put_args.successful_eliminations, get_args.successful_eliminations);
     }
@@ -273,7 +284,7 @@ namespace
         static const size_t NUM_CONSUMER_THREADS = 32;
         static const size_t NUM_OPERATIONS_PER_THREAD = 10000;
         
-        test_elimination_array elimination_array(time(nullptr));
+        test_elimination_array elimination_array(TEST_SEED); //  fixed, so a failure can be reproduced
         
         // Create test elements for all producer threads
         test_element elements[NUM_PRODUCER_THREADS * NUM_OPERATIONS_PER_THREAD];
@@ -366,11 +377,14 @@ namespace
                total_successful_puts > 0 ? 
                (double)total_successful_puts / (total_successful_puts + total_failed_puts) * 100.0 : 0.0);
         
-        // Verify that the elimination array is working
-        // We should see some successful eliminations in a multi-threaded environment
-        CHECK(total_successful_puts > 0);
-        CHECK(total_successful_gets > 0);
-        
+        //  Eliminations need the threads to overlap, which the scheduler does not promise, so only conservation
+        //      is checked (see TwoThreadElimination)
+
+        for (size_t i = 0; i < NUM_CONSUMER_THREADS; ++i)
+        {
+            CHECK_EQUAL(0u, consumer_args[i].null_retrievals);
+        }
+
         // The number of successful puts and gets should be approximately equal
         // (allowing for some difference due to timing)
         long diff = (long)total_successful_puts - (long)total_successful_gets;
@@ -422,6 +436,19 @@ namespace
         
         // Test with thread counts from 1 to 32 (powers of 2 plus some intermediate values)
         size_t thread_counts[] = {2, 4, 6, 8, 12, 16, 20, 24, 28, 32};
+
+        //  Sized for the largest thread count and kept off the stack: these ran to several MB as variable-length
+        //      arrays, enough to overflow the stack under ASan
+
+        static constexpr size_t MAX_PRODUCERS = 16;
+        static constexpr size_t MAX_CONSUMERS = 16;
+
+        static test_element elements[MAX_PRODUCERS * OPERATIONS_PER_THREAD];
+        static test_element *element_ptrs[MAX_PRODUCERS][OPERATIONS_PER_THREAD];
+        static thread_test_args producer_args[MAX_PRODUCERS];
+        static thread_test_args consumer_args[MAX_CONSUMERS];
+        static pthread_t producer_threads[MAX_PRODUCERS];
+        static pthread_t consumer_threads[MAX_CONSUMERS];
         size_t num_test_points = sizeof(thread_counts) / sizeof(thread_counts[0]);
         
         for (size_t test_idx = 0; test_idx < num_test_points; ++test_idx)
@@ -429,6 +456,8 @@ namespace
             size_t num_threads = thread_counts[test_idx];
             size_t num_producer_threads = num_threads / 2;
             size_t num_consumer_threads = num_threads - num_producer_threads;
+
+            CHECK((num_producer_threads <= MAX_PRODUCERS) && (num_consumer_threads <= MAX_CONSUMERS));
             
             // Skip single thread test (no elimination possible)
             if (num_threads == 1)
@@ -437,11 +466,9 @@ namespace
                 continue;
             }
             
-            test_elimination_array elimination_array(time(nullptr) + test_idx);
+            test_elimination_array elimination_array(TEST_SEED + test_idx);
             
             // Create test elements for all producer threads
-            test_element elements[num_producer_threads * OPERATIONS_PER_THREAD];
-            test_element *element_ptrs[num_producer_threads][OPERATIONS_PER_THREAD];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {
@@ -454,8 +481,6 @@ namespace
             }
             
             // Setup thread arguments
-            thread_test_args producer_args[num_producer_threads];
-            thread_test_args consumer_args[num_consumer_threads];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {
@@ -478,8 +503,6 @@ namespace
             stop_threads = false;
             
             // Create threads
-            pthread_t producer_threads[num_producer_threads];
-            pthread_t consumer_threads[num_consumer_threads];
             
             for (size_t i = 0; i < num_producer_threads; ++i)
             {
@@ -562,12 +585,11 @@ namespace
             // Basic sanity checks
             CHECK(total_operations > 0);
             
-            // For multi-threaded scenarios, we should see some eliminations
-            if (num_threads >= 4)
+            for (size_t i = 0; i < num_consumer_threads; ++i)
             {
-                CHECK(total_successful_puts > 0 || total_successful_gets > 0);
+                CHECK_EQUAL(0u, consumer_args[i].null_retrievals);
             }
-            
+
             // Elimination counts should be roughly balanced
             if (total_successful_puts > 0 && total_successful_gets > 0)
             {

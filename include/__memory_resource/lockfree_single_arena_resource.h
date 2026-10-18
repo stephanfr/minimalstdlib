@@ -191,8 +191,8 @@ namespace MINIMAL_STD_NAMESPACE
             explicit lockfree_single_arena_resource_impl(void *block,
                                                          size_t block_size,
                                                          size_t cpu_shards = DEFAULT_CPU_SHARDS)
-                : block_(block),
-                  block_size_(block_size),
+                : block_(internal::align_pointer(block, DEFAULT_ALIGNMENT)),
+                  block_size_(aligned_block_size(block, block_size)),
                   metadata_start_(reinterpret_cast<block_metadata *>(((uintptr_t)block + block_size) & ~(uintptr_t)(ALLOCATION_METADATA_SIZE - 1)) - 1), //  round the end DOWN: the top record must lie inside the arena
                   next_empty_memory_block_(0), // Will be set after allocating per-CPU arrays
                   current_metadata_record_count_(0),
@@ -207,11 +207,25 @@ namespace MINIMAL_STD_NAMESPACE
                 //  Allocate the per-CPU shard arrays from the start of the managed block.
                 //  Layout: [pending_shards][free_block_bins][metadata_block_managers][64-byte align][allocations...]
 
+                //  The arena starts at the first DEFAULT_ALIGNMENT boundary of the caller's block: block_ and block_size_
+                //      describe that aligned region, and block offsets (block_state_ptr) are relative to it, so they are
+                //      multiples of DEFAULT_ALIGNMENT whatever the caller's buffer alignment.
+
                 MINIMAL_STD_ASSERT(block_ != nullptr);
+                MINIMAL_STD_ASSERT(block_size_ > 0);
                 MINIMAL_STD_ASSERT(block_size_ < block_state_ptr::NULL_OFFSET);
                 MINIMAL_STD_ASSERT((block_size_ / DEFAULT_ALIGNMENT) < NO_PREDECESSOR); //  frontier words hold 32-bit unit offsets (256 GiB)
 
-                uint8_t *current_ptr = static_cast<uint8_t *>(internal::align_pointer(block, DEFAULT_ALIGNMENT));
+                //  The per-CPU arrays and one metadata block must fit, or the layout below would write past the caller's
+                //      block.  A block that is too small leaves the resource unusable: every allocation returns nullptr.
+
+                if (block_size_ < minimum_block_size(cpu_shards_))
+                {
+                    MINIMAL_STD_FAIL("lockfree_single_arena_resource: block smaller than minimum_block_size()");
+                    return;
+                }
+
+                uint8_t *current_ptr = static_cast<uint8_t *>(const_cast<void *>(block_));
 
                 //  Allocate pending_shards_ array (cpu_shards_ elements)
                 pending_shards_ = reinterpret_cast<pending_shard *>(current_ptr);
@@ -271,10 +285,23 @@ namespace MINIMAL_STD_NAMESPACE
                     }
                 }
 
+                usable_ = true;
+
                 refresh_extended_metrics_diagnostics();
             }
 
             ~lockfree_single_arena_resource_impl() = default;
+
+            //  Smallest caller block that holds the per-CPU arrays, one metadata block and its manager (plus up to
+            //      DEFAULT_ALIGNMENT - 1 bytes lost to aligning the start, and room for a first allocation).
+            static constexpr size_t minimum_block_size(size_t cpu_shards = DEFAULT_CPU_SHARDS)
+            {
+                return (2 * DEFAULT_ALIGNMENT) +
+                       (cpu_shards * sizeof(pending_shard)) +
+                       (NUM_FREE_BLOCK_BINS * cpu_shards * sizeof(free_block_bin)) +
+                       sizeof(metadata_block_manager) + METADATA_BLOCK_BYTES +
+                       (2 * DEFAULT_ALIGNMENT);
+            }
 
             const extensions::lockfree_single_arena_resource_extended_statistics &extended_metrics() const noexcept
                 requires(is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
@@ -333,7 +360,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             // Packed block offset + state + version for atomic state transitions.
             // Layout: [offset:48][state:4][version:12] = 64 bits.
-            // Offsets are relative to block_ and avoid canonical-address assumptions.
+            // Offsets are relative to block_ (the arena's 64-byte-aligned start) and avoid canonical-address assumptions.
             struct block_state_ptr
             {
                 using pointer = block_header *;
@@ -488,6 +515,10 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr size_t NUM_FREE_BLOCK_BINS = NUM_NON_SENTINEL_FREE_BLOCK_BINS + 1;
             static constexpr size_t MAX_ALLOCATION_SIZE_INTERNAL = max_bin_bytes_aligned();
 
+            //  After alignment, so exactly 4 GiB (which truncates to 0) is excluded too
+            static_assert(MAX_ALLOCATION_SIZE_INTERNAL < (size_t{1} << 32),
+                          "max_bin_bytes must be below 4 GiB: block sizes are kept in 32-bit metadata fields");
+
             static constexpr array<size_t, NUM_FREE_BLOCK_BINS> build_free_block_bin_sizes()
             {
                 array<size_t, NUM_FREE_BLOCK_BINS> bins{};
@@ -507,15 +538,98 @@ namespace MINIMAL_STD_NAMESPACE
 
             static constexpr array<size_t, NUM_FREE_BLOCK_BINS> FREE_BLOCK_BIN_SIZES = build_free_block_bin_sizes();
 
+            //  First bin whose size is >= bytes, searching from bin 'lo'.
+
+            static constexpr size_t search_free_block_bin(size_t bytes, size_t lo)
+            {
+                size_t hi = NUM_FREE_BLOCK_BINS - 1;
+
+                while (lo < hi)
+                {
+                    size_t mid = lo + (hi - lo) / 2;
+
+                    if (FREE_BLOCK_BIN_SIZES[mid] < bytes)
+                    {
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        hi = mid;
+                    }
+                }
+
+                return lo;
+            }
+
+            //  Size-class lookup for requests up to 64 KiB, indexed by the size in DEFAULT_ALIGNMENT units (rounded
+            //      up).  Replaces the binary search on the allocation and maintenance paths.
+
+            static constexpr size_t SMALL_BIN_LOOKUP_UNITS = 1024;
+
+            static constexpr array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> build_small_bin_lookup()
+            {
+                array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> lookup{};
+
+                for (size_t units = 0; units <= SMALL_BIN_LOOKUP_UNITS; ++units)
+                {
+                    lookup[units] = static_cast<uint16_t>(search_free_block_bin(units * DEFAULT_ALIGNMENT, 0));
+                }
+
+                return lookup;
+            }
+
+            static constexpr array<uint16_t, SMALL_BIN_LOOKUP_UNITS + 1> SMALL_BIN_LOOKUP = build_small_bin_lookup();
+
+            //  The lookup is exact only if every size within one DEFAULT_ALIGNMENT unit maps to the same bin.  The
+            //      search is monotonic, so checking both ends of each unit covers every size in it.
+
+            static constexpr bool small_bin_lookup_is_exact()
+            {
+                if (search_free_block_bin(0, 0) != SMALL_BIN_LOOKUP[0])
+                {
+                    return false;
+                }
+
+                for (size_t units = 1; units <= SMALL_BIN_LOOKUP_UNITS; ++units)
+                {
+                    if ((search_free_block_bin(((units - 1) * DEFAULT_ALIGNMENT) + 1, 0) != SMALL_BIN_LOOKUP[units]) ||
+                        (search_free_block_bin(units * DEFAULT_ALIGNMENT, 0) != SMALL_BIN_LOOKUP[units]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            static_assert(small_bin_lookup_is_exact(), "Size-class lookup table must match the bin search for every size");
+
             static_assert(NUM_NON_SENTINEL_FREE_BLOCK_BINS >= 2,
                           "Uniform bin policy must generate at least two non-sentinel bins");
 
         public:
-            static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL;
+            //  The largest request that can succeed: the biggest bin also holds the allocation header
+
+            static constexpr size_t MAX_ALLOCATION_SIZE = MAX_ALLOCATION_SIZE_INTERNAL - ALLOCATION_HEADER_SIZE;
+
+            //  deallocate() that reports whether the block was accepted (false: not a live block of this arena)
+
+            bool try_deallocate(void *block, size_t bytes, size_t alignment)
+            {
+                return do_try_deallocate(block, bytes, alignment);
+            }
 
         private:
-            const void *const block_;
-            const size_t block_size_;
+            const void *const block_;   //  first DEFAULT_ALIGNMENT boundary of the caller's block
+            const size_t block_size_;   //  bytes from block_ to the end of the caller's block
+
+            static size_t aligned_block_size(void *block, size_t block_size)
+            {
+                const size_t adjustment = static_cast<size_t>(reinterpret_cast<uintptr_t>(internal::align_pointer(block, DEFAULT_ALIGNMENT)) -
+                                                              reinterpret_cast<uintptr_t>(block));
+
+                return (block_size > adjustment) ? (block_size - adjustment) : 0;
+            }
             block_metadata *const metadata_start_;
 
             alignas(64) atomic<uint64_t> next_empty_memory_block_;
@@ -539,6 +653,7 @@ namespace MINIMAL_STD_NAMESPACE
             size_t cpu_shards_;
             const void *allocation_base_;
             size_t address_bin_size_;
+            bool usable_ = false; //  false when the caller's block was too small (see minimum_block_size())
 
             struct extended_metrics_sync_guard
             {
@@ -554,6 +669,11 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
                 {
+                    if (!usable_)
+                    {
+                        return;
+                    }
+
                     auto frontier = unpack_frontier(next_empty_memory_block_.load(memory_order_acquire));
                     size_t frontier_offset = reinterpret_cast<uintptr_t>(frontier) - reinterpret_cast<uintptr_t>(block_);
 
@@ -576,7 +696,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             size_t cpu_shard_index() const
             {
-                return static_cast<size_t>(platform_provider_type::get_cpu_id()) % cpu_shards_;
+                const size_t cpu_id = static_cast<size_t>(platform_provider_type::get_cpu_id());
+                return (cpu_id < cpu_shards_) ? cpu_id : (cpu_id % cpu_shards_); //  no divide on the usual path
             }
 
             const block_header &as_block_header(void *block) const
@@ -638,29 +759,19 @@ namespace MINIMAL_STD_NAMESPACE
 
             uint64_t free_block_bin_index(size_t bytes) const
             {
-                if (bytes > MAX_ALLOCATION_SIZE)
+                if (bytes > MAX_ALLOCATION_SIZE_INTERNAL)
                 {
                     return NUM_FREE_BLOCK_BINS - 1;
                 }
 
-                size_t lo = 0;
-                size_t hi = NUM_FREE_BLOCK_BINS - 1;
+                const size_t units = (bytes + DEFAULT_ALIGNMENT - 1) / DEFAULT_ALIGNMENT;
 
-                while (lo < hi)
+                if (units <= SMALL_BIN_LOOKUP_UNITS)
                 {
-                    size_t mid = lo + (hi - lo) / 2;
-
-                    if (FREE_BLOCK_BIN_SIZES[mid] < bytes)
-                    {
-                        lo = mid + 1;
-                    }
-                    else
-                    {
-                        hi = mid;
-                    }
+                    return SMALL_BIN_LOOKUP[units];
                 }
 
-                return lo;
+                return search_free_block_bin(bytes, SMALL_BIN_LOOKUP[SMALL_BIN_LOOKUP_UNITS]);
             }
 
             void back_off(size_t &retries)
@@ -1080,7 +1191,11 @@ namespace MINIMAL_STD_NAMESPACE
                 //  We cannot throw and exception which is what the standard requires if we cannot allocate the memory
                 //      of either the desired size or alignment, so we will just return nullptr.
 
-                if ((bytes == 0) || (DEFAULT_ALIGNMENT % alignment != 0))
+                //  Alignment must be a power of two no larger than DEFAULT_ALIGNMENT (no divide on the fast path).
+
+                //  bytes is bounded before the header is added, so the sum below cannot wrap.
+
+                if (!usable_ || (bytes == 0) || (bytes > MAX_ALLOCATION_SIZE) || (alignment == 0) || (alignment > DEFAULT_ALIGNMENT) || ((alignment & (alignment - 1)) != 0))
                 {
                     return nullptr;
                 }
@@ -1090,7 +1205,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 uint64_t total_size = internal::lockfree_aligned_size(bytes + ALLOCATION_HEADER_SIZE, DEFAULT_ALIGNMENT);
 
-                if (total_size > MAX_ALLOCATION_SIZE)
+                if (total_size > MAX_ALLOCATION_SIZE_INTERNAL)
                 {
                     return nullptr;
                 }
@@ -1214,7 +1329,9 @@ namespace MINIMAL_STD_NAMESPACE
                     block_state_ptr::pack(free_block, block_, IN_USE, version),
                     memory_order_release);
 #pragma GCC diagnostic push
+#if !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
                 metadata->requested_size_.store(static_cast<uint32_t>(bytes), memory_order_release);
 #pragma GCC diagnostic pop
                 metadata->total_size_ = static_cast<uint32_t>(free_block->size_including_header_);
@@ -1223,7 +1340,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                 {
-                    extensions::memory_resource_statistics::allocation_made(bytes);
+                    this->extensions::memory_resource_statistics::allocation_made(bytes);
                 }
 
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)
@@ -1236,6 +1353,13 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool do_try_deallocate(void *block, size_t bytes, size_t alignment)
             {
+                //  Freeing nothing is a no-op; there is no header in front of nullptr to read
+
+                if (block == nullptr)
+                {
+                    return true;
+                }
+
                 extended_metrics_sync_guard sync_guard{*this};
 
                 //  Insure that the block is valid and in use.
@@ -1258,7 +1382,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_bad_index();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_bad_index();
                         }
                         return false;
                     }
@@ -1273,7 +1397,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_state_mismatch();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_state_mismatch();
                         }
                         return false;
                     }
@@ -1287,7 +1411,7 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                         {
-                            extensions::memory_resource_statistics::deallocation_aborted_cas_race();
+                            this->extensions::memory_resource_statistics::deallocation_aborted_cas_race();
                         }
                         return false;
                     }
@@ -1297,7 +1421,10 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if constexpr (minstd::is_base_of_v<extensions::memory_resource_statistics, lockfree_single_arena_resource_impl>)
                 {
-                    extensions::memory_resource_statistics::deallocation_made(bytes);
+                    //  Count the size the block was allocated with, not the caller's claim, so a mismatched size
+                    //      cannot make the statistics drift
+
+                    this->extensions::memory_resource_statistics::deallocation_made(block_to_deallocate->requested_size_.load(memory_order_relaxed));
                 }
 
                 if constexpr (is_base_of_v<extensions::lockfree_single_arena_resource_extended_statistics, lockfree_single_arena_resource_impl>)

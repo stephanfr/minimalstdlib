@@ -8,7 +8,6 @@ the intended blocking condition.
 | `EliminationArray.tla` | `include/lockfree/elimination_array`: one slot's state machine | every element handed over exactly once (asserts, `ExactlyOnce`); `Termination` | `EliminationArray.cfg`: 3 threads × 2 ops | no error, 206,980 distinct states |
 | | | the same, with thread 2 an interrupt handler on thread 1's CPU | `EliminationArray_irq.cfg`: 3 threads × 2 ops | no error, 174,124 distinct states |
 | `SpMcValueStack.tla` | `include/lockfree/sp_mc_value_stack`: `(generation, count)` state, single producer | nothing popped that was not pushed, nothing lost; `Termination` | `SpMcValueStack.cfg`: 1 producer (4 pushes), 2 consumers × 2 pops | no error, 116,609 distinct states |
-| | | the same, with a 1-value generation | `SpMcValueStack_genwrap.cfg` | violated (ABA, which the 32-bit generation prevents) |
 | `SpscQueue.tla` | `include/lockfree/spsc_queue` | neither side touches a slot the other owns; FIFO; nothing lost; the destructor destroys exactly the live elements; `Termination` | `SpscQueue.cfg`: 3 slots, 4 pushes, 3 pops | no error, 852 distinct states |
 | `TokenDispenser.tla` | `include/lockfree/token_dispenser` | no token held twice; `Termination` (`get_token` blocks while every token is held, which is intended) | `TokenDispenser.cfg`: 2 tokens, 3 threads × 2 rounds | no error, 335,387 distinct states |
 

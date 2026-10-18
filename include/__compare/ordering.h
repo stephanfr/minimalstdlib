@@ -17,7 +17,17 @@
 #include <__type_traits/enable_if.h>
 #include <__type_traits/is_same.h>
 
-namespace MINIMAL_STD_NAMESPACE
+//  The compiler's built-in operator<=> (on arithmetic types and pointers) returns the comparison category types, and
+//      looks them up as classes in namespace std: clang rejects a typedef there.  So when minstd provides the compiler's
+//      std dependencies, the classes themselves are declared in std, and minstd names them with using-declarations.
+
+#ifdef _MINIMAL_STD_PROVIDE_COMPILER_STD_NAMESPACE_DEPENDENCIES
+#define _MINIMAL_STD_ORDERING_NAMESPACE std
+#else
+#define _MINIMAL_STD_ORDERING_NAMESPACE MINIMAL_STD_NAMESPACE
+#endif
+
+namespace _MINIMAL_STD_ORDERING_NAMESPACE
 {
     // exposition only
     enum class _OrdResult : signed char
@@ -45,7 +55,7 @@ namespace MINIMAL_STD_NAMESPACE
         //
         // The alternative to the `__enable_if__` attribute would be to use the fact that a pointer
         // can be constructed from literal 0, but this conflicts with `-Wzero-as-null-pointer-constant`.
-        template <class _Tp, class = __enable_if_t<is_same_v<_Tp, int>>>
+        template <class _Tp, class = ::MINIMAL_STD_NAMESPACE::__enable_if_t<::MINIMAL_STD_NAMESPACE::is_same_v<_Tp, int>>>
         _MINIMAL_STD_HIDDEN consteval _CmpUnspecifiedParam(_Tp __zero) noexcept
 #if __has_attribute(__enable_if__)
             __attribute__((__enable_if__(
@@ -312,6 +322,19 @@ namespace MINIMAL_STD_NAMESPACE
     inline constexpr strong_ordering strong_ordering::equivalent(_OrdResult::__equiv);
     inline constexpr strong_ordering strong_ordering::greater(_OrdResult::__greater);
 
+} // namespace _MINIMAL_STD_ORDERING_NAMESPACE
+
+namespace MINIMAL_STD_NAMESPACE
+{
+#ifdef _MINIMAL_STD_PROVIDE_COMPILER_STD_NAMESPACE_DEPENDENCIES
+    using std::_CmpUnspecifiedParam;
+    using std::_OrdResult;
+    using std::_PartialOrdResult;
+    using std::partial_ordering;
+    using std::strong_ordering;
+    using std::weak_ordering;
+#endif
+
     /// [cmp.categories.pre]/1
     /// The types partial_ordering, weak_ordering, and strong_ordering are
     /// collectively termed the comparison category types.
@@ -320,17 +343,4 @@ namespace MINIMAL_STD_NAMESPACE
         is_same_v<_Tp, partial_ordering> || is_same_v<_Tp, weak_ordering> || is_same_v<_Tp, strong_ordering>;
 } // namespace MINIMAL_STD_NAMESPACE
 
-
-//  Include classess needed by the compiler in the 'std' namespace
-
-#ifdef _MINIMAL_STD_PROVIDE_COMPILER_STD_NAMESPACE_DEPENDENCIES
-namespace std
-{
-//  Ordering types must be available in the std namespace as some comparison
-//      operators depend upon them
-
-    using strong_ordering = MINIMAL_STD_NAMESPACE::strong_ordering;
-    using weak_ordering = MINIMAL_STD_NAMESPACE::weak_ordering;
-    using partial_ordering = MINIMAL_STD_NAMESPACE::partial_ordering;
-}
-#endif
+#undef _MINIMAL_STD_ORDERING_NAMESPACE

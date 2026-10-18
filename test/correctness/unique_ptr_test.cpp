@@ -185,7 +185,7 @@ namespace
         {
             auto ptr = make_tracked_unique(resource, 42);
 
-            CHECK(ptr);
+            CHECK(static_cast<bool>(ptr));
             CHECK(ptr.get() != nullptr);
             CHECK_EQUAL(42, ptr->value());
             CHECK_EQUAL(42, (*ptr).value());
@@ -330,5 +330,62 @@ namespace
 
         CHECK(ptr.get() != nullptr); //  before: destroyed and null
         CHECK_EQUAL(42, *ptr);
+    }
+
+    struct chained_node
+    {
+        minstd::unique_ptr<chained_node> next;
+        int id;
+
+        explicit chained_node(int node_id)
+            : id(node_id)
+        {
+            live++;
+        }
+
+        ~chained_node()
+        {
+            live--;
+        }
+
+        inline static int live = 0;
+    };
+
+    static minstd::unique_ptr<chained_node> make_node(counting_resource &resource, int id)
+    {
+        void *storage = resource.allocate(sizeof(chained_node), alignof(chained_node));
+        return minstd::unique_ptr<chained_node>(new (storage) chained_node(id), resource);
+    }
+
+    TEST(UniquePtrTests, MoveAssignFromAnObjectTheTargetOwns)
+    {
+        //  head = move(head->next): the source lives inside the object head owns.  Assignment used to destroy that
+        //      object first (and with it the rest of the chain), then read the source from freed memory.
+        counting_resource resource;
+        chained_node::live = 0;
+
+        {
+            auto head = make_node(resource, 1);
+            head->next = make_node(resource, 2);
+            head->next->next = make_node(resource, 3);
+
+            head = minstd::move(head->next);
+
+            CHECK(head.get() != nullptr);
+            CHECK_EQUAL(2, head->id);
+            CHECK(head->next.get() != nullptr);
+            CHECK_EQUAL(3, head->next->id);
+            CHECK_EQUAL(2, chained_node::live); //  only node 1 is gone
+        }
+
+        CHECK_EQUAL(0, chained_node::live);
+        CHECK_EQUAL(resource.allocate_calls_, resource.deallocate_calls_);
+    }
+
+    TEST(UniquePtrTests, BoolConversionIsExplicit)
+    {
+        //  An implicit operator bool let a == b compile and compare truthiness.
+        static_assert(!minstd::is_convertible_v<minstd::unique_ptr<int>, bool>);
+        static_assert(minstd::is_constructible_v<bool, minstd::unique_ptr<int>>);
     }
 }

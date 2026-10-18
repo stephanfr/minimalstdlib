@@ -24,6 +24,39 @@ static_assert(__cplusplus >= 202002L, "Minimal C++ Stdlib requires C++ 20 or lat
 #define MINIMAL_STD_FAILURE_POLICY_DEFAULT 0
 #define MINIMAL_STD_FAILURE_POLICY_TEST 1
 
+//
+//  How lockfree::tagged_ptr restores the address bits its counter displaces (the top 16 with the
+//      default 16-bit counter).  Pick the rule that matches where the tagged objects live:
+//
+//      ZERO            the top bits are zero: user space, identity-mapped low memory, TTBR0.
+//      ONES            the top bits are ones: the upper (TTBR1) half on AArch64, kernel space on x86-64.
+//      SIGN_EXTEND_47  the top bits copy bit 47: right for x86-64 canonical addresses and for AArch64
+//                      with VAs of at most 47 bits.  With 48-bit VAs on AArch64 each half spans bit 47:
+//                      a TTBR0 address with bit 47 set (0x00008000'00000000 and up) decodes into the upper
+//                      half, and a TTBR1 address with bit 47 clear (0xFFFF0000'00000000 to
+//                      0xFFFF7FFF'FFFFFFFF) into the lower half.  Use ZERO or ONES there.
+//
+//  The default is SIGN_EXTEND_47, and ZERO for the hosted test build.
+//
+
+#define MINIMAL_STD_POINTER_TOP_BITS_ZERO 0
+#define MINIMAL_STD_POINTER_TOP_BITS_ONES 1
+#define MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47 2
+
+#if !defined(MINIMAL_STD_POINTER_TOP_BITS)
+#if defined(__MINIMAL_STD_TEST__)
+#define MINIMAL_STD_POINTER_TOP_BITS MINIMAL_STD_POINTER_TOP_BITS_ZERO
+#else
+#define MINIMAL_STD_POINTER_TOP_BITS MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47
+#endif
+#endif
+
+#if (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_ZERO) && \
+    (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_ONES) &&  \
+    (MINIMAL_STD_POINTER_TOP_BITS != MINIMAL_STD_POINTER_TOP_BITS_SIGN_EXTEND_47)
+#error "Invalid MINIMAL_STD_POINTER_TOP_BITS value"
+#endif
+
 extern "C" void __assert(const char *msg, const char *file, int line);
 
 #define MINIMAL_STD_NAMESPACE minstd
@@ -130,46 +163,48 @@ namespace MINIMAL_STD_NAMESPACE
 }
 
 #define MINIMAL_STD_ASSERT(expression)                                                  \
-    {                                                                                   \
+    do {                                                                                \
         if (!(expression))                                                              \
         {                                                                               \
             ::MINIMAL_STD_NAMESPACE::contract_violation(#expression, __FILE__, __LINE__); \
         }                                                                               \
-    }
+    } while (0)
 
 #define MINIMAL_STD_FAIL(message)                                                   \
-    {                                                                               \
+    do {                                                                            \
         ::MINIMAL_STD_NAMESPACE::contract_violation(#message, __FILE__, __LINE__); \
-    }
+    } while (0)
 
 #if MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_LEGACY
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...) \
-    {                                                               \
+    do {                                                            \
         (void)(requested_bytes);                                    \
         (void)(alignment);                                          \
         __VA_ARGS__;                                                \
-    }
+    } while (0)
 #elif MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_TRAP
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...)                    \
-    {                                                                                 \
+    do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
-    }
+        __VA_ARGS__; /* reached only when the failure policy returns (TEST) */        \
+    } while (0)
 #elif MINIMAL_STD_ALLOCATION_FAILURE_POLICY == MINIMAL_STD_ALLOCATION_FAILURE_POLICY_THROW
 #if defined(__cpp_exceptions)
 #include <new>
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...) \
-    {                                                               \
+    do {                                                            \
         (void)(requested_bytes);                                    \
         (void)(alignment);                                          \
         throw ::std::bad_alloc();                                  \
-    }
+    } while (0)
 #else
 #define MINIMAL_STD_OUT_OF_MEMORY(requested_bytes, alignment, ...)                    \
-    {                                                                                 \
+    do {                                                                              \
         ::MINIMAL_STD_NAMESPACE::allocation_failure((requested_bytes), (alignment),   \
                                                     __FILE__, __LINE__);              \
-    }
+        __VA_ARGS__; /* reached only when the failure policy returns (TEST) */        \
+    } while (0)
 #endif
 #else
 #error "Invalid MINIMAL_STD_ALLOCATION_FAILURE_POLICY value"

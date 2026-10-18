@@ -85,7 +85,7 @@ namespace
             pthread_join(test_threads[i], nullptr);
         }
 
-        minstd::array<uint32_t, 17> aggregated_values;
+        minstd::array<uint32_t, 17> aggregated_values{}; //  an aggregate: without the braces the counters start as whatever is on the stack
 
         for (uint32_t i = 0; i < NUM_THREADS; i++)
         {
