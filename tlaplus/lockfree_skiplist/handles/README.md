@@ -26,7 +26,7 @@ republished between its two loads.
 
 | Config | What | Expected | Result |
 |--------|------|----------|--------|
-| `SlotHandleResolution_recheck.cfg` | generation re-checked after the table load | no error, terminates | no error, 41,747 distinct states |
+| `SlotHandleResolution.cfg` | generation re-checked after the table load | no error, terminates | no error, 41,747 distinct states |
 
 ## Iterators (use-after-free, found by the stress test)
 
@@ -57,4 +57,4 @@ three codegens.
 
 | Config | What | Expected | Result |
 |--------|------|----------|--------|
-| `IteratorSavedHandle_fixed.cfg` | `unpack_unretired_ptr` | no error, terminates | no error, 4,306 distinct states |
+| `IteratorSavedHandle.cfg` | `unpack_unretired_ptr` | no error, terminates | no error, 4,306 distinct states |

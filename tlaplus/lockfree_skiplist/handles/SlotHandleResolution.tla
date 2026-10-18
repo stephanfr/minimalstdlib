@@ -7,8 +7,8 @@
 (*   free_slot:    slot_table.store(nullptr)                               *)
 (*   unpack_ptr:   g = generation.load(); if g != handle.gen return null;  *)
 (*                 p = slot_table.load();                                  *)
-(*                 [Recheck: if generation.load() != handle.gen return     *)
-(*                  null]; return p                                        *)
+(*                 if generation.load() != handle.gen return null;         *)
+(*                 return p                                                *)
 (*                                                                         *)
 (* The node published in generation k is node k.  Readers hold handles of *)
 (* every generation up to MaxGen, so some are current and some stale.      *)
@@ -16,7 +16,7 @@
 (***************************************************************************)
 EXTENDS Integers, TLC
 
-CONSTANTS MaxGen, Readers, Recheck
+CONSTANTS MaxGen, Readers
 
 (* --algorithm SlotHandleResolution {
 variables gen = 1, table = 1;
@@ -37,9 +37,7 @@ variables h \in 1..MaxGen, g = 0, p = 0, res = -1;
  R_gen:     g := gen;
             if (g # h) { res := 0; goto R_done; };
  R_table:   p := table;
-            if (Recheck) {
- R_recheck:     if (gen # h) { res := 0; goto R_done; };
-            };
+ R_recheck: if (gen # h) { res := 0; goto R_done; };
  R_ret:     res := p;
  R_done:    assert res \in {0, h};
 }
@@ -97,9 +95,7 @@ R_gen(self) == /\ pc[self] = "R_gen"
 
 R_table(self) == /\ pc[self] = "R_table"
                  /\ p' = [p EXCEPT ![self] = table]
-                 /\ IF Recheck
-                       THEN /\ pc' = [pc EXCEPT ![self] = "R_recheck"]
-                       ELSE /\ pc' = [pc EXCEPT ![self] = "R_ret"]
+                 /\ pc' = [pc EXCEPT ![self] = "R_recheck"]
                  /\ UNCHANGED << gen, table, h, g, res >>
 
 R_recheck(self) == /\ pc[self] = "R_recheck"
@@ -117,7 +113,7 @@ R_ret(self) == /\ pc[self] = "R_ret"
 
 R_done(self) == /\ pc[self] = "R_done"
                 /\ Assert(res[self] \in {0, h[self]}, 
-                          "Failure of assertion at line 44, column 13.")
+                          "Failure of assertion at line 42, column 13.")
                 /\ pc' = [pc EXCEPT ![self] = "Done"]
                 /\ UNCHANGED << gen, table, h, g, p, res >>
 

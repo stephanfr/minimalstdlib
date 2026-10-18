@@ -56,11 +56,8 @@ Not modelled here (each covered elsewhere):
 - a remover: tombstone its own links top-down, then level 0; its traversal unlinks the upper links it sees; it unlinks level 0 and retires only if `upper_levels_drained()`;
 - helping traversals: unlink tombstoned upper links (`-1` each), and retire the node once it is drained.
 
-`DrainGate = FALSE` models the code before 68ab76f (no count; the remover always unlinks level 0 and retires).
-
-`RetargetBug = TRUE` models `remove()` before the retarget fix. After a failed level-0 mark, its re-walk could land on
-this node (a re-insert of a key whose original node another thread had removed) and mark only level 0, skipping the
-upper levels. The fix restarts the remove, which is the normal remover (`RetargetBug = FALSE`).
+A remove whose level-0 mark fails restarts, so a remover never marks level 0 without first tombstoning the upper
+levels.
 
 | Config | Expected | Result |
 |--------|----------|--------|

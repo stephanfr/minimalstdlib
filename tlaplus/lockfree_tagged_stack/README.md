@@ -12,7 +12,7 @@ One label per shared-memory access:
 |-----|-------|
 | `push`: `head.load`; loop { `store_link(node, head.ptr)`; CAS `head -> (node, counter + 1)` } | `U_load`, `U_link`, `U_cas` |
 | `pop`: `head.load`; loop { null → return; `next = load_link(cur)`; CAS `head -> (next, counter + 1)` }; `store_link(cur, null)` | `P_load`, `P_check`, `P_link`, `P_cas`, `P_clear` |
-| `steal_all`: CAS loop `head -> (null, counter + 1)` | one step; `StealResetsTag = TRUE` is the old `exchange(make(nullptr))`, which reset the counter to 0 |
+| `steal_all`: CAS loop `head -> (null, counter + 1)` | one step |
 | caller writes into a block it owns (the static arena's bin-7 splice via `store_link`; the single arena's metadata reuse) | `Scribble`: an owner sets a node's link word to any value |
 
 - A thread owns the nodes it popped or stole, and may push them back.
@@ -33,16 +33,18 @@ One label per shared-memory access:
 | Config | What | Expected | Result |
 |--------|------|----------|--------|
 | `pop_push_only.cfg` | pop + push | no error | no error, 18,515 distinct states |
-| `steal_advances_tag.cfg` | pop + push + `steal_all` (the code now) | no error | no error, 228,193 distinct states |
+| `steal_all.cfg` | pop + push + `steal_all` (the code now) | no error | no error, 228,193 distinct states |
 | `scribble.cfg` | as above, owners overwrite link words | no error | no error, 663,383 distinct states |
+| `bug_tag_wraps.cfg` | pop + push with a 2-value counter | `Safety` violated | violated: the example of a failing model |
 
-**`steal_all` fix:** the old `exchange(make(nullptr))` reset the counter to 0. A popper stalled with `(A, 0)` could
-then succeed against a later `(A, 0)` and install a stale next pointer. `steal_all` now advances the counter with a
-CAS loop. `lockfree_single_arena_resource::steal_pending_deallocation_list` uses it instead of its own `exchange`.
+**`steal_all`** advances the counter (a CAS loop) rather than resetting it: a popper stalled with `(A, n)` must not
+succeed against a later `(A, n)`. `lockfree_single_arena_resource::steal_pending_deallocation_list` uses it.
 
 ## Counter width per user
 
-The counter must not wrap while one popper is stalled between its head load and its CAS.
+The counter must not wrap while one popper is stalled between its head load and its CAS. `bug_tag_wraps.cfg`, the
+one deliberately failing configuration under `tlaplus/`, shows what happens when it does: the same spec with only
+the counter width changed.
 
 | User | Head encoding | Counter bits | Head changes needed during one stall |
 |------|---------------|--------------|--------------------------------------|

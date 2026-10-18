@@ -362,7 +362,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, TailFreeingRestoresFrontierAfterMai
 
 //  The handler allocates from the resource it interrupted, so its guards must mask the signal as interrupt_guard
 //      masks interrupts on the target: the TRIMMING window in trim_metadata_records() relies on that, and with a
-//      no-op guard a handler landing inside it spins forever (bug N6, tlaplus/lockfree_allocator/bug_n6.cfg).
+//      no-op guard a handler landing inside it spins forever (tlaplus/lockfree_allocator models the guarded trim).
 //      The signal still arrives everywhere the resource leaves interrupts enabled.
 
 typedef minstd::pmr::lockfree_single_arena_resource_impl<

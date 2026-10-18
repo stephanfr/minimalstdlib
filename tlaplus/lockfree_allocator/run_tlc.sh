@@ -2,8 +2,8 @@
 # Translate the PlusCal in LockfreeSingleArena.tla and run TLC on one configuration.
 #
 #   ./run_tlc.sh [config] [extra TLC args...]
-#   ./run_tlc.sh fixed_small.cfg
-#   ./run_tlc.sh fixed_stale.cfg -simulate -depth 2000
+#   ./run_tlc.sh small.cfg
+#   ./run_tlc.sh stale_backlink.cfg -simulate -depth 2000
 
 set -e
 
@@ -13,7 +13,7 @@ TLA_JAR="$TLA_DIR/tla2tools.jar"
 TLA_VERSION="1.8.0"
 SPEC="LockfreeSingleArena.tla"
 
-CONFIG="${1:-fixed_small.cfg}"
+CONFIG="${1:-small.cfg}"
 shift || true
 
 if [ ! -f "$TLA_JAR" ]; then

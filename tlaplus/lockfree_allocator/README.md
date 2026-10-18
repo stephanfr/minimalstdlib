@@ -2,39 +2,27 @@
 
 `LockfreeSingleArena.tla` is a PlusCal model of `include/__memory_resource/lockfree_single_arena_resource.h`. Each label in the model corresponds to one shared-memory access in the C++ code: an atomic load, store, CAS or exchange. Comments next to each label name the C++ function it models.
 
-It replaces `LockfreeAllocatorTagged.tla`, which described an earlier design (soft-deleted metadata, iterators, last-block reclaim) that no longer exists in the code.
-
-`boundary/` holds two small models of just the frontier/metadata boundary as the code handles it now (the `FixedBoundary` switch below); checking the overlap there needs five concurrent allocations, which is beyond an exhaustive run of this model.
+`boundary/` holds two small models of just the frontier/metadata boundary: checking an overlap there needs five concurrent allocations, which is beyond an exhaustive run of this model.
 
 ## What is modelled
 
 | C++ | Model |
 |-----|-------|
-| `next_empty_memory_block_` | `fwPtr`, plus `fwCtr` (tag counter) or `fwPred` (packed predecessor, N4) |
+| `next_empty_memory_block_` (block pointer and its predecessor, packed) | `fwPtr`, `fwPred` |
 | `block_header` (`metadata_index_`, `size_including_header_`, `previous_block_`) at every 64-byte unit | `hdrMeta`, `hdrSize`, `hdrPrev` |
 | `block_metadata::block_state_` (pointer + state), `total_size_`, `original_shard_` | `mState`, `mPtr`, `mSize`, `mShard` |
 | `current_metadata_record_count_` | `metaCount` |
 | `metadata_block_manager` (`state_and_active_count_`, `local_free_head_`) | `mgrActive`, `mgrTrimming`, `mgrFree` |
 | `free_block_bins_` | `bins[size][shard]` |
 | `pending_shards_[s]` (`head_`, `count_`, `maintenance_window_open_`) | `pending`, `pendingCount`, `windowOpen` |
-| `frontier_reclaim_in_progress_` (N4) | `reclaimBusy` |
+| `frontier_reclaim_in_progress_` | `reclaimBusy` |
 | `interrupt_guard` | `guardDepth[cpu]` |
 
 Procedures: `Allocate` (`do_allocate`), `Deallocate` (`do_try_deallocate`), `Search` (`search_for_deallocated_block` + `unguarded_try_claim_popped_block`), `GetMetaIndex` (`get_next_metadata_record_index`), `GetEmptyBlock` (`get_next_empty_memory_block`), `MaybeWindow`, `RunWindow` (`run_maintenance_window`, with `reclaim_pending_frontier_batch` and `process_pending_batch` inline), `RunWindowAll`, `TryReclaim` (`try_reclaim_frontier_blocks`), `Trim` (`trim_metadata_records`), `RecycleMetadata`.
 
 **Threads and interrupts.** There is one `Main` process per CPU, and each CPU is its own shard. `Main` process `i` makes `OpsPerThread[i]` calls, each one an allocate or a free of something it holds. With `UseInterrupts = TRUE`, an `Irq` process per CPU can start only while that CPU is outside every `interrupt_guard`. While it runs, that CPU's `Main` process makes no progress (`CanRun` in `NextI`).
 
-## Fix switches
-
-These let one model check the code before and after each fix. N3-N6 are the fix numbers used when the model was written; all of them are in the current code.
-
-| Constant | Old behaviour | Fixed |
-|----------|---------------|-------|
-| `FrontierMode` | `"pre_cas_backlink"`: `next->previous_block_` written before the frontier CAS (cebad98) | `"post_cas_hint"` (N3: written after the CAS, hint range- and adjacency-checked), `"packed"` (N4, the current code: predecessor in the frontier word, no adjacency check) |
-| `SerializeReclaim` | `FALSE`: per-shard windows can roll the frontier back concurrently | `TRUE` (N4) |
-| `PendingCountFirst` | `FALSE`: push, then `count_++` | `TRUE` (N5) |
-| `GuardTrim` | `FALSE`: TRIMMING held outside an interrupt guard | `TRUE` (N6) |
-| `FixedBoundary` | `FALSE`: each side checks the other region, then CASes its own word, with no re-check | `TRUE` (the current code): after its CAS each side re-checks the other and, on overlap, undoes its claim once it is on top of its own stack, or keeps it if the overlap has gone (`grow_metadata_region`, the frontier CAS in `get_next_empty_memory_block`) |
+## Model parameters
 
 `InitialBacklinks` sets the initial `previous_block_` contents. The arena buffer is not zeroed, so it can hold anything, including a back-link left over from an earlier layout:
 - `CleanArena`: all null.
@@ -49,23 +37,23 @@ These let one model check the code before and after each fix. N3-N6 are the fix 
 - `TrackedBlocksDisjoint`, `TrackedBlocksBelowFrontier`: the same for blocks the allocator still tracks (`IN_USE`, `LOCKED`, `DEALLOCATED_PENDING`, `AVAILABLE`).
 - `ListsDisjoint`, `ListStatesConsistent`: a metadata record is in at most one list, and its state matches that list.
 - `NothingBeyondMetaCount`: a trimmed record is never still referenced.
-- `PendingCountExact` (N5): with no free between its push and its count update, `count_` equals the queued entries plus the stolen ones not yet subtracted.
+- `PendingCountExact`: with no free between its count update and its push, `count_` equals the queued entries plus the stolen ones not yet subtracted.
 - `ActiveSlotsNonNegative`.
-- `FrontierBelowMetadata`: the block region never reaches a metadata record. With `FixedBoundary` a claim can overlap the other region between its CAS and its re-check or undo, so this is checked whenever no process is in that window.
+- `FrontierBelowMetadata`: the block region never reaches a metadata record. A claim can overlap the other region between its CAS and its re-check or undo, so this is checked whenever no process is in that window.
 - `NoBlockOverRecord`: no block handed out or still tracked covers a metadata record that is in use, at any time.
 
 Assertions, reported by TLC as `Failure of assertion`:
-- the allocator never reads or writes a block header that lies inside a caller's live allocation (N3, N4);
+- the allocator never reads or writes a block header that lies inside a caller's live allocation;
 - a free of a valid allocation is never rejected;
 - a node is never pushed onto a list while it is already on one;
-- `reduce_pending_deallocation_count` never underflows (N5's assert).
+- `reduce_pending_deallocation_count` never underflows (the C++ asserts it).
 
-Deadlock checking is on, which is how an interrupt handler that can never finish is found (N6).
+Deadlock checking is on, which is how an interrupt handler that can never finish would be found (for example one spinning on a manager the code it interrupted is trimming).
 
 ## Abstractions
 
 - Memory is counted in 64-byte units. Metadata record `i` sits at unit `ArenaUnits-1-i`, so the frontier/metadata collision checks are the C++ ones.
-- `intrusive_tagged_stack` push and pop are single atomic steps on a set, and pop order is nondeterministic, which covers LIFO. The tag counter is what makes the C++ CAS ABA-safe; the link race is M15 in the plan.
+- `intrusive_tagged_stack` push and pop are single atomic steps on a set, and pop order is nondeterministic, which covers LIFO. The tag counter is what makes the C++ CAS ABA-safe; `lockfree_tagged_stack/` models the stack itself.
 - The 8 address bins are collapsed into one list per (size class, shard). Each size in `Sizes` is its own size class.
 - Packed-state version counters are not modelled. Every allocation is freed exactly once, by the thread holding it (the API contract), so a version never decides a CAS. A double free of a stale pointer is therefore outside the model.
 - A window walks the stolen pending list head-first (LIFO) and hands `Threshold` entries at a time to `process_pending_batch`, as the C++ does with `MAINTENANCE_WINDOW_BATCH_SIZE`. The scan of one batch in `reclaim_pending_frontier_batch` (one state load per entry) is a single step.
@@ -73,30 +61,22 @@ Deadlock checking is on, which is how an interrupt handler that can never finish
 
 ## Configurations and expected results
 
-`fixed_*` configurations correspond to the current code (every switch on). `bug_n6.cfg` is kept as an example of what the switches are for: it turns one fix off and TLC shows the defect (the deadlock that the trim's interrupt guard prevents). Models of the other fixed defects were removed once their fixes were in; the correct specs are what prove the code.
-
-| Config | Switches | Expected | Result (TLC 1.8, 2 workers) |
+| Config | Parameters | Expected | Result (TLC 1.8) |
 |--------|----------|----------|-----------------------------|
-| `fixed_small.cfg` | all fixed; 2 CPUs × 2 ops, clean arena, threshold 1 | no error | no error; 2,292,571 distinct states |
-| `fixed_batch2.cfg` | all fixed; 2 CPUs × 2 ops, threshold and batch size 2 | no error | no error; 1,358,141 distinct states |
-| `fixed_irq.cfg` | all fixed; 1 CPU (3 ops) + interrupt handler (2 ops) | no error, no deadlock | no error; 1,513,359 distinct states |
-| `fixed_stale.cfg` | all fixed; 2 CPUs, 1+3 ops, `StaleBacklinkAt5` | no error | no error; 977,131 distinct states |
-| `fixed_small_live.cfg` | all fixed; 2 CPUs (2 + 1 ops), `SpecIFair` (weak fairness per process) | no error; `Termination` (no livelock in the spin/undo loops) | no error, `Termination` holds; 99,093 distinct states |
-| `fixed_irq_live.cfg` | as `fixed_irq.cfg`, `SpecIFair` | no error; `Termination` | no error, `Termination` holds; 1,513,359 distinct states |
-| `fixed_irq2.cfg` | all fixed; 2 CPUs × 1 op, each with an interrupt handler (1 op) | no error, no deadlock | no error in 13,254,117 distinct states (stopped after 50 min with TSan sharing the CPUs, not exhaustive; 811,561 states left on the queue) |
-| `fixed_irq2_small.cfg` | as `fixed_irq2.cfg` with one block size (2) and 10 arena units | no error, no deadlock | no error; 31,195,287 distinct states (exhaustive, 60 min on 4 workers) |
-| `bug_n6.cfg` | `GuardTrim = FALSE`; 1 CPU + interrupt | deadlock: handler spins in `GM_breserve` while the interrupted `Trim` holds TRIMMING | deadlock |
+| `small.cfg` | 2 CPUs × 2 ops, clean arena, threshold 1 | no error | no error; 2,259,464 distinct states |
+| `batch2.cfg` | 2 CPUs × 2 ops, threshold and batch size 2 | no error | no error; 1,341,697 distinct states |
+| `irq.cfg` | 1 CPU (3 ops) + interrupt handler (2 ops) | no error, no deadlock | no error; 1,506,856 distinct states |
+| `stale_backlink.cfg` | 2 CPUs, 1+3 ops, `StaleBacklinkAt5` | no error | no error; 956,908 distinct states |
+| `small_live.cfg` | 2 CPUs (2 + 1 ops), `SpecIFair` (weak fairness per process) | no error; `Termination` (no livelock in the spin/undo loops) | no error, `Termination` holds; 95,417 distinct states |
+| `irq_live.cfg` | as `irq.cfg`, `SpecIFair` | no error; `Termination` | no error, `Termination` holds; 1,506,856 distinct states |
+| `irq2.cfg` | 2 CPUs × 1 op, each with an interrupt handler (1 op) | no error, no deadlock | no error in 13,254,117 distinct states (stopped after 50 min with TSan sharing the CPUs, not exhaustive; 811,561 states left on the queue); a run from before the switches were removed |
+| `irq2_small.cfg` | as `irq2.cfg` with one block size (2) and 10 arena units | no error, no deadlock | no error; 30,846,135 distinct states (exhaustive, 70 min on 4 workers) |
 
 ## Running
 
 ```bash
-./run_tlc.sh fixed_small.cfg                     # exhaustive, ~6 minutes on 3 cores
-./run_tlc.sh bug_n6.cfg                          # expected to fail: prints the counterexample
-./run_tlc.sh fixed_small.cfg -simulate -depth 600   # random deeper runs
+./run_tlc.sh small.cfg                       # exhaustive, ~6 minutes on 3 cores
+./run_tlc.sh small.cfg -simulate -depth 600  # random deeper runs
 ```
 
 `run_tlc.sh` translates the PlusCal (`pcal.trans`) before each run, so edit the algorithm, not the generated TLA+ between `BEGIN TRANSLATION` and `END TRANSLATION`.
-
-## Not demonstrated
-
-N4's second hole needs two shards' maintenance windows rolling the frontier back at the same moment, so that one reclaimer reads a predecessor header that the other has just exposed to reallocation. It needs more operations than an exhaustive run can cover. `SerializeReclaim = FALSE` with `FrontierMode = "packed"` is still useful for deeper simulation runs (`-simulate`).

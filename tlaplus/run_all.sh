@@ -7,8 +7,8 @@
 #
 #  Environment: TLC_WORKERS (default 2), TLC_TIMEOUT seconds per configuration (default 3600), TLA_JAR (default
 #  tlaplus/tla2tools.jar, downloaded if missing).  Each line is checked against the expected result: *bug*
-#  configurations model a known defect and are expected to fail (one is kept as an example,
-#  lockfree_allocator/bug_n6.cfg); every other configuration is expected to pass.  A line that differs (or times
+#  configurations are expected to fail (one is kept as an example of a failing model,
+#  lockfree_tagged_stack/bug_tag_wraps.cfg); every other configuration is expected to pass.  A line that differs (or times
 #  out) is marked UNEXPECTED and the script exits 1.
 #
 #  A spec is chosen per configuration: the only .tla file in its directory, or else the .tla whose name is the
@@ -17,7 +17,7 @@
 TLA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TLA_JAR="${TLA_JAR:-$TLA_DIR/tla2tools.jar}"
 FILTER="${1:-}"
-SLOW="fixed_irq2.cfg fixed_irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeSkiplist_safety_2t.cfg"
+SLOW="irq2.cfg irq2_small.cfg BitblockSet.cfg BitblockSet_strict.cfg BitblockSet_stress.cfg LockfreeSkiplist_safety_2t.cfg"
 
 if [ ! -f "$TLA_JAR" ]; then
     wget -q "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar" -O "$TLA_JAR" || exit 1

@@ -15,7 +15,7 @@ otherwise.
 
 | Class | Coverage | Deadlock / livelock | Races (C++ and AArch64) | Use-after-free / bad access |
 |-------|----------|---------------------|-------------------------|-----------------------------|
-| `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`fixed_small_live`, `fixed_irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
+| `lockfree_single_arena_resource` | `lockfree_allocator/` (+ `boundary/`) | `Termination` under fairness (`small_live`, `irq_live`) | every relaxed access is ordered by a later release of `block_state_` or read after a claim; litmus A | `Safety` (no overlap, header reads in live blocks only) |
 | `intrusive_tagged_stack` | `lockfree_tagged_stack/` | `Termination` | link load/store are atomic; MP through head release/acquire | ABA: needs the counter not to wrap during one stall (2^16 head changes; 2^39+ for the static arena's arena-relative heads) |
 | `lockfree_static_arena_resource` | tagged stack model (`scribble.cfg`) + bump-pointer argument below | lock-free CAS loops | **fixed:** links in a side table, so a stale `load_link` never reads caller memory | type-stable arena memory |
 | `bitblock_set` | `lockfree_bitblock_set/` | TLC deadlock check; CAS loops are lock-free (a failed CAS means another context succeeded) | acquire to take bits, release to return them | `MutualExclusion`, `NoOrphanBits` (small configs exhaustive) |
@@ -44,11 +44,11 @@ match the code.
 - **Address bins collapsed to a single bin per size and shard.** This is an over-approximation: any block can be
   found by any search of its size.
 - **Batch frontier reclaim is a single step.** The batch is private to the reclaimer once taken, and frontier
-  rollback is serialised by `frontier_reclaim_in_progress_` (N4), so nothing else can interleave with it.
-- **Undo loops** (`FB_undo`, `GM_bundo`, `GM_breserve`) wait only on a later or deeper context. `fixed_small_live`
-  and `fixed_irq_live` check that they terminate under weak fairness: no livelock.
+  rollback is serialised by `frontier_reclaim_in_progress_`, so nothing else can interleave with it.
+- **Undo loops** (`FB_undo`, `GM_bundo`, `GM_breserve`) wait only on a later or deeper context. `small_live`
+  and `irq_live` check that they terminate under weak fairness: no livelock.
 
-**Cross-CPU interrupts:** `fixed_irq2.cfg` is not exhaustive. `fixed_irq2_small.cfg` (one block size, smaller arena)
+**Cross-CPU interrupts:** `irq2.cfg` is not exhaustive. `irq2_small.cfg` (one block size, smaller arena)
 is exhaustive: no error and no deadlock in 31,195,287 distinct states.
 
 **Weak memory:**
@@ -133,7 +133,7 @@ use-after-free. That is covered by:
 - **`remove()` retargeting (fixed):** after a failed level-0 mark, `remove()`'s re-walk could land on a node that
   re-inserted its key after another thread removed the original, and mark only its level 0. That node then either
   leaked (never drained) or, if its inserter was still publishing, was retired and then published at an upper level
-  (use-after-free). `remove()` now restarts instead (`upper_levels/`, `RetargetBug`; regression test
+  (use-after-free). `remove()` now restarts instead (`upper_levels/`; regression test
   `RemoveThatLandsOnAReinsertedNodeReclaimsIt`).
 - **`slot_blocks/`:** slot blocks shared between lists of one type (fixed).
 - **`handles/`:** stale-handle resolution (fixed), and iterators resolving a handle kept between read sections

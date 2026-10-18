@@ -16,9 +16,6 @@
 | `OwnedImpliesSet`, `SetImpliesOwned` | the word and the holders agree |
 | `ReleaseByOwnerSucceeds` | an owner's release returns `SUCCESS` |
 
-`NonAtomic = TRUE` splits each RMW into a load and a store: a mutation, for checking that the invariants catch a
-race (no configuration sets it; `MutualExclusion` fails with it).
-
 ## Configurations and results (TLC 1.8, exhaustive)
 
 | Config | Parameters | Result |
