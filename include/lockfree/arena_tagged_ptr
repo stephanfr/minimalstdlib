@@ -13,19 +13,21 @@ namespace MINIMAL_STD_NAMESPACE
 {
     namespace lockfree
     {
-        //  A tagged head word for nodes that are ALIGN-aligned and lie inside one arena: the node is stored as its
-        //      index in the arena ((p - base) / ALIGN + 1, 0 for null), so the index needs only as many bits as the
-        //      arena has ALIGN-sized units, and every other bit of the 64-bit word holds the ABA counter.  A 1 GiB arena
+        //  A tagged head word for nodes that are UNIT_BYTES-aligned and lie inside one arena: the node is stored as its
+        //      index in the arena ((p - base) / UNIT_BYTES + 1, 0 for null), so the index needs only as many bits as the
+        //      arena has UNIT_BYTES-sized units, and every other bit of the 64-bit word holds the ABA counter.  A 1 GiB arena
         //      of 64-byte units leaves 39 counter bits (tagged_ptr leaves 16), so a stalled popper would have to sleep
         //      through 2^39 head changes before its CAS could be fooled.
         //
         //      Layout: [counter : counter_bits()][index : index_bits()]
         //
         //      A codec object for intrusive_tagged_stack's codec overloads.
-        template <typename T, size_t ALIGN = 64>
+        //      (The unit-size parameter is named UNIT_BYTES, not ALIGN, so a consumer's global
+        //      #define ALIGN does not clobber it.)
+        template <typename T, size_t UNIT_BYTES = 64>
         class arena_tagged_ptr
         {
-            static_assert((ALIGN & (ALIGN - 1)) == 0, "arena_tagged_ptr: ALIGN must be a power of two");
+            static_assert((UNIT_BYTES & (UNIT_BYTES - 1)) == 0, "arena_tagged_ptr: UNIT_BYTES must be a power of two");
 
         public:
             using pointer = T *;
@@ -36,8 +38,8 @@ namespace MINIMAL_STD_NAMESPACE
             static constexpr uint32_t MIN_COUNTER_BITS = 16;
 
             arena_tagged_ptr(const void *arena_start, size_t arena_size)
-                : base_(reinterpret_cast<uintptr_t>(arena_start) & ~static_cast<uintptr_t>(ALIGN - 1)),
-                  max_index_(((reinterpret_cast<uintptr_t>(arena_start) + arena_size - base_) / ALIGN) + 1),
+                : base_(reinterpret_cast<uintptr_t>(arena_start) & ~static_cast<uintptr_t>(UNIT_BYTES - 1)),
+                  max_index_(((reinterpret_cast<uintptr_t>(arena_start) + arena_size - base_) / UNIT_BYTES) + 1),
                   index_bits_(bits_for(max_index_)),
                   index_mask_((storage_type{1} << index_bits_) - 1),
                   counter_mask_((index_bits_ == 0) ? ~storage_type{0} : (~storage_type{0} >> index_bits_))
@@ -63,7 +65,7 @@ namespace MINIMAL_STD_NAMESPACE
                     return nullptr;
                 }
 
-                return reinterpret_cast<pointer>(base_ + ((index - 1) * ALIGN));
+                return reinterpret_cast<pointer>(base_ + ((index - 1) * UNIT_BYTES));
             }
 
             counter_type unpack_counter(storage_type value) const noexcept
@@ -104,10 +106,10 @@ namespace MINIMAL_STD_NAMESPACE
 
                 const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
 
-                MINIMAL_STD_ASSERT((address >= base_) && (((address - base_) & (ALIGN - 1)) == 0) &&
-                                   (((address - base_) / ALIGN) + 1 <= max_index_));
+                MINIMAL_STD_ASSERT((address >= base_) && (((address - base_) & (UNIT_BYTES - 1)) == 0) &&
+                                   (((address - base_) / UNIT_BYTES) + 1 <= max_index_));
 
-                return ((address - base_) / ALIGN) + 1;
+                return ((address - base_) / UNIT_BYTES) + 1;
             }
         };
     }

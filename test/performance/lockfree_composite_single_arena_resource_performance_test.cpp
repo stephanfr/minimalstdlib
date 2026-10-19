@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "../shared/perf_report.h"
+
 extern "C" double sqrt(double);
 extern "C" double log(double);
 extern "C" double cos(double);
@@ -159,6 +161,8 @@ namespace
         static double baseline_lockfree_efficiency = 0.0;
         constexpr size_t MAX_THREADS = 16;
         constexpr size_t REPETITIONS = 500;
+
+        perf_report report("LockfreeCompositeSingleArenaResourcePerformanceTests", "ThreadScalabilitySensitivityAnalysis");
 
         for (size_t num_threads = 1; num_threads <= MAX_THREADS; ++num_threads)
         {
@@ -335,6 +339,34 @@ namespace
                    composite_vs_malloc,
                    lockfree_vs_malloc);
 
+            char label[64];
+            const size_t iterations = NUM_ALLOCATIONS_PER_THREAD * REPETITIONS;
+
+            snprintf(label, sizeof(label), "composite %zu threads", num_threads);
+            report.record_with_baseline(label,
+                                       composite_total_ops_per_second,
+                                       malloc_total_ops_per_second,
+                                       (malloc_total_ops_per_second > 0.0)
+                                           ? ((composite_total_ops_per_second - malloc_total_ops_per_second) * 100.0 / malloc_total_ops_per_second)
+                                           : 0.0,
+                                       composite_vs_malloc,
+                                       num_threads,
+                                       iterations);
+
+            snprintf(label, sizeof(label), "lockfree %zu threads", num_threads);
+            report.record_with_baseline(label,
+                                       lockfree_total_ops_per_second,
+                                       malloc_total_ops_per_second,
+                                       (malloc_total_ops_per_second > 0.0)
+                                           ? ((lockfree_total_ops_per_second - malloc_total_ops_per_second) * 100.0 / malloc_total_ops_per_second)
+                                           : 0.0,
+                                       lockfree_vs_malloc,
+                                       num_threads,
+                                       iterations);
+
+            snprintf(label, sizeof(label), "malloc/free %zu threads", num_threads);
+            report.record(label, malloc_total_ops_per_second, num_threads, iterations);
+
             CHECK(composite_elapsed_time > 0);
             CHECK(lockfree_elapsed_time > 0);
             CHECK(malloc_elapsed_time > 0);
@@ -359,5 +391,7 @@ namespace
         printf("- Composite settings: threshold=3072B, element=256B, elements/block=2048, arenas<=32, blocks<=512, stats=off, max_bin=32MB, max_waste=5%%\n");
         printf("- Composite routes allocations <= 3072 bytes to the bitblock pool\n");
         printf("- All allocators tested with identical workloads for fair comparison\n");
+
+        report.finalize();
     }
 }
