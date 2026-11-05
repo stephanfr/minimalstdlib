@@ -26,6 +26,7 @@ otherwise.
 | `skiplist` handles, iterators | `lockfree_skiplist/handles/` | `Termination` | acquire on table → generation re-check; retired mark + fence (litmus K) | **fixed:** stale handle resolved to a newer node; **fixed:** iterator `++` read a retired node being freed |
 | `mp_sc_growable_ring_queue` | `lockfree_mp_sc_queue/` | `Termination` | litmus G, H | no write to a freed buffer |
 | `elimination_array` | `lockfree_small/` | `Termination`, also with a same-CPU interrupt handler | release/acquire on `state_` | n/a |
+| `latest_value_slot_array` | `lockfree_small/` | `FairDone`, also with a writer stalled mid-store and with same-CPU interrupt handlers | `current_` release/acquire; seqlock fence pair on relaxed payload words (no litmus test yet) | **fixed:** a lapped load returned a not-yet-published value; ABA: 32-bit `seq_` |
 | `sp_mc_value_stack` | `lockfree_small/` | `Termination` | release sequence on `state_` | ABA: 32-bit generation |
 | `spsc_queue` | `lockfree_small/` | `Termination` | index release/acquire | no slot shared |
 | `token_dispenser` | `lockfree_small/` | `Termination`; blocks only while every token is held (intended) | CAS / `and_fetch` | n/a |
@@ -154,5 +155,6 @@ See `lockfree_mp_sc_queue/README.md` and `lockfree_small/README.md`.
 | `intrusive_tagged_stack` counter, single arena | 16 bits | a popper does not stall across 65,536 head changes of one stack |
 | `intrusive_tagged_stack` counter, static arena (`arena_tagged_ptr`) | 64 − index bits (39 for a 1 GiB arena) | a popper does not stall across 2^39 head changes of one bin |
 | `sp_mc_value_stack` generation | 32 bits | a popper does not stall across 2^32 pushes |
+| `latest_value_slot_array` `seq_` | 32 bits per slot | a load is not stalled, between its reads of a slot's `seq_`, across a multiple of 2^31 rewrites of that slot (`LatestValueSlotArray_bug_seq_wraps.cfg` shows the failure) |
 | skip-list slot generation | `GENERATION_MASK` bits, seeded per block incarnation | a handle does not outlive a full wrap of its slot's generation |
 

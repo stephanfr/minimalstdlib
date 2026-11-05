@@ -1,0 +1,475 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <atomic>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "array"
+#include "basic_string"
+#include "buffer"
+#include "__type_traits/is_trivially_copyable.h"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    namespace lockfree
+    {
+        //  Lock-free slot array holding the most recent value of a trivially-
+        //  copyable type T (of any size), readable from any number of threads
+        //  and ISRs.
+        //
+        //  Store contract
+        //    store() is non-blocking.  It returns FAILURE, with no effect,
+        //    only while another store is in flight, and SUCCESS otherwise.  A
+        //    successful store is linearised at its write of current_.  An ISR
+        //    that preempts a writer on the same core simply drops its value;
+        //    it never deadlocks.
+        //
+        //  Load contract
+        //    load() is lock-free and linearisable: it returns a value that was
+        //    the latest published one at some instant while it ran (it is
+        //    linearised at its read of current_).  It returns EMPTY, with the
+        //    zero value, if nothing has been stored yet, and SUCCESS
+        //    otherwise.  It retries only if the slot it is reading was
+        //    rewritten, i.e. a writer lapped it after NumSlots-1 completed
+        //    stores; a larger NumSlots reduces retries.  It is not wait-free:
+        //    a reader can be lapped repeatedly by a stream of stores.
+        //
+        //  Memory ordering
+        //    A seqlock: the writer bumps the slot's sequence counter to odd,
+        //    takes a release fence, writes the payload, bumps the counter to
+        //    even with release ordering, then publishes (even next_slot_sequence_number, slot) in
+        //    current_, with a flag bit recording that a store has happened.
+        //    A reader acquires current_, requires the slot's counter to equal
+        //    the published next_slot_sequence_number before and after copying the
+        //    payload (acquire fence before the second read), and retries
+        //    otherwise.  Checking against the *published* next_slot_sequence_number, not just "even
+        //    and unchanged", is what stops a lapped reader from returning a
+        //    value the writer has not published yet: it would be newer than
+        //    what a later load returns.  Payload buffer_in_words_ are accessed through
+        //    relaxed atomics (not a plain memcpy): the reader's copy races
+        //    with a lapping writer by design, which is only defined behaviour,
+        //    and only lets the fences pair up, if both sides are atomic.  It
+        //    also keeps the class TSAN-clean.  Cost: one stack temporary of
+        //    sizeof(T) per call.
+        //
+        //    The single active writer never writes the slot current_ names,
+        //    so a preempted writer never stalls readers.
+        //
+        //  Assumption
+        //    A load is not stalled, between its first and last read of a
+        //    slot's sequence counter, across a multiple of 2^31 rewrites of
+        //    that slot (2^31 * NumSlots stores), which would bring the 32-bit
+        //    counter back to the value the load expects.
+        //
+        //  Model: tlaplus/lockfree_small/LatestValueSlotArray.tla
+
+        //  Result of a store or load.
+        //    SUCCESS   - the whole value was stored or loaded.
+        //    FAILURE   - store only: another store was in flight, so nothing was stored.
+        //    TRUNCATED - the value was stored or loaded, but clipped to fit: the input was longer than the
+        //                capacity (store), or the destination was smaller than the value (load).
+        //    EMPTY     - load only: nothing has been stored yet, so the zero value (empty string, zero-length
+        //                blob) was loaded.
+        //
+        //  FAILURE takes precedence: an over-long store that loses to an in-flight store returns FAILURE, since
+        //      nothing was stored.  Only latest_value_text and latest_value_blob return TRUNCATED; the slot array
+        //      itself always stores and loads a whole T.  A zero value loads into any destination, so EMPTY never
+        //      coincides with TRUNCATED.
+
+        enum class latest_value_result : uint8_t
+        {
+            SUCCESS = 0,
+            FAILURE,
+            TRUNCATED,
+            EMPTY
+        };
+
+        template <typename T, size_t NumSlots>
+        class latest_value_slot_array
+        {
+        private:
+
+            static constexpr size_t WORD_COUNT = (sizeof(T) + 7) / 8;
+
+            //  Set in the slot-index half of current_ by every store, so current_ is non-zero once anything has
+            //      been stored.  The next_slot_sequence_number half cannot serve: it wraps back to 0 after 2^31 rewrites of a slot.
+            
+            static constexpr uint32_t STORED_FLAG = 0x8000'0000u;
+
+            struct slot
+            {
+                atomic<uint32_t> sequence_number_;
+                atomic<uint64_t> buffer_in_words_[WORD_COUNT];
+            };
+
+        public:
+
+            static_assert(NumSlots >= 2, "latest_value_slot_array: NumSlots must be >= 2");
+            static_assert(NumSlots < STORED_FLAG, "latest_value_slot_array: NumSlots must leave room for the stored flag");
+            static_assert(is_trivially_copyable_v<T>, "latest_value_slot_array: T must be trivially copyable");
+            static_assert(atomic<uint64_t>::is_always_lock_free, "latest_value_slot_array: needs lock-free 64-bit atomics");
+
+            static constexpr size_t NUM_SLOTS = NumSlots;
+
+            constexpr latest_value_slot_array() noexcept = default;
+
+            latest_value_slot_array(const latest_value_slot_array &) = delete;
+            latest_value_slot_array(latest_value_slot_array &&) = delete;
+            latest_value_slot_array &operator=(const latest_value_slot_array &) = delete;
+            latest_value_slot_array &operator=(latest_value_slot_array &&) = delete;
+
+            //  Non-blocking store, returns SUCCESS unless another store is in flight.
+
+            latest_value_result store(const T &value) noexcept
+            {
+                if (writer_busy_.exchange(1, memory_order_acquire))
+                {
+                    return latest_value_result::FAILURE;
+                }
+
+                //  current_ and the sequence_number_ counters are written only by the writer_busy_ holder, so relaxed loads
+                //      see the previous holder's stores (its release of writer_busy_ pairs with our acquire).
+
+                const uint32_t next_slot_index = (slot_of(current_.load(memory_order_relaxed)) + 1) % static_cast<uint32_t>(NUM_SLOTS);
+                slot &next_slot = slots_[next_slot_index];
+                const uint32_t next_slot_sequence_number = next_slot.sequence_number_.load(memory_order_relaxed);
+
+                next_slot.sequence_number_.store(next_slot_sequence_number + 1, memory_order_relaxed);
+                __atomic_thread_fence(__ATOMIC_RELEASE);
+
+                //  Zeroed so the bytes past sizeof(T) in the last word are not indeterminate.
+                //      Serialize the trivially copyable value into the buffer, then copy it word by word into the slot's buffer.
+
+                uint64_t buffer[WORD_COUNT]{};
+                memcpy(buffer, &value, sizeof(T));
+
+                for (size_t i = 0; i < WORD_COUNT; ++i)
+                {
+                    next_slot.buffer_in_words_[i].store(buffer[i], memory_order_relaxed);
+                }
+
+                next_slot.sequence_number_.store(next_slot_sequence_number + 2, memory_order_release);
+                current_.store(pack(next_slot_sequence_number + 2, next_slot_index), memory_order_release);
+                writer_busy_.store(0, memory_order_release);
+
+                return latest_value_result::SUCCESS;
+            }
+
+            //  Lock-free load.  Retries only if a writer lapped the slot being read.
+            //      Returns EMPTY, loading the zero value, if nothing has been stored yet; SUCCESS otherwise.
+
+            latest_value_result load(T &out) const noexcept
+            {
+                while (true)
+                {
+                    const uint64_t published = current_.load(memory_order_acquire);
+                    const uint32_t expected  = sequence_number_of(published);
+                    const slot &current_slot = slots_[slot_of(published)];
+                    
+                    //  Early out only: the acquire of current_ already orders the copy after the published
+                    //      store, and the check after the copy is the one that matters.
+
+                    if (current_slot.sequence_number_.load(memory_order_relaxed) != expected)
+                    {
+                        continue;       //  lapped: rewritten, or being rewritten, since it was published
+                    }
+
+                    uint64_t buffer[WORD_COUNT];
+
+                    for (size_t i = 0; i < WORD_COUNT; ++i)
+                    {
+                        buffer[i] = current_slot.buffer_in_words_[i].load(memory_order_relaxed);
+                    }
+
+                    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                    const uint32_t seq_after_copy = current_slot.sequence_number_.load(memory_order_relaxed);
+
+                    if (seq_after_copy == expected)
+                    {
+                        //  Before the first store current_ is 0, naming slot 0 at next_slot_sequence_number 0: its zero-initialised
+                        //      contents, which no store writes until current_ has moved on from it.
+
+                        memcpy(&out, buffer, sizeof(T));
+                        return is_stored(published) ? latest_value_result::SUCCESS : latest_value_result::EMPTY;
+                    }
+                }
+            }
+
+            T load() const noexcept
+            {
+                T out{};
+                load(out);
+                return out;
+            }
+
+            //  True once any store has succeeded.  A snapshot: a store may succeed right after it returns false.
+
+            bool has_value() const noexcept
+            {
+                return is_stored(current_.load(memory_order_acquire));
+            }
+
+        private:
+
+            //  current_ packs the published slot's even next_slot_sequence_number (high 32 bits) with its index and STORED_FLAG (low
+            //      32 bits), so a reader can tell the published contents of a slot from a later, unpublished
+            //      rewrite of it, and the initial zero value from a stored one.
+
+            alignas(MINSTD_CACHE_LINE_SIZE) slot                slots_[NumSlots]{};
+            alignas(MINSTD_CACHE_LINE_SIZE) atomic<uint64_t>    current_{0};
+            alignas(MINSTD_CACHE_LINE_SIZE) atomic<uint32_t>    writer_busy_{0};
+
+            static constexpr uint64_t pack(uint32_t next_slot_sequence_number, uint32_t slot_index) noexcept
+            {
+                return (static_cast<uint64_t>(next_slot_sequence_number) << 32) | STORED_FLAG | slot_index;
+            }
+
+            static constexpr uint32_t sequence_number_of(uint64_t packed) noexcept
+            {
+                return static_cast<uint32_t>(packed >> 32);
+            }
+
+            static constexpr uint32_t slot_of(uint64_t packed) noexcept
+            {
+                return static_cast<uint32_t>(packed) & ~STORED_FLAG;
+            }
+
+            static constexpr bool is_stored(uint64_t packed) noexcept
+            {
+                return (static_cast<uint32_t>(packed) & STORED_FLAG) != 0;
+            }
+        };
+
+        //  latest_value_text and latest_value_blob are type-safe views over a latest_value_slot_array
+        //      whose payload is a trivially-copyable array of chars or bytes.  These are convenience classes
+        //      for storing strings and blobs with clean sematics.
+
+        template <typename CharT, size_t MaxLen, size_t NumSlots = 4>
+        class latest_value_text
+        {
+        private:
+            using payload_type = array<CharT, MaxLen + 1>;
+
+            static size_t measure(const CharT *s, size_t max) noexcept
+            {
+                size_t n = 0;
+
+                while (n < max && s[n] != CharT{})
+                {
+                    ++n;
+                }
+
+                return n;
+            }
+
+        public:
+
+            static_assert(MaxLen > 0, "latest_value_text: MaxLen must be > 0");
+            static_assert(NumSlots >= 2, "latest_value_text: NumSlots must be >= 2");
+            static_assert(is_trivially_copyable_v<CharT>, "latest_value_text: CharT must be trivially copyable");
+
+            using char_type = CharT;
+
+            static constexpr size_t MAX_LEN   = MaxLen;
+            static constexpr size_t NUM_SLOTS = NumSlots;
+
+            constexpr latest_value_text() noexcept = default;
+
+            latest_value_text(const latest_value_text &) = delete;
+            latest_value_text(latest_value_text &&) = delete;
+            latest_value_text &operator=(const latest_value_text &) = delete;
+            latest_value_text &operator=(latest_value_text &&) = delete;
+
+            latest_value_result store(const CharT *value) noexcept
+            {
+                if (value == nullptr)
+                {
+                    return store(value, 0);
+                }
+
+                //  Measure one past MaxLen so an over-long string is told apart from one of exactly MaxLen.
+
+                return store(value, measure(value, MaxLen + 1));
+            }
+
+            latest_value_result store(const CharT *value, size_t length) noexcept
+            {
+                payload_type payload{};
+                const size_t n = (length > MaxLen) ? MaxLen : length;
+
+                for (size_t i = 0; i < n; ++i)
+                {
+                    payload[i] = value[i];
+                }
+
+                payload[n] = CharT{};
+
+                const latest_value_result stored = slots_.store(payload);
+
+                return (stored == latest_value_result::SUCCESS && n < length) ? latest_value_result::TRUNCATED : stored;
+            }
+
+            latest_value_result store(const basic_string<CharT> &value) noexcept
+            {
+                return store(value.data(), value.length());
+            }
+
+            latest_value_result load(CharT *out, size_t out_len) const noexcept
+            {
+                payload_type payload;
+                const latest_value_result loaded = slots_.load(payload);
+                const size_t n = measure(payload.data(), MaxLen);
+
+                if (out_len == 0)
+                {
+                    return (n > 0) ? latest_value_result::TRUNCATED : loaded;
+                }
+
+                const size_t copy = (n < out_len - 1) ? n : (out_len - 1);
+
+                for (size_t i = 0; i < copy; ++i)
+                {
+                    out[i] = payload[i];
+                }
+                out[copy] = CharT{};
+
+                return (copy < n) ? latest_value_result::TRUNCATED : loaded;
+            }
+
+            latest_value_result load(basic_string<CharT> &out) const noexcept
+            {
+                payload_type payload;
+                const latest_value_result loaded = slots_.load(payload);
+                out = payload.data();   //  null-terminated; assign clips to capacity
+
+                return (out.length() < measure(payload.data(), MaxLen)) ? latest_value_result::TRUNCATED : loaded;
+            }
+
+            //  True once any store has succeeded; a snapshot.
+
+            bool has_value() const noexcept
+            {
+                return slots_.has_value();
+            }
+
+            //  Length of the current string, in characters.
+
+            size_t length() const noexcept
+            {
+                payload_type payload;
+                slots_.load(payload);
+                return measure(payload.data(), MaxLen);
+            }
+
+        private:
+
+            latest_value_slot_array<payload_type, NumSlots>     slots_;
+        };
+
+        template <size_t MaxBytes, size_t NumSlots = 4>
+        class latest_value_blob
+        {
+        private:
+
+            struct payload
+            {
+                array<uint8_t, MaxBytes> bytes;
+                uint64_t                 length;
+            };
+
+        public:
+
+            static_assert(MaxBytes > 0, "latest_value_blob: MaxBytes must be > 0");
+            static_assert(NumSlots >= 2, "latest_value_blob: NumSlots must be >= 2");
+            static_assert(is_trivially_copyable_v<payload>, "latest_value_blob: payload must be trivially copyable");
+
+            static constexpr size_t MAX_BYTES = MaxBytes;
+            static constexpr size_t NUM_SLOTS = NumSlots;
+
+            constexpr latest_value_blob() noexcept = default;
+
+            latest_value_blob(const latest_value_blob &) = delete;
+            latest_value_blob(latest_value_blob &&) = delete;
+            latest_value_blob &operator=(const latest_value_blob &) = delete;
+            latest_value_blob &operator=(latest_value_blob &&) = delete;
+
+            latest_value_result store(const void *src, size_t n) noexcept
+            {
+                payload p;
+                memset(&p, 0, sizeof(p));       //  padding too, so no indeterminate bytes reach the slot words
+                const size_t copy = (n > MaxBytes) ? MaxBytes : n;
+
+                if (copy > 0)
+                {
+                    memcpy(p.bytes.data(), src, copy);
+                }
+
+                p.length = copy;
+
+                const latest_value_result stored = slots_.store(p);
+
+                return (stored == latest_value_result::SUCCESS && copy < n) ? latest_value_result::TRUNCATED : stored;
+            }
+
+            latest_value_result store(const buffer<uint8_t> &src) noexcept
+            {
+                return store(src.data(), src.size());
+            }
+
+            latest_value_result load(void *dst, size_t n) const noexcept
+            {
+                payload p;
+                const latest_value_result loaded = slots_.load(p);
+                const size_t length = static_cast<size_t>(p.length);
+                const size_t copy   = (n < length) ? n : length;
+
+                if (copy > 0)
+                {
+                    memcpy(dst, p.bytes.data(), copy);
+                }
+
+                return (copy < length) ? latest_value_result::TRUNCATED : loaded;
+            }
+
+            latest_value_result load(buffer<uint8_t> &dst) const noexcept
+            {
+                payload p;
+                const latest_value_result loaded = slots_.load(p);
+                const size_t length = static_cast<size_t>(p.length);
+                dst.clear();
+
+                const size_t appended = (length > 0) ? dst.append(p.bytes.data(), length) : 0;
+
+                return (appended < length) ? latest_value_result::TRUNCATED : loaded;
+            }
+
+            //  True once any store has succeeded; a snapshot.
+
+            bool has_value() const noexcept
+            {
+                return slots_.has_value();
+            }
+
+            //  Size of the current blob, in bytes.
+
+            size_t size() const noexcept
+            {
+                payload p;
+                slots_.load(p);
+
+                return static_cast<size_t>(p.length);
+            }
+
+        private:
+
+            latest_value_slot_array<payload, NumSlots>      slots_;
+        };
+    }
+}

@@ -70,6 +70,8 @@ namespace
     {
         minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS> list;
 
+        CHECK_TRUE(list.valid());
+
         for (uint32_t i = 0; i < 100; i++)
         {
             CHECK_TRUE(list.insert(i, i));
@@ -1492,7 +1494,8 @@ namespace
                                                         if (list.find(1) != list.end()) _exit(3);
                                                         if (list.begin() != list.end()) _exit(4);
                                                         if (list.size() != 0) _exit(5);
-                                                        if (!list.validate_ordering()) _exit(6); })); //  before: the child segfaults
+                                                        if (!list.validate_ordering()) _exit(6);
+                                                        if (list.valid()) _exit(7); })); //  before: the child segfaults
     }
 
     TEST(SkiplistTests, SentinelsWithoutSlotsFailSafely)
@@ -1536,6 +1539,7 @@ namespace
                                                         if (!list.validate_ordering()) _exit(1);
                                                         if (list.insert(1, 1)) _exit(2);
                                                         if (list.size() != 0) _exit(3);
-                                                        if (list.begin() != list.end()) _exit(4); })); //  before: the child segfaults
+                                                        if (list.begin() != list.end()) _exit(4);
+                                                        if (list.valid()) _exit(5); })); //  before: the child segfaults
     }
 }
