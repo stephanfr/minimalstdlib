@@ -1992,6 +1992,14 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             }
 
+            //  False if the constructor could not allocate the sentinels: the list is then permanently empty and every
+            //      insert fails.
+
+            bool valid() const noexcept
+            {
+                return head_ != nullptr;
+            }
+
             uint32_t size() const
             {
                 if (head_ == nullptr)
