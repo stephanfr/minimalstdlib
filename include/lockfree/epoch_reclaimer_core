@@ -121,8 +121,18 @@ namespace MINIMAL_STD_NAMESPACE
                 }
             }
 
-            auto detached_list_head = exchange_retired_list_fn(exempt_slot);
-            return reclaim_detached_list_fn(exempt_slot, detached_list_head, reclaim_epoch);
+            //  Every slot's list, not only the caller's: a CPU that only helps unlink (in a find or insert) retires
+            //      nodes but may never run a reclaim itself.  Each list is detached by an exchange, so concurrent
+            //      reclaimers free disjoint nodes.
+
+            uint32_t nodes_freed = 0;
+
+            for (size_t i = 0; i < NUM_SLOTS; ++i)
+            {
+                nodes_freed += reclaim_detached_list_fn(i, exchange_retired_list_fn(i), reclaim_epoch);
+            }
+
+            return nodes_freed;
         }
 
         SlotPolicyType &slot_policy_;

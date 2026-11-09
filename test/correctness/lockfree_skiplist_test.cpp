@@ -852,6 +852,61 @@ namespace
         CHECK_EQUAL(inserted.load(), list.nodes_reclaimed()); //  before: fewer (stranded nodes)
     }
 
+    TEST(SkiplistTests, ReclaimFreesNodesRetiredOnAnotherCpu)
+    {
+        //  A remove() leaves a node taller than one level linked above level 0, so a later find() on another CPU
+        //      finishes the unlink and retires it on that CPU's slot.  A CPU that only finds never reclaims, so
+        //      the remover's reclaim has to free those nodes too.  This is a kernel whose one reaper task removes
+        //      while every core looks tasks up.
+
+        using list_type = minstd::skip_list<uint32_t, uint32_t, SKIPLIST_STRESS_MAX_THREADS, 16, 14, minstd::skiplist_extensions::skiplist_statistics>;
+
+        static uint32_t current_cpu;
+        minstd::platform::set_test_cpu_id_provider([]() -> uint32_t { return current_cpu; });
+
+        constexpr uint32_t NUM_KEYS = 256;
+
+        {
+            list_type list;
+            list.reset_statistics();
+
+            current_cpu = 1;
+
+            uint32_t inserted = 0;
+
+            for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+            {
+                inserted += list.insert(key, key) ? 1 : 0;
+            }
+
+            //  The find() runs before any later remove() can walk onto the node and finish the unlink itself.
+
+            for (uint32_t key = 1; key <= NUM_KEYS; ++key)
+            {
+                current_cpu = 1;
+                CHECK_TRUE(list.remove(key));
+
+                current_cpu = 2;
+                list.find(key);
+            }
+
+            current_cpu = 1;
+
+            const size_t remover_slot = list.enter_read_section();
+            list.exit_read_section(remover_slot);
+
+            for (uint32_t round = 0; round < 8; ++round)
+            {
+                list.advance_and_reclaim(remover_slot);
+            }
+
+            CHECK_EQUAL(0u, list.size());
+            CHECK_EQUAL(inserted, list.nodes_reclaimed()); //  before: only the one-level nodes the remover retired
+        }
+
+        minstd::pmr::test::os_abstractions::install_test_cpu_id_provider();
+    }
+
     TEST(SkiplistTests, RemoveThatLandsOnAReinsertedNodeReclaimsIt)
     {
         //  remove(10) targets node A.  Its level-0 mark fails because A's successor changes (insert 15); while it
