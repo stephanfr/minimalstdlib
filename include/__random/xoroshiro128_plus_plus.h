@@ -32,12 +32,12 @@ namespace MINIMAL_STD_NAMESPACE
         struct seed_type
         {
             constexpr seed_type(uint64_t low, uint64_t high) noexcept
-                : low(low), high(high)
+                : low_(low), high_(high)
             {
             }
 
-            uint64_t low;
-            uint64_t high;
+            uint64_t low_;
+            uint64_t high_;
         };
 
         static constexpr result_type min() noexcept
@@ -86,9 +86,9 @@ namespace MINIMAL_STD_NAMESPACE
         {
             uint_least32_t s[4];
             seq.generate(s, s + 4);
-            state_.low  = (uint64_t(s[0]) << 32) | uint64_t(s[1]);
-            state_.high = (uint64_t(s[2]) << 32) | uint64_t(s[3]);
-            if (state_.low == 0u && state_.high == 0u)
+            state_.low_  = (uint64_t(s[0]) << 32) | uint64_t(s[1]);
+            state_.high_ = (uint64_t(s[2]) << 32) | uint64_t(s[3]);
+            if (state_.low_ == 0u && state_.high_ == 0u)
                 state_ = seed_type(DEFAULT_SEED_LOW, DEFAULT_SEED_HIGH);
         }
 
@@ -124,7 +124,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         bool operator==(const xoroshiro128_plus_plus &other) const noexcept
         {
-            return state_.low == other.state_.low && state_.high == other.state_.high;
+            return state_.low_ == other.state_.low_ && state_.high_ == other.state_.high_;
         }
 
         bool operator!=(const xoroshiro128_plus_plus &other) const noexcept
@@ -152,8 +152,8 @@ namespace MINIMAL_STD_NAMESPACE
                 {
                     if (JUMP[i] & UINT64_C(1) << b)
                     {
-                        s0 ^= state_.low;
-                        s1 ^= state_.high;
+                        s0 ^= state_.low_;
+                        s1 ^= state_.high_;
                     }
 
                     next_value_internal();
@@ -175,13 +175,13 @@ namespace MINIMAL_STD_NAMESPACE
 
         uint64_t next_value_internal() noexcept
         {
-            const uint64_t s0 = state_.low;
-            uint64_t s1 = state_.high;
+            const uint64_t s0 = state_.low_;
+            uint64_t s1 = state_.high_;
             const uint64_t result = MINIMAL_STD_NAMESPACE::rotl(s0 + s1, 17) + s0;
 
             s1 ^= s0;
-            state_.low  = MINIMAL_STD_NAMESPACE::rotl(s0, 49) ^ s1 ^ (s1 << 21); // a, b
-            state_.high = MINIMAL_STD_NAMESPACE::rotl(s1, 28);                    // c
+            state_.low_  = MINIMAL_STD_NAMESPACE::rotl(s0, 49) ^ s1 ^ (s1 << 21); // a, b
+            state_.high_ = MINIMAL_STD_NAMESPACE::rotl(s1, 28);                    // c
 
             return result;
         }

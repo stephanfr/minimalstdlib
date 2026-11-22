@@ -134,9 +134,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionali
     CHECK((unsigned long)ptr1 % DEFAULT_ALIGNMENT == 0);
 
     auto allocation_info = resource.get_allocation_info(ptr1);
-    CHECK(allocation_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-    CHECK(allocation_info.size == 50);
-    CHECK(allocation_info.alignment == DEFAULT_ALIGNMENT);
+    CHECK(allocation_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(allocation_info.size_ == 50);
+    CHECK(allocation_info.alignment_ == DEFAULT_ALIGNMENT);
 
     void *ptr2 = resource.allocate(1023);
 
@@ -144,9 +144,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionali
     CHECK((unsigned long)ptr2 % DEFAULT_ALIGNMENT == 0);
 
     allocation_info = resource.get_allocation_info(ptr2);
-    CHECK(allocation_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-    CHECK(allocation_info.size == 1023);
-    CHECK(allocation_info.alignment == DEFAULT_ALIGNMENT);
+    CHECK(allocation_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(allocation_info.size_ == 1023);
+    CHECK(allocation_info.alignment_ == DEFAULT_ALIGNMENT);
 
     void *ptr3 = resource.allocate(123);
 
@@ -154,9 +154,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionali
     CHECK((unsigned long)ptr3 % DEFAULT_ALIGNMENT == 0);
 
     allocation_info = resource.get_allocation_info(ptr3);
-    CHECK(allocation_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-    CHECK(allocation_info.size == 123);
-    CHECK(allocation_info.alignment == DEFAULT_ALIGNMENT);
+    CHECK(allocation_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(allocation_info.size_ == 123);
+    CHECK(allocation_info.alignment_ == DEFAULT_ALIGNMENT);
 
     void *ptr4 = resource.allocate(45678);
 
@@ -164,9 +164,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionali
     CHECK((unsigned long)ptr4 % DEFAULT_ALIGNMENT == 0);
 
     allocation_info = resource.get_allocation_info(ptr4);
-    CHECK(allocation_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-    CHECK(allocation_info.size == 45678);
-    CHECK(allocation_info.alignment == DEFAULT_ALIGNMENT);
+    CHECK(allocation_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(allocation_info.size_ == 45678);
+    CHECK(allocation_info.alignment_ == DEFAULT_ALIGNMENT);
 
     CHECK_EQUAL(4, resource.extended_metrics().current_allocated());
 
@@ -180,9 +180,9 @@ TEST(LockfreeSingleArenaMemoryResourceTests, SingleArenaResourceBasicFunctionali
     CHECK((unsigned long)ptr5 % DEFAULT_ALIGNMENT == 0);
 
     allocation_info = resource.get_allocation_info(ptr5);
-    CHECK(allocation_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-    CHECK(allocation_info.size == 100);
-    CHECK(allocation_info.alignment == DEFAULT_ALIGNMENT);
+    CHECK(allocation_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(allocation_info.size_ == 100);
+    CHECK(allocation_info.alignment_ == DEFAULT_ALIGNMENT);
 }
 
 TEST(LockfreeSingleArenaMemoryResourceTests, AllocationLargerThanMaxIsRejected)
@@ -240,7 +240,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanc
     CHECK_EQUAL(static_cast<size_t>(NUM_BLOCKS - 1), resource.extended_metrics().pending_deallocations());
 
     auto pending_info = resource.get_allocation_info(ptrs[0]);
-    CHECK(pending_info.state == lockfree_single_arena_resource_with_stats::allocation_state::DEALLOCATED_PENDING);
+    CHECK(pending_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::DEALLOCATED_PENDING);
 
     const size_t windows_before = resource.extended_metrics().maintenance_windows();
 
@@ -251,7 +251,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, DeferredDeallocationOpensMaintenanc
     CHECK(resource.extended_metrics().maintenance_windows() > windows_before);
 
     auto finalized_info = resource.get_allocation_info(ptrs[0]);
-    CHECK(finalized_info.state != lockfree_single_arena_resource_with_stats::allocation_state::DEALLOCATED_PENDING);
+    CHECK(finalized_info.state_ != lockfree_single_arena_resource_with_stats::allocation_state::DEALLOCATED_PENDING);
 }
 
 TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataCountStable)
@@ -296,7 +296,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ReuseAfterMaintenanceKeepsMetadataC
     }
 
     auto reused_info = resource.get_allocation_info(reused);
-    CHECK(reused_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+    CHECK(reused_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
 
     resource.deallocate(reused, ALLOC_SIZE);
 }
@@ -489,7 +489,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentDoubleFreeResilience)
         CHECK(ptr != nullptr);
 
         auto info = resource.get_allocation_info(ptr);
-        CHECK(info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+        CHECK(info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
 
         minstd::atomic<size_t> success_count{0};
         minstd::atomic<bool> go{false};
@@ -512,7 +512,7 @@ TEST(LockfreeSingleArenaMemoryResourceTests, ConcurrentDoubleFreeResilience)
 
         //  After all threads finish, the allocation must not be IN_USE
         info = resource.get_allocation_info(ptr);
-        CHECK(info.state != lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+        CHECK(info.state_ != lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
     }
 
     //  Final consistency: no live allocations remain
@@ -1001,8 +1001,8 @@ TEST(LockfreeSingleArenaMemoryResourceTests, RepeatedRecycleAndReuseAfterPending
             CHECK(ptrs[i] != nullptr);
 
             auto info = resource.get_allocation_info(ptrs[i]);
-            CHECK(info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
-            CHECK_EQUAL(size, info.size);
+            CHECK(info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+            CHECK_EQUAL(size, info.size_);
         }
 
         for (size_t i = BLOCKS; i > 0; --i)

@@ -38,13 +38,13 @@ namespace MINIMAL_STD_NAMESPACE
             //      by a thread that owns the block through a bin-7 steal_all().
             struct free_block_header
             {
-                size_t size;
+                size_t size_;
             };
 
             //  A free-bin link: the index (+1, 0 for none) of the next block's cell
             struct link_cell
             {
-                uint32_t next;
+                uint32_t next_;
             };
 
             static constexpr size_t NUM_BINS = 8;
@@ -57,7 +57,7 @@ namespace MINIMAL_STD_NAMESPACE
             //      fooled only if its bin changes 2^counter_bits times meanwhile.
             using tagged_ptr_type = lockfree::tagged_ptr<link_cell>;
             using head_codec_type = lockfree::arena_tagged_ptr<link_cell, sizeof(link_cell)>;
-            using stack_type = lockfree::intrusive_tagged_stack<link_cell, tagged_ptr_type, uint32_t, &link_cell::next>;
+            using stack_type = lockfree::intrusive_tagged_stack<link_cell, tagged_ptr_type, uint32_t, &link_cell::next_>;
 
             static uint8_t *aligned_start(void *start)
             {
@@ -151,7 +151,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             void push_free(uint8_t *block, size_t block_size)
             {
-                header_of(block)->size = block_size;
+                header_of(block)->size_ = block_size;
 
                 backoff_type backoff;
                 stack_type::push(free_stack_heads_[get_bin(block_size)], *cell_of(block), adapter(), backoff, head_codec_);
@@ -276,7 +276,7 @@ namespace MINIMAL_STD_NAMESPACE
 
                 for (link_cell* current = stolen_list; current != nullptr; current = links.to_node(stack_type::load_link(*current)))
                 {
-                    const size_t size = header_of(block_of(current))->size;
+                    const size_t size = header_of(block_of(current))->size_;
 
                     if ((size >= alloc_size) && ((best_fit == nullptr) || (size < best_fit_size)))
                     {

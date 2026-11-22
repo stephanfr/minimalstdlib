@@ -380,8 +380,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             struct payload
             {
-                array<uint8_t, MaxBytes> bytes;
-                uint64_t                 length;
+                array<uint8_t, MaxBytes> bytes_;
+                uint64_t                 length_;
             };
 
         public:
@@ -408,10 +408,10 @@ namespace MINIMAL_STD_NAMESPACE
 
                 if (copy > 0)
                 {
-                    memcpy(p.bytes.data(), src, copy);
+                    memcpy(p.bytes_.data(), src, copy);
                 }
 
-                p.length = copy;
+                p.length_ = copy;
 
                 const latest_value_result stored = slots_.store(p);
 
@@ -427,12 +427,12 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 payload p;
                 const latest_value_result loaded = slots_.load(p);
-                const size_t length = static_cast<size_t>(p.length);
+                const size_t length = static_cast<size_t>(p.length_);
                 const size_t copy   = (n < length) ? n : length;
 
                 if (copy > 0)
                 {
-                    memcpy(dst, p.bytes.data(), copy);
+                    memcpy(dst, p.bytes_.data(), copy);
                 }
 
                 return (copy < length) ? latest_value_result::TRUNCATED : loaded;
@@ -442,10 +442,10 @@ namespace MINIMAL_STD_NAMESPACE
             {
                 payload p;
                 const latest_value_result loaded = slots_.load(p);
-                const size_t length = static_cast<size_t>(p.length);
+                const size_t length = static_cast<size_t>(p.length_);
                 dst.clear();
 
-                const size_t appended = (length > 0) ? dst.append(p.bytes.data(), length) : 0;
+                const size_t appended = (length > 0) ? dst.append(p.bytes_.data(), length) : 0;
 
                 return (appended < length) ? latest_value_result::TRUNCATED : loaded;
             }
@@ -464,7 +464,7 @@ namespace MINIMAL_STD_NAMESPACE
                 payload p;
                 slots_.load(p);
 
-                return static_cast<size_t>(p.length);
+                return static_cast<size_t>(p.length_);
             }
 
         private:

@@ -62,10 +62,10 @@ namespace MINIMAL_STD_NAMESPACE
                 block_header* current = allocated_blocks_head_;
                 while (current != nullptr)
                 {
-                    block_header* next = current->next;
+                    block_header* next = current->next_;
                     if (upstream_resource_)
                     {
-                        upstream_resource_->deallocate(current, current->size, alignof(block_header));
+                        upstream_resource_->deallocate(current, current->size_, alignof(block_header));
                     }
                     current = next;
                 }
@@ -146,8 +146,8 @@ namespace MINIMAL_STD_NAMESPACE
                 // Prepend to the allocated blocks list (using placement new would require <new>, 
                 // but we can just initialize it since trivial types)
                 block_header* header = reinterpret_cast<block_header*>(new_block);
-                header->size = next_size;
-                header->next = allocated_blocks_head_;
+                header->size_ = next_size;
+                header->next_ = allocated_blocks_head_;
                 allocated_blocks_head_ = header;
 
                 char* block_start = reinterpret_cast<char*>(header + 1);
@@ -176,8 +176,8 @@ namespace MINIMAL_STD_NAMESPACE
         private:
             struct block_header
             {
-                size_t size;
-                block_header* next;
+                size_t size_;
+                block_header* next_;
             };
 
             memory_resource* upstream_resource_;
