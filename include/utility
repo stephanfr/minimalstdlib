@@ -7,6 +7,7 @@
 #include "minstdconfig.h"
 
 #include "__utility/forward.h"
+#include "__utility/in_place.h"
 #include "__utility/integer_sequence.h"
 #include "__utility/move.h"
 #include "__utility/pair.h"

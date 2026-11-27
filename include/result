@@ -1,0 +1,289 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+//  The OS's result classes rebuilt on expected: each names its result code first, and the code is always available
+//      from result_code(): ResultCode::SUCCESS with a value, the error without one.  The code enum must have a
+//      SUCCESS value, and none of these is ever built from unexpected(ResultCode::SUCCESS).
+//
+//      status_result<Code>                          success or a code, no value             expected<void, Code>
+//      simple_result                                status_result<simple_success_or_failure>
+//      value_result<Code, T>                        a T                                     expected<T, Code>
+//      value_result_with_error_info<Code, T, Info>  a T, or a code with an optional Info
+//      reference_result<Code, T>                    a T& the result does not own
+//      pointer_result<Code, T>                      an owned T, in a unique_ptr
+//
+//      minstd::value_result<parse_code, header> parse(const uint8_t *data, size_t length)
+//      {
+//          if (length < header::SIZE)
+//          {
+//              return minstd::unexpected(parse_code::TOO_SHORT);
+//          }
+//
+//          return header(data);
+//      }
+//
+//      and_then and or_else take functions returning any of these.  and_then keeps the error type and or_else the
+//      value type:  parse(data, length).and_then(validate), where validate returns a value_result<parse_code, U>.
+//      Each also converts from the plain expected with its value and error types, which transform and
+//      transform_error return.
+
+#include "minstdconfig.h"
+
+#include <stdint.h>
+
+#include "__functional/reference_wrapper.h"
+#include "expected"
+#include "memory"
+#include "optional"
+#include "type_traits"
+#include "utility"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    template <typename ResultCode>
+    concept result_code_enum = is_enum_v<ResultCode> && requires { ResultCode::SUCCESS; };
+
+    enum class simple_success_or_failure : uint32_t
+    {
+        SUCCESS = 0,
+        FAILURE,
+    };
+
+    template <result_code_enum ResultCode>
+    class status_result : public expected<void, ResultCode>
+    {
+    private:
+        using base_type = expected<void, ResultCode>;
+
+    public:
+        using base_type::base_type;
+
+        status_result(const base_type &other)
+            requires is_copy_constructible_v<base_type>
+            : base_type(other)
+        {
+        }
+
+        status_result(base_type &&other)
+            requires is_move_constructible_v<base_type>
+            : base_type(minstd::move(other))
+        {
+        }
+
+        ResultCode result_code() const noexcept
+        {
+            return this->has_value() ? ResultCode::SUCCESS : this->error();
+        }
+    };
+
+    using simple_result = status_result<simple_success_or_failure>;
+
+    template <result_code_enum ResultCode, typename T>
+    class value_result : public expected<T, ResultCode>
+    {
+    private:
+        using base_type = expected<T, ResultCode>;
+
+    public:
+        using base_type::base_type;
+
+        value_result(const base_type &other)
+            requires is_copy_constructible_v<base_type>
+            : base_type(other)
+        {
+        }
+
+        value_result(base_type &&other)
+            requires is_move_constructible_v<base_type>
+            : base_type(minstd::move(other))
+        {
+        }
+
+        ResultCode result_code() const noexcept
+        {
+            return this->has_value() ? ResultCode::SUCCESS : this->error();
+        }
+    };
+
+    template <result_code_enum ResultCode, typename ErrorInfo>
+    struct coded_error
+    {
+        ResultCode code_;
+        optional<ErrorInfo> info_;
+    };
+
+    //  A failure takes its information alongside the code:  return {minstd::unexpected(code), info};
+
+    template <result_code_enum ResultCode, typename T, typename ErrorInfo>
+    class value_result_with_error_info : public expected<T, coded_error<ResultCode, ErrorInfo>>
+    {
+    private:
+        using base_type = expected<T, coded_error<ResultCode, ErrorInfo>>;
+        using coded_error_type = coded_error<ResultCode, ErrorInfo>;
+
+    public:
+        using base_type::base_type;
+
+        value_result_with_error_info(const base_type &other)
+            requires is_copy_constructible_v<base_type>
+            : base_type(other)
+        {
+        }
+
+        value_result_with_error_info(base_type &&other)
+            requires is_move_constructible_v<base_type>
+            : base_type(minstd::move(other))
+        {
+        }
+
+        value_result_with_error_info(const unexpected<ResultCode> &code)
+            : base_type(unexpected<coded_error_type>(coded_error_type{code.error(), optional<ErrorInfo>()}))
+        {
+        }
+
+        //  Keeps an rvalue code from the base's converting constructor.
+
+        value_result_with_error_info(unexpected<ResultCode> &&code)
+            : value_result_with_error_info(static_cast<const unexpected<ResultCode> &>(code))
+        {
+        }
+
+        value_result_with_error_info(const unexpected<ResultCode> &code, const ErrorInfo &info)
+            : base_type(unexpected<coded_error_type>(coded_error_type{code.error(), optional<ErrorInfo>(info)}))
+        {
+        }
+
+        ResultCode result_code() const noexcept
+        {
+            return this->has_value() ? ResultCode::SUCCESS : this->error().code_;
+        }
+
+        //  Empty on success, and on a failure given no information.
+
+        optional<ErrorInfo> error_info() const
+        {
+            return this->has_value() ? optional<ErrorInfo>() : this->error().info_;
+        }
+    };
+
+    //  The referenced object must outlive the result.  value(), * and -> give the T& itself, and and_then and
+    //      transform pass it to their function.
+
+    template <result_code_enum ResultCode, typename T>
+    class reference_result : public expected<reference_wrapper<T>, ResultCode>
+    {
+    private:
+        using base_type = expected<reference_wrapper<T>, ResultCode>;
+
+    public:
+        reference_result(T &value)
+            : base_type(reference_wrapper<T>(value))
+        {
+        }
+
+        reference_result(const unexpected<ResultCode> &error)
+            : base_type(error)
+        {
+        }
+
+        reference_result(const base_type &other)
+            requires is_copy_constructible_v<base_type>
+            : base_type(other)
+        {
+        }
+
+        reference_result(base_type &&other)
+            requires is_move_constructible_v<base_type>
+            : base_type(minstd::move(other))
+        {
+        }
+
+        explicit reference_result(in_place_t, reference_wrapper<T> value)
+            : base_type(in_place, value)
+        {
+        }
+
+        template <typename... Args>
+            requires is_constructible_v<ResultCode, Args...>
+        explicit reference_result(unexpect_t, Args &&...args)
+            : base_type(unexpect, minstd::forward<Args>(args)...)
+        {
+        }
+
+        ResultCode result_code() const noexcept
+        {
+            return this->has_value() ? ResultCode::SUCCESS : this->error();
+        }
+
+        T &value() const
+        {
+            return base_type::value().get();
+        }
+
+        //  Unchecked, as for expected: has_value() must be true.
+
+        T &operator*() const noexcept
+        {
+            return base_type::operator*().get();
+        }
+
+        T *operator->() const noexcept
+        {
+            return &base_type::operator*().get();
+        }
+
+        template <typename F>
+        auto and_then(F &&f) const
+        {
+            return base_type::and_then(with_referent<F>(f));
+        }
+
+        template <typename F>
+        auto transform(F &&f) const
+        {
+            return base_type::transform(with_referent<F>(f));
+        }
+
+    private:
+        //  Hands f the T& the base holds in a reference_wrapper, returning exactly what f returns.
+        template <typename F>
+        static auto with_referent(remove_reference_t<F> &f)
+        {
+            return [&f](const reference_wrapper<T> &held) -> decltype(auto) {
+                return minstd::__invoke(minstd::forward<F>(f), held.get());
+            };
+        }
+    };
+
+    //  The value is a unique_ptr, so a success may still hold nothing if the callee chose to return an empty one.
+
+    template <result_code_enum ResultCode, typename T>
+    class pointer_result : public expected<unique_ptr<T>, ResultCode>
+    {
+    private:
+        using base_type = expected<unique_ptr<T>, ResultCode>;
+
+    public:
+        using base_type::base_type;
+
+        pointer_result(const base_type &other)
+            requires is_copy_constructible_v<base_type>
+            : base_type(other)
+        {
+        }
+
+        pointer_result(base_type &&other)
+            requires is_move_constructible_v<base_type>
+            : base_type(minstd::move(other))
+        {
+        }
+
+        ResultCode result_code() const noexcept
+        {
+            return this->has_value() ? ResultCode::SUCCESS : this->error();
+        }
+    };
+} // namespace MINIMAL_STD_NAMESPACE

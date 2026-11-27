@@ -177,6 +177,11 @@ namespace MINIMAL_STD_NAMESPACE
             return has_value_;
         }
 
+        constexpr explicit operator bool() const noexcept
+        {
+            return has_value_;
+        }
+
         T &operator*()
         {
             return value_;

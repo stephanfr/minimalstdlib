@@ -7,6 +7,7 @@
 #include <minstdconfig.h>
 
 #include <avl_tree>
+#include <expected>
 #include <forward_list>
 #include <list>
 #include <lockfree/spsc_queue>
@@ -194,6 +195,35 @@ namespace
         STRCMP_EQUAL("invalid_optional_access", g_failure_event.message);
         STRCMP_EQUAL(__FILE__, g_failure_event.file);
         CHECK_EQUAL(expected_line, g_failure_event.line);
+    }
+
+    TEST(FailurePolicyTests, InvalidExpectedAccessLogsWithoutTrap)
+    {
+        const int expected_line = __LINE__ + 1;
+        minstd::invalid_expected_access(__FILE__, __LINE__);
+
+        CHECK_EQUAL(1, g_failure_event.call_count);
+        STRCMP_EQUAL("invalid_expected_access", g_failure_event.reason);
+        STRCMP_EQUAL("invalid_expected_access", g_failure_event.message);
+        STRCMP_EQUAL(__FILE__, g_failure_event.file);
+        CHECK_EQUAL(expected_line, g_failure_event.line);
+    }
+
+    TEST(FailurePolicyTests, ExpectedWrongSideAccessIsReported)
+    {
+        const minstd::expected<uint32_t, uint32_t> value(24U);
+        const minstd::expected<uint32_t, uint32_t> error(minstd::unexpected(7U));
+        const minstd::expected<void, uint32_t> success;
+
+        (void)value.value();
+        (void)error.error();
+        CHECK_EQUAL(0, g_failure_event.call_count);
+
+        (void)error.value();
+        (void)value.error();
+        (void)success.error();
+        CHECK_EQUAL(3, g_failure_event.call_count);
+        STRCMP_EQUAL("invalid_expected_access", g_failure_event.reason);
     }
 
     TEST(FailurePolicyTests, SpscQueueConstructorOomLogsWithoutTrap)

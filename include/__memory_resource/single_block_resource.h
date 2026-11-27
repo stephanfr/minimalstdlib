@@ -43,10 +43,10 @@ namespace MINIMAL_STD_NAMESPACE
         public:
             struct allocation_info
             {
-                bool is_valid = false;
-                bool in_use = false;
-                size_t size = 0;
-                size_t alignment = 0;
+                bool is_valid_ = false;
+                bool in_use_ = false;
+                size_t size_ = 0;
+                size_t alignment_ = 0;
             };
 
             single_block_resource() = delete;

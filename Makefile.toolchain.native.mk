@@ -17,11 +17,12 @@ AR := ar
 CPREPROCESSOR := cpp
 #  An invalid memory order on an atomic is an error; clang names the warning differently (CC=clang++ builds with clang)
 ifneq ($(findstring clang,$(CC)),)
-C_FLAGS := -Wall -Werror=atomic-memory-ordering -fno-exceptions -fno-unwind-tables
+C_CPP_SHARED_FLAGS := -Wall -Werror=atomic-memory-ordering -fno-exceptions -fno-unwind-tables
 else
-C_FLAGS := -Wall -Werror=invalid-memory-model -fno-exceptions -fno-unwind-tables
+C_CPP_SHARED_FLAGS := -Wall -Werror=invalid-memory-model -fno-exceptions -fno-unwind-tables
 endif
-CPP_FLAGS := $(C_FLAGS) -std=c++20 -fno-rtti
+C_FLAGS := -std=c17 $(C_CPP_SHARED_FLAGS)
+CPP_FLAGS := -std=c++20 -fno-rtti $(C_CPP_SHARED_FLAGS)
 OPTIMIZATION_FLAGS := -O2
 LDFLAGS :=
 

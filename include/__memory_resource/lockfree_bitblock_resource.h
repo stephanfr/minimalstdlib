@@ -225,8 +225,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             struct allocation_header
             {
-                block *owner = nullptr;
-                uint32_t num_elements = 0;
+                block *owner_ = nullptr;
+                uint32_t num_elements_ = 0;
             };
 
         public:
@@ -329,8 +329,8 @@ namespace MINIMAL_STD_NAMESPACE
 
                 uint8_t *allocation_base = blk->data_ + (element_index * ELEMENT_SIZE_IN_BYTES);
                 auto header = reinterpret_cast<allocation_header *>(allocation_base);
-                header->owner = blk;
-                header->num_elements = static_cast<uint32_t>(num_elements);
+                header->owner_ = blk;
+                header->num_elements_ = static_cast<uint32_t>(num_elements);
 
                 return allocation_base + HEADER_SIZE;
             }
@@ -338,7 +338,7 @@ namespace MINIMAL_STD_NAMESPACE
             static block *block_from_allocation(void *ptr)
             {
                 auto header = reinterpret_cast<allocation_header *>(static_cast<uint8_t *>(ptr) - HEADER_SIZE);
-                return header->owner;
+                return header->owner_;
             }
 
             void update_hints_after_deallocation(block *blk)
@@ -483,8 +483,8 @@ namespace MINIMAL_STD_NAMESPACE
 
                 uint8_t *payload = static_cast<uint8_t *>(block);
                 auto header = reinterpret_cast<allocation_header *>(payload - HEADER_SIZE);
-                auto current_block = header->owner;
-                uint32_t num_elements = header->num_elements;
+                auto current_block = header->owner_;
+                uint32_t num_elements = header->num_elements_;
 
                 auto index = (reinterpret_cast<uint8_t *>(header) - current_block->data_) / ELEMENT_SIZE_IN_BYTES;
 

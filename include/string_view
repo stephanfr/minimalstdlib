@@ -1,0 +1,151 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "basic_string"
+#include "type_traits"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    //  Characters someone else owns, and how many: the characters must outlive the view, which need not end in a NUL.
+    //      Reading past the end gives T(), never the bytes beyond.
+    //
+    //      bool parsed = parse(minstd::string_view("10.0.2.15"));
+
+    template <typename T>
+    class basic_string_view
+    {
+    public:
+        static constexpr size_t npos = SIZE_MAX;
+
+        constexpr basic_string_view() noexcept = default;
+
+        //  A literal or a character array: up to its first NUL, and never past its end.
+
+        template <size_t N>
+        constexpr basic_string_view(const T (&characters)[N]) noexcept
+            : data_(characters),
+              length_(bounded_length(characters, N))
+        {
+        }
+
+        //  NUL-terminated text from a C interface; null is empty.
+
+        template <typename Pointer>
+            requires(is_same_v<Pointer, const T *> || is_same_v<Pointer, T *>)
+        explicit constexpr basic_string_view(Pointer characters) noexcept
+            : data_(characters),
+              length_((characters == nullptr) ? 0 : bounded_length(characters, npos))
+        {
+        }
+
+        constexpr basic_string_view(const T *characters, size_t length) noexcept
+            : data_(characters),
+              length_((characters == nullptr) ? 0 : length)
+        {
+        }
+
+        basic_string_view(const basic_string<T> &string) noexcept
+            : data_(string.data()),
+              length_(string.length())
+        {
+        }
+
+        constexpr size_t size() const noexcept
+        {
+            return length_;
+        }
+
+        constexpr size_t length() const noexcept
+        {
+            return length_;
+        }
+
+        constexpr bool empty() const noexcept
+        {
+            return length_ == 0;
+        }
+
+        //  For C interfaces only: not NUL-terminated in general.
+
+        constexpr const T *data() const noexcept
+        {
+            return data_;
+        }
+
+        constexpr T operator[](size_t index) const noexcept
+        {
+            return (index < length_) ? data_[index] : T();
+        }
+
+        //  At most 'count' characters from 'position', clamped to the view.
+
+        constexpr basic_string_view substr(size_t position, size_t count = npos) const noexcept
+        {
+            if (position >= length_)
+            {
+                return basic_string_view();
+            }
+
+            const size_t available = length_ - position;
+
+            return basic_string_view(data_ + position, (count < available) ? count : available);
+        }
+
+        constexpr size_t find(T character, size_t position = 0) const noexcept
+        {
+            for (size_t i = position; i < length_; i++)
+            {
+                if (data_[i] == character)
+                {
+                    return i;
+                }
+            }
+
+            return npos;
+        }
+
+        constexpr bool operator==(const basic_string_view &other) const noexcept
+        {
+            if (length_ != other.length_)
+            {
+                return false;
+            }
+
+            for (size_t i = 0; i < length_; i++)
+            {
+                if (data_[i] != other.data_[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+    private:
+        const T *data_ = nullptr;
+        size_t length_ = 0;
+
+        static constexpr size_t bounded_length(const T *characters, size_t limit) noexcept
+        {
+            size_t length = 0;
+
+            while ((length < limit) && (characters[length] != T()))
+            {
+                length++;
+            }
+
+            return length;
+        }
+    };
+
+    using string_view = basic_string_view<char>;
+} // namespace MINIMAL_STD_NAMESPACE

@@ -45,10 +45,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         virtual result_type operator()() = 0;
 
-        //  Returns an estimate of the entropy of the source in bits.
-        //  Returns 0.0 when the entropy cannot be determined or the source
-        //  is deterministic.  Concrete subclasses override when hardware
-        //  can report a meaningful estimate.
+        //  An estimate of the source's entropy in bits: 0 when unknown or deterministic.
 
         virtual double entropy() const noexcept
         {

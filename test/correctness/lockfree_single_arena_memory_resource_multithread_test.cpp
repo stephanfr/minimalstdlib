@@ -311,12 +311,12 @@ TEST(LockfreeSingleArenaMemoryResourceMultithreadCorrectnessTests, MultiThreadTe
             {
                 auto alloc_info = resource.get_allocation_info(args[i].pointers_allocated[j]);
 
-                if (alloc_info.state == lockfree_single_arena_resource_with_stats::allocation_state::INVALID)
+                if (alloc_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::INVALID)
                 {
                     printf("Invalid allocation info\n");
                 }
 
-                CHECK(alloc_info.state != lockfree_single_arena_resource_with_stats::allocation_state::INVALID);
+                CHECK(alloc_info.state_ != lockfree_single_arena_resource_with_stats::allocation_state::INVALID);
 
                 total_number_of_allocations++;
                 total_number_of_bytes_allocated += args[i].sizes_allocated[j];
@@ -340,7 +340,7 @@ TEST(LockfreeSingleArenaMemoryResourceMultithreadCorrectnessTests, MultiThreadTe
             if (!args[i].deleted_element[j])
             {
                 auto alloc_info = resource.get_allocation_info(args[i].pointers_allocated[j]);
-                CHECK(alloc_info.state == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
+                CHECK(alloc_info.state_ == lockfree_single_arena_resource_with_stats::allocation_state::IN_USE);
             }
         }
     }

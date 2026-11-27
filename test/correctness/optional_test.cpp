@@ -408,6 +408,22 @@ namespace
         CHECK_EQUAL(42u, value_opt.value_or(99u));
     }
 
+    TEST(OptionalTests, ConvertsToBoolOnlyExplicitly)
+    {
+        static_assert(!minstd::is_convertible_v<minstd::optional<uint32_t>, bool>, "operator bool must be explicit");
+
+        minstd::optional<uint32_t> value_opt(42u);
+        const minstd::optional<uint32_t> empty_opt;
+
+        CHECK_TRUE(static_cast<bool>(value_opt));
+        CHECK_FALSE(static_cast<bool>(empty_opt));
+        CHECK_TRUE(value_opt ? true : false);
+        CHECK_TRUE(!empty_opt);
+
+        value_opt.reset();
+        CHECK_FALSE(static_cast<bool>(value_opt));
+    }
+
     TEST(OptionalTests, ComparisonOperatorsTest)
     {
         minstd::optional<uint32_t> empty1;

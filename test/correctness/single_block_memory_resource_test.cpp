@@ -34,9 +34,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     auto alloc_info = resource.get_allocation_info(ptr1);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(alloc_info.in_use);
-    CHECK(alloc_info.size == 50);
+    CHECK(alloc_info.is_valid_);
+    CHECK(alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 50);
 
     void *ptr2 = resource.allocate(50);
 
@@ -48,9 +48,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     alloc_info = resource.get_allocation_info(ptr2);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(alloc_info.in_use);
-    CHECK(alloc_info.size == 50);
+    CHECK(alloc_info.is_valid_);
+    CHECK(alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 50);
 
     void *ptr3 = resource.allocate(133);
 
@@ -62,9 +62,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     alloc_info = resource.get_allocation_info(ptr3);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(alloc_info.in_use);
-    CHECK(alloc_info.size == 133);
+    CHECK(alloc_info.is_valid_);
+    CHECK(alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 133);
 
     void *ptr4 = resource.allocate(64);
 
@@ -76,9 +76,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     alloc_info = resource.get_allocation_info(ptr4);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(alloc_info.in_use);
-    CHECK(alloc_info.size == 64);
+    CHECK(alloc_info.is_valid_);
+    CHECK(alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 64);
 
     CHECK(resource.current_allocated() == 4);
     CHECK(resource.current_bytes_allocated() == 50 + 50 + 133 + 64);
@@ -91,9 +91,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     alloc_info = resource.get_allocation_info(ptr2);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(!alloc_info.in_use);
-    CHECK(alloc_info.size == 50);
+    CHECK(alloc_info.is_valid_);
+    CHECK(!alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 50);
 
     CHECK(resource.current_allocated() == 3);
     CHECK(resource.current_bytes_allocated() == 50 + 133 + 64);
@@ -106,9 +106,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceBasicFunctionality)
 
     alloc_info = resource.get_allocation_info(ptr4);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(!alloc_info.in_use);
-    CHECK(alloc_info.size == 64);
+    CHECK(alloc_info.is_valid_);
+    CHECK(!alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 64);
 
     CHECK(resource.current_allocated() == 2);
     CHECK(resource.current_bytes_allocated() == 50 + 133);
@@ -139,9 +139,9 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceDoesNotReuseTooSmallBloc
 
     auto alloc_info = resource.get_allocation_info(next);
 
-    CHECK(alloc_info.is_valid);
-    CHECK(alloc_info.in_use);
-    CHECK(alloc_info.size == 16); //  before the fix: header overwritten, size is garbage
+    CHECK(alloc_info.is_valid_);
+    CHECK(alloc_info.in_use_);
+    CHECK(alloc_info.size_ == 16); //  before the fix: header overwritten, size is garbage
 }
 
 TEST(SingleBlockMemoryResourceTests, SingleBlockResourceReusesFittingBlock)
@@ -171,7 +171,7 @@ TEST(SingleBlockMemoryResourceTests, SingleBlockResourceHonoursRequestedAlignmen
         CHECK_EQUAL(0, (uintptr_t)ptr % 64);   //  before: 16-aligned only
 
         auto alloc_info = resource.get_allocation_info(ptr);
-        CHECK(alloc_info.is_valid);
-        CHECK(alloc_info.size == 24);
+        CHECK(alloc_info.is_valid_);
+        CHECK(alloc_info.size_ == 24);
     }
 }

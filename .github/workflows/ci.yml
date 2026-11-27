@@ -17,7 +17,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/stephanfr/aarch64-bare-metal-toolchain:13.3.rel1
+      image: ghcr.io/stephanfr/aarch64-bare-metal-toolchain:15.2.rel1
 
     steps:
       - uses: actions/checkout@v4

@@ -97,8 +97,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             struct slot_handle
             {
-                uint32_t slot = 0;
-                uint32_t generation = 0;
+                uint32_t slot_ = 0;
+                uint32_t generation_ = 0;
             };
 
             static inline SlotStatistics slot_stats_;
@@ -535,13 +535,13 @@ namespace MINIMAL_STD_NAMESPACE
                 while (true)
                 {
                     slot_handle handle = allocate_from_partially_free_blocks(ptr);
-                    if (handle.slot != 0)
+                    if (handle.slot_ != 0)
                     {
                         return handle;
                     }
 
                     handle = allocate_fresh_slot(ptr);
-                    if (handle.slot != 0)
+                    if (handle.slot_ != 0)
                     {
                         return handle;
                     }
@@ -869,8 +869,8 @@ namespace MINIMAL_STD_NAMESPACE
                 skip_node(const KeyType k, const ValueType &v, const int next_node_size) : key(k), value(v), top_level(next_node_size)
                 {
                     const auto slot = forward_link_type::allocate_slot(this);
-                    internal_slot_ = slot.slot;
-                    internal_generation_ = slot.generation;
+                    internal_slot_ = slot.slot_;
+                    internal_generation_ = slot.generation_;
                     if (internal_slot_ != 0)
                     {
                         intialize_next_nodes(next_node_size, nullptr);
@@ -881,8 +881,8 @@ namespace MINIMAL_STD_NAMESPACE
                 skip_node(const KeyType k, const int next_node_size, skip_node *next_node_target) : key(k), top_level(next_node_size)
                 {
                     const auto slot = forward_link_type::allocate_slot(this);
-                    internal_slot_ = slot.slot;
-                    internal_generation_ = slot.generation;
+                    internal_slot_ = slot.slot_;
+                    internal_generation_ = slot.generation_;
                     intialize_next_nodes(next_node_size, next_node_target);
                 }
 

@@ -1131,21 +1131,21 @@ namespace
             {
                 const auto handle = link_type::allocate_slot(a->node);
 
-                if ((handle.slot == 0) || (handle.slot >= TRACKED_SLOTS))
+                if ((handle.slot_ == 0) || (handle.slot_ >= TRACKED_SLOTS))
                 {
                     continue;
                 }
 
-                if (holders[handle.slot].fetch_add(1) != 0) //  someone else holds this slot too
+                if (holders[handle.slot_].fetch_add(1) != 0) //  someone else holds this slot too
                 {
                     a->violations->fetch_add(1);
                 }
 
-                holders[handle.slot].fetch_sub(1);
-                link_type::free_slot(handle.slot);
+                holders[handle.slot_].fetch_sub(1);
+                link_type::free_slot(handle.slot_);
             }
 
-            link_type::free_slot(pin.slot);
+            link_type::free_slot(pin.slot_);
             return nullptr;
         };
 
@@ -1181,8 +1181,8 @@ namespace
         for (int i = 0; i < 100; ++i)
         {
             const auto handle = link_type::allocate_slot(&node);
-            CHECK(handle.slot != 0);
-            link_type::free_slot(handle.slot);
+            CHECK(handle.slot_ != 0);
+            link_type::free_slot(handle.slot_);
         }
 
         CHECK(link_type::slot_high_water_mark() <= 1);              //  before: 100
@@ -1203,11 +1203,11 @@ namespace
         while (true)
         {
             const auto handle = link_type::allocate_slot(&node);
-            if (handle.slot == 0)
+            if (handle.slot_ == 0)
             {
                 break;
             }
-            slots[allocated++] = handle.slot;
+            slots[allocated++] = handle.slot_;
         }
 
         CHECK_EQUAL(link_type::MAX_SLOTS - 1, allocated);
@@ -1218,9 +1218,9 @@ namespace
         }
 
         const auto handle = link_type::allocate_slot(&node);
-        CHECK(handle.slot != 0); //  before: 0 forever - retired ranges were never reused
+        CHECK(handle.slot_ != 0); //  before: 0 forever - retired ranges were never reused
 
-        link_type::free_slot(handle.slot);
+        link_type::free_slot(handle.slot_);
         release_all_slot_blocks<link_type>();
     }
 
@@ -1233,7 +1233,7 @@ namespace
                                                         link_type::set_block_memory_resource(&resource);
                                                         oom_node node;
                                                         const auto handle = link_type::allocate_slot(&node);
-                                                        if (handle.slot != 0) _exit(1); })); //  before: the child segfaults
+                                                        if (handle.slot_ != 0) _exit(1); })); //  before: the child segfaults
     }
 
 

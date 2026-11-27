@@ -313,6 +313,37 @@ namespace
         }
     }
 
+    TEST(DifferentialFormatTests, EveryFiniteMagnitudeMatchesPrintf)
+    {
+        minstd::xoroshiro128_plus_plus engine(1021);
+        minstd::fixed_string<360> buffer;
+        minstd::fixed_string<16> spec_text;
+        char expected[360];
+
+        for (int i = 0; i < 20000; i++)
+        {
+            uint64_t bits = engine();
+
+            if (((bits >> 52) & 0x7FF) == 0x7FF)
+            {
+                continue;
+            }
+
+            if ((i % 4) == 0)
+            {
+                bits &= 0xFFF0000000000000; //  an exact power of two
+            }
+
+            const double value = __builtin_bit_cast(double, bits);
+            const int precision = static_cast<int>(engine() % 20);
+
+            snprintf(expected, sizeof(expected), "%.*f", precision, value);
+            minstd::format(spec_text, "{{:.{}}}", static_cast<int32_t>(precision));
+
+            STRCMP_EQUAL(expected, minstd::format(buffer, spec_text.c_str(), value).c_str());
+        }
+    }
+
     TEST(DifferentialFormatTests, FloatsWithSignsAndPaddingMatchPrintf)
     {
         minstd::xoroshiro128_plus_plus engine(99);

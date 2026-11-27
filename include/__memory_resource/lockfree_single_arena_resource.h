@@ -180,10 +180,10 @@ namespace MINIMAL_STD_NAMESPACE
 
             struct allocation_info
             {
-                void *location = nullptr;
-                allocation_state state = INVALID;
-                size_t size = 0;
-                size_t alignment = 0;
+                void *location_ = nullptr;
+                allocation_state state_ = INVALID;
+                size_t size_ = 0;
+                size_t alignment_ = 0;
             };
 
             lockfree_single_arena_resource_impl() = delete;
@@ -1217,8 +1217,8 @@ namespace MINIMAL_STD_NAMESPACE
                 bool used_frontier = false;
 
                 claimed_block claimed = search_for_deallocated_block(free_block_bin, shard);
-                block_header *free_block = claimed.block;
-                block_metadata *metadata = claimed.metadata;
+                block_header *free_block = claimed.block_;
+                block_metadata *metadata = claimed.metadata_;
 
                 if (free_block == nullptr)
                 {
@@ -1242,8 +1242,8 @@ namespace MINIMAL_STD_NAMESPACE
                     {
                         maybe_open_maintenance_window(shard, true);
                         claimed = search_for_deallocated_block(free_block_bin, shard);
-                        free_block = claimed.block;
-                        metadata = claimed.metadata;
+                        free_block = claimed.block_;
+                        metadata = claimed.metadata_;
 
                         if (free_block != nullptr)
                         {
@@ -1259,8 +1259,8 @@ namespace MINIMAL_STD_NAMESPACE
                         // Final desperate attempt: force maintenance to completely flush all lazily queued blocks
                         run_maintenance_window_all();
                         claimed = search_for_deallocated_block(free_block_bin, shard);
-                        free_block = claimed.block;
-                        metadata = claimed.metadata;
+                        free_block = claimed.block_;
+                        metadata = claimed.metadata_;
 
                         if (free_block != nullptr)
                         {
@@ -1288,7 +1288,7 @@ namespace MINIMAL_STD_NAMESPACE
                         return nullptr;
                     }
 
-                    if (claimed.block == nullptr)
+                    if (claimed.block_ == nullptr)
                     {
                         //  Frontier allocation path owns the reserved metadata.
                         metadata = frontier_reserved_metadata;
@@ -1764,8 +1764,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             struct claimed_block
             {
-                block_header *block = nullptr;
-                block_metadata *metadata = nullptr;
+                block_header *block_ = nullptr;
+                block_metadata *metadata_ = nullptr;
             };
 
             //  Unguarded variant of try_claim_popped_block for use within an existing guard scope.

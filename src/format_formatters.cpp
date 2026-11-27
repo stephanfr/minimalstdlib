@@ -27,20 +27,14 @@ namespace FMT_FORMATTERS_NAMESPACE
     //      never its sign or leading digits.
     //
 
-    struct numeric_text
+    template <size_t CAPACITY>
+    struct numeric_text_of
     {
-        //  Enough for 64 binary digits, a '.' and the decimals we compute.  Runs of zeros are counted
-        //      rather than stored, so a large double or a large precision need not fit.
-
-        static constexpr size_t CAPACITY = 80;
-
         const char *sign = "";
         const char *prefix = "";
         char digits[CAPACITY];
         size_t length = 0;
-        size_t fraction_start = 0; //  digits[fraction_start..length) follow the integer zeros
-        size_t integer_zeros = 0;  //  zeros at the end of the integer part
-        size_t trailing_zeros = 0; //  zeros at the end of the fraction
+        size_t trailing_zeros = 0; //  counted rather than stored, so a large precision need not fit
         bool finite = true;        //  inf and nan are padded with spaces, never zeros
 
         void push_back(char c)
@@ -51,6 +45,15 @@ namespace FMT_FORMATTERS_NAMESPACE
             }
         }
     };
+
+    //  Enough for 64 binary digits, a '.' and the decimals we compute.
+
+    using numeric_text = numeric_text_of<80>;
+
+    //  The 309 integer digits of the largest double and a '.'.  Kept apart so that formatting an integer
+    //      or an ordinary float does not pay for this much stack.
+
+    using large_float_text = numeric_text_of<310>;
 
     //
     //  Function to determine integer prefixes for binary, octal or hex
@@ -140,12 +143,13 @@ namespace FMT_FORMATTERS_NAMESPACE
         }
     }
 
-    void EmitNumber(minstd::string &buffer, const numeric_text &number, const arg_format_options &format)
+    template <size_t CAPACITY>
+    void EmitNumber(minstd::string &buffer, const numeric_text_of<CAPACITY> &number, const arg_format_options &format)
     {
         const size_t sign_length = strnlen(number.sign, 2);
         const size_t prefix_length = strnlen(number.prefix, 3);
 
-        const size_t number_length = sign_length + prefix_length + number.length + number.integer_zeros + number.trailing_zeros;
+        const size_t number_length = sign_length + prefix_length + number.length + number.trailing_zeros;
 
         size_t fill_before = 0;
         size_t zero_fill = 0;
@@ -183,16 +187,7 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         AppendRepeated(buffer, '0', zero_fill);
 
-        const size_t fraction_start = number.fraction_start > 0 ? number.fraction_start : number.length;
-
-        for (size_t i = 0; i < fraction_start; i++)
-        {
-            buffer.push_back(number.digits[i]);
-        }
-
-        AppendRepeated(buffer, '0', number.integer_zeros);
-
-        for (size_t i = fraction_start; i < number.length; i++)
+        for (size_t i = 0; i < number.length; i++)
         {
             buffer.push_back(number.digits[i]);
         }
@@ -206,8 +201,8 @@ namespace FMT_FORMATTERS_NAMESPACE
     //  Function to render an unsigned value most significant digit first
     //
 
-    template <typename T>
-    void AppendDigits(numeric_text &number, T value, unsigned base, const char *numeric_conversion_digits)
+    template <size_t CAPACITY, typename T>
+    void AppendDigits(numeric_text_of<CAPACITY> &number, T value, unsigned base, const char *numeric_conversion_digits)
     {
         char reversed[64];
         size_t count = 0;
@@ -225,42 +220,95 @@ namespace FMT_FORMATTERS_NAMESPACE
     }
 
     //
-    //  Template function to convert floats to string.  Works for all floating point types.
+    //  Floats are rendered from their IEEE 754 bits in integer arithmetic, so the digits are exact.
     //
 
-    template <typename T>
-    void FloatToString(minstd::string &buffer, const T &value, const arg_format_options &format)
+    //  At or above 2^64 a double is an integer, m * 2^shift.  It is built in base 10^9 so its digits are exact.
+
+    void LargeFloatToString(minstd::string &buffer, uint64_t mantissa, uint32_t shift, const char *sign, uint32_t precision, const arg_format_options &format)
     {
-        numeric_text number;
+        static constexpr uint32_t LIMB_BASE = 1000000000;
+        static constexpr size_t MAX_LIMBS = 35;       //  10^315 > 2^1024
+        static constexpr uint32_t MAX_LIMB_SHIFT = 29; //  a limb below 2^30, shifted, plus a carry fits 64 bits
 
-        //  The sign bit, not value < 0, so -0.0 and -nan keep their sign as they do in std::format
+        uint32_t limbs[MAX_LIMBS]; //  least significant first
+        size_t limb_count = 0;
 
-        const bool is_negative = __builtin_signbit(value);
-
-        //  NaN compares unequal to itself
-
-        if (value != value)
+        for (uint64_t rest = mantissa; rest != 0; rest /= LIMB_BASE)
         {
-            number.sign = DetermineSign(is_negative, format);
-            number.finite = false;
-            number.push_back('n');
-            number.push_back('a');
-            number.push_back('n');
-
-            EmitNumber(buffer, number, format);
-            return;
+            limbs[limb_count++] = static_cast<uint32_t>(rest % LIMB_BASE);
         }
 
-        const double magnitude = is_negative ? -(double)value : (double)value;
-
-        number.sign = DetermineSign(is_negative, format);
-
-        if (magnitude > 1.7976931348623157e308)
+        for (uint32_t remaining = shift; remaining > 0;)
         {
+            const uint32_t step = minstd::min(remaining, MAX_LIMB_SHIFT);
+            uint64_t carry = 0;
+
+            for (size_t i = 0; i < limb_count; i++)
+            {
+                const uint64_t shifted = (static_cast<uint64_t>(limbs[i]) << step) + carry;
+
+                limbs[i] = static_cast<uint32_t>(shifted % LIMB_BASE);
+                carry = shifted / LIMB_BASE;
+            }
+
+            if (carry != 0)
+            {
+                limbs[limb_count++] = static_cast<uint32_t>(carry);
+            }
+
+            remaining -= step;
+        }
+
+        large_float_text number;
+
+        number.sign = sign;
+
+        AppendDigits(number, limbs[limb_count - 1], 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
+
+        for (size_t limb = limb_count - 1; limb > 0; limb--)
+        {
+            for (uint32_t divisor = LIMB_BASE / 10; divisor > 0; divisor /= 10)
+            {
+                number.push_back('0' + (limbs[limb - 1] / divisor) % 10);
+            }
+        }
+
+        if (precision > 0)
+        {
+            number.push_back('.');
+            number.trailing_zeros = precision;
+        }
+
+        EmitNumber(buffer, number, format);
+    }
+
+    void FloatToString(minstd::string &buffer, double value, const arg_format_options &format)
+    {
+        static constexpr uint64_t MANTISSA_MASK = (uint64_t{1} << 52) - 1;
+        static constexpr uint32_t INFINITY_OR_NAN = 0x7FF;
+        static constexpr uint32_t UNIT_EXPONENT = 1075; //  a biased exponent at which the mantissa counts units
+
+        const uint64_t bits = __builtin_bit_cast(uint64_t, value);
+        const uint32_t biased_exponent = static_cast<uint32_t>((bits >> 52) & 0x7FF);
+        const uint64_t fraction_bits = bits & MANTISSA_MASK;
+
+        //  The sign bit, so -0.0 and -nan keep their sign as they do in std::format
+
+        const char *sign = DetermineSign((bits >> 63) != 0, format);
+
+        numeric_text number;
+
+        number.sign = sign;
+
+        if (biased_exponent == INFINITY_OR_NAN)
+        {
+            const char *name = (fraction_bits != 0) ? "nan" : "inf";
+
             number.finite = false;
-            number.push_back('i');
-            number.push_back('n');
-            number.push_back('f');
+            number.push_back(name[0]);
+            number.push_back(name[1]);
+            number.push_back(name[2]);
 
             EmitNumber(buffer, number, format);
             return;
@@ -268,130 +316,89 @@ namespace FMT_FORMATTERS_NAMESPACE
 
         const uint32_t precision = format.precision().has_value() ? format.precision().value() : 0;
 
-        //  Below 2^64 the integer part fits a uint64_t and the fraction (magnitude - units) is exact, so the
-        //      decimals come from the fraction alone: the integer part takes no rounding error however large it
-        //      is.  Up to 19 decimals are computed exactly from the binary value, as std::format prints them;
-        //      any further ones are zeros.
+        //  The magnitude is exactly mantissa * 2^(exponent - UNIT_EXPONENT); a subnormal has exponent 1 and no implicit bit
 
-        if (magnitude < 18446744073709551616.0)
+        const uint64_t mantissa = (biased_exponent == 0) ? fraction_bits : (fraction_bits | (uint64_t{1} << 52));
+        const uint32_t exponent = (biased_exponent == 0) ? 1 : biased_exponent;
+
+        if (exponent >= UNIT_EXPONENT + 12)
         {
-            static uint64_t const pow10[] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
-                                             100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
-                                             1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
-                                             1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
-                                             1000000000000000000ULL, 10000000000000000000ULL};
+            LargeFloatToString(buffer, mantissa, exponent - UNIT_EXPONENT, sign, precision, format);
+            return;
+        }
 
-            const uint32_t computed_digits = minstd::min(precision, (uint32_t)19);
-            const uint64_t decimal_multiplier = pow10[computed_digits];
+        static uint64_t const pow10[] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
+                                         100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
+                                         1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+                                         1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+                                         1000000000000000000ULL, 10000000000000000000ULL};
 
-            uint64_t units = (uint64_t)magnitude;
-            const double fraction = magnitude - (double)units; //  exact
+        //  Up to 19 decimals are computed exactly from the binary value, as std::format prints them; any
+        //      further ones are zeros.
 
-            //  The fraction is exactly m / 2^e (IEEE 754: m below 2^53).  Scale it by 10^k in 128-bit integers,
-            //      so the decimals and the tie test are exact: m * 10^19 < 2^117.  Rounding a double product
-            //      instead misjudges near-ties (0.005 is slightly above a tie and must print 0.01).
+        const uint32_t computed_digits = minstd::min(precision, (uint32_t)19);
+        const uint64_t decimal_multiplier = pow10[computed_digits];
 
-            uint64_t decimals = 0;
-            bool round_up = false;
+        uint64_t units = 0;
+        uint64_t decimals = 0;
+        bool round_up = false;
 
-            if (fraction != 0)
-            {
-                uint64_t bits;
-                __builtin_memcpy(&bits, &fraction, sizeof(bits));
-
-                const uint32_t biased_exponent = static_cast<uint32_t>((bits >> 52) & 0x7FF);
-                const uint64_t m = (biased_exponent == 0) ? (bits & ((uint64_t{1} << 52) - 1))                       //  subnormal
-                                                          : ((bits & ((uint64_t{1} << 52) - 1)) | (uint64_t{1} << 52)); //  normal
-                const uint32_t e = (biased_exponent == 0) ? 1074 : (1075 - biased_exponent);                          //  fraction < 1, so e > 52
-
-                if (e < 128)
-                {
-                    using uint128 = unsigned __int128;
-
-                    const uint128 product = static_cast<uint128>(m) * decimal_multiplier;
-                    const uint128 one = static_cast<uint128>(1) << e;
-                    const uint128 remainder = product & (one - 1);
-                    const uint128 half = one >> 1;
-
-                    decimals = static_cast<uint64_t>(product >> e);
-
-                    //  Round half to even, as std::format does for an exact tie (2.5 -> "2", 0.125 -> "0.12")
-
-                    const uint64_t last_digit = (computed_digits > 0) ? decimals : units;
-
-                    round_up = (remainder > half) || ((remainder == half) && ((last_digit & 1) != 0));
-                }
-
-                //  e >= 128: the fraction is below 2^-75, so 10^19 times it is far below one half: rounds to zero
-            }
-
-            if (round_up)
-            {
-                if (++decimals == decimal_multiplier)
-                {
-                    decimals = 0;
-                    units++; //  cannot wrap: doubles this close to 2^64 have no fraction
-                }
-            }
-
-            AppendDigits(number, units, 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
-
-            if (precision > 0)
-            {
-                number.fraction_start = number.length;
-                number.push_back('.');
-
-                for (uint32_t i = computed_digits; i > 0; i--)
-                {
-                    number.push_back('0' + (decimals / pow10[i - 1]) % 10);
-                }
-
-                number.trailing_zeros = precision - computed_digits;
-            }
+        if (exponent >= UNIT_EXPONENT)
+        {
+            units = mantissa << (exponent - UNIT_EXPONENT);
         }
         else
         {
-            //  Too large for the integer: print its leading 17 significant digits, which is all a double
-            //      carries, then zeros for the rest of the magnitude.  The scale is divided out in exact
-            //      powers of ten (up to 1e22 is exact) so the leading digits pick up as little error as we can.
-            //      This is the precision limit of the formatter: the 17th digit can differ from the exact value
-            //      (printf prints the exact binary value, e.g. 1e23 as 99999999999999991611392).
+            const uint32_t fraction_shift = UNIT_EXPONENT - exponent;
 
-            uint32_t exponent = 0;
-            double power = 1;
+            //  Otherwise the value is below 2^-75, and even 10^19 times it rounds to zero
 
-            while (magnitude / power >= 1e17)
+            if (fraction_shift < 128)
             {
-                power *= 10;
-                exponent++;
+                using uint128 = unsigned __int128;
+
+                const uint128 one = static_cast<uint128>(1) << fraction_shift;
+                const uint128 whole = static_cast<uint128>(mantissa) >> fraction_shift;
+                const uint128 fraction = static_cast<uint128>(mantissa) & (one - 1);
+
+                //  fraction < 2^53, so the product is below 2^117
+
+                const uint128 product = fraction * decimal_multiplier;
+                const uint128 remainder = product & (one - 1);
+                const uint128 half = one >> 1;
+
+                units = static_cast<uint64_t>(whole);
+                decimals = static_cast<uint64_t>(product >> fraction_shift);
+
+                //  Round half to even, as std::format does for an exact tie (2.5 -> "2", 0.125 -> "0.12")
+
+                const uint64_t last_digit = (computed_digits > 0) ? decimals : units;
+
+                round_up = (remainder > half) || ((remainder == half) && ((last_digit & 1) != 0));
+            }
+        }
+
+        if (round_up)
+        {
+            if (++decimals == decimal_multiplier)
+            {
+                decimals = 0;
+                units++; //  cannot wrap: a double with a fraction is below 2^52
+            }
+        }
+
+        AppendDigits(number, units, 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
+
+        if (precision > 0)
+        {
+            number.push_back('.');
+
+            for (uint32_t i = computed_digits; i > 0; i--)
+            {
+                number.push_back('0' + (decimals / pow10[i - 1]) % 10);
             }
 
-            double scaled = magnitude;
-
-            for (uint32_t remaining = exponent; remaining > 0;)
-            {
-                const uint32_t step = minstd::min(remaining, (uint32_t)22);
-                double divisor = 1;
-
-                for (uint32_t i = 0; i < step; i++)
-                {
-                    divisor *= 10;
-                }
-
-                scaled /= divisor;
-                remaining -= step;
-            }
-
-            AppendDigits(number, (uint64_t)(scaled + 0.5), 10, LOWER_CASE_NUMERIC_CONVERSION_DIGITS);
-
-            number.integer_zeros = exponent;
-
-            if (precision > 0)
-            {
-                number.fraction_start = number.length;
-                number.push_back('.');
-                number.trailing_zeros = precision;
-            }
+            number.trailing_zeros = precision - computed_digits;
         }
 
         EmitNumber(buffer, number, format);
@@ -523,6 +530,12 @@ namespace FMT_FORMATTERS_NAMESPACE
     void fmt_arg_base<const minstd::string &>::AppendInternal(minstd::string &buffer, const ::MINIMAL_STD_NAMESPACE::arg_format_options &format_options) const
     {
         FormattedStringAppend(buffer, value_, value_.length(), format_options);
+    }
+
+    template <>
+    void fmt_arg_base<const minstd::string_view &>::AppendInternal(minstd::string &buffer, const ::MINIMAL_STD_NAMESPACE::arg_format_options &format_options) const
+    {
+        FormattedStringAppend(buffer, value_.data(), value_.length(), format_options);
     }
 
     template <>

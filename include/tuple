@@ -47,12 +47,12 @@
 #pragma GCC system_header
 
 //  A couple of preprocessor defs to forward or simply get the value of a tuple element.  They reach the element through
-//      a cast to its base rather than as tup.BaseType::value: clang does not see a pack that appears only in the
-//      qualifier of a member access, so a fold over tup.B::value fails to expand there.
+//      a cast to its base rather than as tup.BaseType::value_: clang does not see a pack that appears only in the
+//      qualifier of a member access, so a fold over tup.B::value_ fails to expand there.
 
-#define _TUPLE_FWD_M(TupleType, BaseType, tup, value) \
-    ::MINIMAL_STD_NAMESPACE::tuple_internal::_forward_base<BaseType, TupleType>(tup).value
-#define _TUPLE_GET_M(BaseType, tup, value) ::MINIMAL_STD_NAMESPACE::tuple_internal::_as_base<BaseType>(tup).value
+#define _TUPLE_FWD_M(TupleType, BaseType, tup, member) \
+    ::MINIMAL_STD_NAMESPACE::tuple_internal::_forward_base<BaseType, TupleType>(tup).member
+#define _TUPLE_GET_M(BaseType, tup, member) ::MINIMAL_STD_NAMESPACE::tuple_internal::_as_base<BaseType>(tup).member
 
 namespace MINIMAL_STD_NAMESPACE
 {
@@ -394,7 +394,7 @@ namespace MINIMAL_STD_NAMESPACE
             type_list<B1...>)
         {
             return (
-                (_TUPLE_GET_M(B1, t1, value) == _TUPLE_GET_M(B1, t2, value)) && ...);
+                (_TUPLE_GET_M(B1, t1, value_) == _TUPLE_GET_M(B1, t2, value_)) && ...);
         }
 
         template <class Tup, class... B1>
@@ -406,8 +406,8 @@ namespace MINIMAL_STD_NAMESPACE
             bool is_less = false;
 
             (_partial_cmp(
-                 _TUPLE_GET_M(B1, t1, value),
-                 _TUPLE_GET_M(B1, t2, value),
+                 _TUPLE_GET_M(B1, t1, value_),
+                 _TUPLE_GET_M(B1, t2, value_),
                  is_less) &&
              ...);
 
@@ -424,8 +424,8 @@ namespace MINIMAL_STD_NAMESPACE
 
             bool is_eq =
                 (_partial_cmp(
-                     _TUPLE_GET_M(B1, t1, value),
-                     _TUPLE_GET_M(B1, t2, value),
+                     _TUPLE_GET_M(B1, t1, value_),
+                     _TUPLE_GET_M(B1, t2, value_),
                      is_less) &&
                  ... && true);
 
@@ -440,7 +440,7 @@ namespace MINIMAL_STD_NAMESPACE
             type_list<B2...>)
         {
 
-            return ((_TUPLE_GET_M(B1, t1, value) == _TUPLE_GET_M(B2, t2, value)) && ...);
+            return ((_TUPLE_GET_M(B1, t1, value_) == _TUPLE_GET_M(B2, t2, value_)) && ...);
         }
 
         template <class Tup1, class Tup2, class... B1, class... B2>
@@ -452,8 +452,8 @@ namespace MINIMAL_STD_NAMESPACE
         {
             bool is_less = false;
 
-            (_partial_cmp(_TUPLE_GET_M(B1, t1, value),
-                          _TUPLE_GET_M(B2, t2, value),
+            (_partial_cmp(_TUPLE_GET_M(B1, t1, value_),
+                          _TUPLE_GET_M(B2, t2, value_),
                           is_less) &&
              ... && true);
 
@@ -470,8 +470,8 @@ namespace MINIMAL_STD_NAMESPACE
             bool is_less = false;
 
             bool is_eq = (_partial_cmp(
-                              _TUPLE_GET_M(B1, t1, value),
-                              _TUPLE_GET_M(B2, t2, value),
+                              _TUPLE_GET_M(B1, t1, value_),
+                              _TUPLE_GET_M(B2, t2, value_),
                               is_less) &&
                           ... && true);
 
@@ -502,21 +502,21 @@ namespace MINIMAL_STD_NAMESPACE
         static T decl_elem(tag<I>);
         using type = T;
 
-        [[no_unique_address]] T value;
+        [[no_unique_address]] T value_;
 
         inline constexpr decltype(auto) operator[](tag<I>) &
         {
-            return (value);
+            return (value_);
         }
 
         inline constexpr decltype(auto) operator[](tag<I>) const &
         {
-            return (value);
+            return (value_);
         }
 
         inline constexpr decltype(auto) operator[](tag<I>) &&
         {
-            return (static_cast<tuple_elem &&>(*this).value);
+            return (static_cast<tuple_elem &&>(*this).value_);
         }
 
         //  Intentionally no defaulted or custom comparison operators to avoid
@@ -559,25 +559,25 @@ namespace MINIMAL_STD_NAMESPACE
             F &&func,
             type_list<B...>)
         {
-            (void(func(_TUPLE_FWD_M(Tup, B, tup, value))), ...);
+            (void(func(_TUPLE_FWD_M(Tup, B, tup, value_))), ...);
         }
 
         template <class Tup, class F, class... B>
         inline constexpr bool _any(Tup &&tup, F &&func, type_list<B...>)
         {
-            return (bool(func(_TUPLE_FWD_M(Tup, B, tup, value))) || ...);
+            return (bool(func(_TUPLE_FWD_M(Tup, B, tup, value_))) || ...);
         }
 
         template <class Tup, class F, class... B>
         inline constexpr bool _all(Tup &&tup, F &&func, type_list<B...>)
         {
-            return (bool(func(_TUPLE_FWD_M(Tup, B, tup, value))) && ...);
+            return (bool(func(_TUPLE_FWD_M(Tup, B, tup, value_))) && ...);
         }
 
         template <class Tup, class F, class... B>
-        inline constexpr auto _map(Tup &&tup, F &&func, type_list<B...>) -> tuple<decltype(func(_TUPLE_FWD_M(Tup, B, tup, value)))...>
+        inline constexpr auto _map(Tup &&tup, F &&func, type_list<B...>) -> tuple<decltype(func(_TUPLE_FWD_M(Tup, B, tup, value_)))...>
         {
-            return {func(_TUPLE_FWD_M(Tup, B, tup, value))...};
+            return {func(_TUPLE_FWD_M(Tup, B, tup, value_))...};
         }
 
         template <class Tup, class F, class... B>
@@ -586,13 +586,13 @@ namespace MINIMAL_STD_NAMESPACE
             F &&f,
             type_list<B...>)
         {
-            return static_cast<F &&>(f)(_TUPLE_FWD_M(Tup, B, t, value)...);
+            return static_cast<F &&>(f)(_TUPLE_FWD_M(Tup, B, t, value_)...);
         }
 
         template <class U, class Tup, class... B>
         inline constexpr U _convert(Tup &&t, type_list<B...>)
         {
-            return U{_TUPLE_FWD_M(Tup, B, t, value)...};
+            return U{_TUPLE_FWD_M(Tup, B, t, value_)...};
         }
     } // namespace tuple_internal::detail
 
@@ -890,7 +890,7 @@ namespace MINIMAL_STD_NAMESPACE
             tuple &other,
             type_list<B...>) noexcept(nothrow_swappable)
         {
-            (MINIMAL_STD_NAMESPACE::swap(B::value, _TUPLE_GET_M(B, other, value)), ...);
+            (MINIMAL_STD_NAMESPACE::swap(B::value_, _TUPLE_GET_M(B, other, value_)), ...);
         }
 
         template <class U, class... B1, class... B2>
@@ -899,7 +899,7 @@ namespace MINIMAL_STD_NAMESPACE
             type_list<B1...>,
             type_list<B2...>)
         {
-            (void(B1::value = _TUPLE_FWD_M(U, B2, u, value)), ...);
+            (void(B1::value_ = _TUPLE_FWD_M(U, B2, u, value_)), ...);
         }
 
         template <class U, size_t... I>
@@ -907,13 +907,13 @@ namespace MINIMAL_STD_NAMESPACE
             U &&u,
             index_sequence<I...>)
         {
-            (void(tuple_elem<I, T>::value = get<I>(static_cast<U &&>(u))), ...);
+            (void(tuple_elem<I, T>::value_ = get<I>(static_cast<U &&>(u))), ...);
         }
 
         template <class... U, class... B>
         inline constexpr void _assign(type_list<B...>, U &&...u)
         {
-            (void(B::value = static_cast<U &&>(u)), ...);
+            (void(B::value_ = static_cast<U &&>(u)), ...);
         }
     };
 
@@ -1116,12 +1116,12 @@ namespace MINIMAL_STD_NAMESPACE
     struct convert
     {
         using base_list = typename decay_t<Tuple>::base_list;
-        Tuple tuple;
+        Tuple tuple_;
         template <class U>
         constexpr operator U() &&
         {
             return tuple_internal::detail::_convert<U>(
-                static_cast<Tuple &&>(tuple),
+                static_cast<Tuple &&>(tuple_),
                 base_list{});
         }
     };
@@ -1216,8 +1216,8 @@ namespace MINIMAL_STD_NAMESPACE
             return {_TUPLE_FWD_M(
                 type_t<Outer>,
                 Inner,
-                _TUPLE_GET_M(Outer, tup, value),
-                value)...};
+                _TUPLE_GET_M(Outer, tup, value_),
+                value_)...};
         }
     } // namespace tuple_internal::detail
 
