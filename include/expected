@@ -1,0 +1,1518 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+//  The C++23 std::expected and std::unexpected, with these differences, since there are no exceptions:
+//
+//      - There is no bad_expected_access.  value() on an error calls invalid_expected_access(), which traps.
+//      - error() on a value, undefined for std::expected, is reported the same way.
+//      - The function given to and_then or or_else may also return a class derived from expected.  That class
+//        needs the constructor taking unexpect (for and_then), or in_place (for or_else on a value).
+//
+//  Without a constexpr construct_at, constant evaluation can construct, read, compare and chain, but cannot
+//      change which of the two an expected holds, nor copy or move one whose value or error is non-trivial.
+
+#include "minstdconfig.h"
+
+#include "initializer_list"
+#include "new"
+#include "type_traits"
+#include "utility"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    template <typename E>
+    class unexpected;
+
+    template <typename T, typename E>
+    class expected;
+
+    struct unexpect_t
+    {
+        explicit unexpect_t() = default;
+    };
+
+    inline constexpr unexpect_t unexpect{};
+
+    namespace expected_detail
+    {
+        template <typename T>
+        inline constexpr bool is_unexpected_v = false;
+
+        template <typename E>
+        inline constexpr bool is_unexpected_v<unexpected<E>> = true;
+
+        template <typename T, typename E>
+        void match_expected(const expected<T, E> &);
+
+        //  An expected, or a class derived from one
+        template <typename T>
+        concept expected_like = requires(const T &value) { expected_detail::match_expected(value); };
+
+        template <typename E>
+        concept valid_error = !is_reference_v<E> && !is_function_v<E> && !is_void_v<E> && !is_array_v<E> &&
+                              !is_const_v<E> && !is_volatile_v<E> && !is_unexpected_v<E>;
+
+        template <typename T>
+        concept valid_value = !is_reference_v<T> && !is_function_v<T> && !is_array_v<T> &&
+                              !is_same_v<remove_cv_t<T>, in_place_t> && !is_same_v<remove_cv_t<T>, unexpect_t> &&
+                              !is_unexpected_v<remove_cv_t<T>>;
+
+        template <typename T, typename W>
+        concept constructible_from_any_cvref =
+            is_constructible_v<T, W &> || is_constructible_v<T, W> ||
+            is_constructible_v<T, const W &> || is_constructible_v<T, const W>;
+
+        template <typename T, typename W>
+        concept convertible_from_any_cvref =
+            is_convertible_v<W &, T> || is_convertible_v<W, T> ||
+            is_convertible_v<const W &, T> || is_convertible_v<const W, T>;
+
+        //  Whether expected<T, E> converts from an expected<U, G>, taking its members as ValueFrom and ErrorFrom.
+        //      The exclusions keep this from competing with building the value or error from the whole source.
+        template <typename T, typename E, typename U, typename G, typename ValueFrom, typename ErrorFrom>
+        concept convertible_expected =
+            ((is_void_v<T> && is_void_v<U>) || (!is_void_v<T> && is_constructible_v<T, ValueFrom>)) &&
+            is_constructible_v<E, ErrorFrom> &&
+            (is_void_v<T> || is_same_v<remove_cv_t<T>, bool> ||
+             (!constructible_from_any_cvref<T, expected<U, G>> && !convertible_from_any_cvref<T, expected<U, G>>)) &&
+            !constructible_from_any_cvref<unexpected<E>, expected<U, G>>;
+
+        template <typename T, typename Self, typename U>
+        concept value_argument =
+            !is_same_v<remove_cvref_t<U>, in_place_t> && !is_same_v<remove_cvref_t<U>, unexpect_t> &&
+            !is_same_v<remove_cvref_t<U>, Self> && !is_unexpected_v<remove_cvref_t<U>> &&
+            (!is_same_v<remove_cv_t<T>, bool> || !expected_like<remove_cvref_t<U>>) &&
+            is_constructible_v<T, U>;
+
+        //  Concepts, so that each trivial special member subsumes, and is preferred to, its non-trivial overload
+
+        template <typename... Members>
+        concept copy_constructible_members = (is_copy_constructible_v<Members> && ...);
+
+        template <typename... Members>
+        concept trivially_copy_constructible_members =
+            copy_constructible_members<Members...> && (is_trivially_copy_constructible_v<Members> && ...);
+
+        template <typename... Members>
+        concept move_constructible_members = (is_move_constructible_v<Members> && ...);
+
+        template <typename... Members>
+        concept trivially_move_constructible_members =
+            move_constructible_members<Members...> && (is_trivially_move_constructible_v<Members> && ...);
+
+        template <typename T>
+        concept copy_assignable_member = is_copy_constructible_v<T> && is_copy_assignable_v<T>;
+
+        template <typename T>
+        concept move_assignable_member = is_move_constructible_v<T> && is_move_assignable_v<T>;
+
+        template <typename T>
+        concept swappable_member = is_swappable_v<T> && is_move_constructible_v<T>;
+
+        template <typename A, typename B>
+        concept equality_checkable =
+            requires(const A &a, const B &b) { requires is_convertible_v<decltype(a == b), bool>; };
+
+        template <typename T, typename... Args>
+        constexpr void construct_member(T &member, Args &&...args)
+        {
+            ::new (const_cast<void *>(static_cast<const volatile void *>(__builtin_addressof(member))))
+                T(minstd::forward<Args>(args)...);
+        }
+
+        template <typename T>
+        constexpr void destroy_member(T &member)
+        {
+            member.~T();
+        }
+
+        //  Replaces the active union member.  Where construction could throw, std::expected builds the new member
+        //      aside first, which also lets the arguments refer into the old one.
+        template <typename New, typename Old, typename... Args>
+        constexpr void replace_member(New &new_member, Old &old_member, Args &&...args)
+        {
+            if constexpr (!is_nothrow_constructible_v<New, Args...> && is_nothrow_move_constructible_v<New>)
+            {
+                New replacement(minstd::forward<Args>(args)...);
+                destroy_member(old_member);
+                construct_member(new_member, minstd::move(replacement));
+            }
+            else
+            {
+                destroy_member(old_member);
+                construct_member(new_member, minstd::forward<Args>(args)...);
+            }
+        }
+
+        //  Construct a member directly from a call's result, so that it need not be movable
+        struct invoke_value_t
+        {
+        };
+
+        struct invoke_error_t
+        {
+        };
+    } // namespace expected_detail
+
+    template <typename E>
+    class unexpected
+    {
+        static_assert(expected_detail::valid_error<E>, "E cannot be used as an error type");
+
+    public:
+        constexpr unexpected(const unexpected &) = default;
+        constexpr unexpected(unexpected &&) = default;
+
+        template <typename Err = E>
+            requires(!is_same_v<remove_cvref_t<Err>, unexpected> && !is_same_v<remove_cvref_t<Err>, in_place_t> &&
+                     is_constructible_v<E, Err>)
+        constexpr explicit unexpected(Err &&error)
+            : error_(minstd::forward<Err>(error))
+        {
+        }
+
+        template <typename... Args>
+            requires is_constructible_v<E, Args...>
+        constexpr explicit unexpected(in_place_t, Args &&...args)
+            : error_(minstd::forward<Args>(args)...)
+        {
+        }
+
+        template <typename U, typename... Args>
+            requires is_constructible_v<E, ::std::initializer_list<U> &, Args...>
+        constexpr explicit unexpected(in_place_t, ::std::initializer_list<U> list, Args &&...args)
+            : error_(list, minstd::forward<Args>(args)...)
+        {
+        }
+
+        constexpr unexpected &operator=(const unexpected &) = default;
+        constexpr unexpected &operator=(unexpected &&) = default;
+
+        constexpr const E &error() const & noexcept
+        {
+            return error_;
+        }
+
+        constexpr E &error() & noexcept
+        {
+            return error_;
+        }
+
+        constexpr const E &&error() const && noexcept
+        {
+            return minstd::move(error_);
+        }
+
+        constexpr E &&error() && noexcept
+        {
+            return minstd::move(error_);
+        }
+
+        constexpr void swap(unexpected &other) noexcept(is_nothrow_swappable_v<E>)
+        {
+            static_assert(is_swappable_v<E>);
+
+            using MINIMAL_STD_NAMESPACE::swap;
+            swap(error_, other.error_);
+        }
+
+        friend constexpr void swap(unexpected &lhs, unexpected &rhs) noexcept(noexcept(lhs.swap(rhs)))
+            requires is_swappable_v<E>
+        {
+            lhs.swap(rhs);
+        }
+
+        template <typename E2>
+            requires expected_detail::equality_checkable<E, E2>
+        friend constexpr bool operator==(const unexpected &lhs, const unexpected<E2> &rhs)
+        {
+            return lhs.error() == rhs.error();
+        }
+
+    private:
+        E error_;
+    };
+
+    template <typename E>
+    unexpected(E) -> unexpected<E>;
+
+    template <typename T, typename E>
+    class expected
+    {
+        static_assert(expected_detail::valid_value<T>, "T cannot be used as a value type");
+        static_assert(expected_detail::valid_error<E>, "E cannot be used as an error type");
+
+    public:
+        using value_type = T;
+        using error_type = E;
+        using unexpected_type = unexpected<E>;
+
+        template <typename U>
+        using rebind = expected<U, error_type>;
+
+        constexpr expected()
+            requires is_default_constructible_v<T>
+            : value_(),
+              has_value_(true)
+        {
+        }
+
+        constexpr expected(const expected &) = delete;
+
+        constexpr expected(const expected &)
+            requires expected_detail::trivially_copy_constructible_members<T, E>
+        = default;
+
+        constexpr expected(const expected &other)
+            requires expected_detail::copy_constructible_members<T, E>
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(other);
+        }
+
+        constexpr expected(expected &&)
+            requires expected_detail::trivially_move_constructible_members<T, E>
+        = default;
+
+        constexpr expected(expected &&other) noexcept(is_nothrow_move_constructible_v<T> &&
+                                                      is_nothrow_move_constructible_v<E>)
+            requires expected_detail::move_constructible_members<T, E>
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(minstd::move(other));
+        }
+
+        template <typename U, typename G>
+            requires expected_detail::convertible_expected<T, E, U, G, add_lvalue_reference_t<const U>, const G &>
+        constexpr explicit(!is_convertible_v<add_lvalue_reference_t<const U>, T> || !is_convertible_v<const G &, E>)
+            expected(const expected<U, G> &other)
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(other);
+        }
+
+        template <typename U, typename G>
+            requires expected_detail::convertible_expected<T, E, U, G, U, G>
+        constexpr explicit(!is_convertible_v<U, T> || !is_convertible_v<G, E>) expected(expected<U, G> &&other)
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(minstd::move(other));
+        }
+
+        template <typename U = remove_cv_t<T>>
+            requires expected_detail::value_argument<T, expected, U>
+        constexpr explicit(!is_convertible_v<U, T>) expected(U &&value)
+            : value_(minstd::forward<U>(value)),
+              has_value_(true)
+        {
+        }
+
+        template <typename G>
+            requires is_constructible_v<E, const G &>
+        constexpr explicit(!is_convertible_v<const G &, E>) expected(const unexpected<G> &error)
+            : error_(error.error()),
+              has_value_(false)
+        {
+        }
+
+        template <typename G>
+            requires is_constructible_v<E, G>
+        constexpr explicit(!is_convertible_v<G, E>) expected(unexpected<G> &&error)
+            : error_(minstd::move(error).error()),
+              has_value_(false)
+        {
+        }
+
+        template <typename... Args>
+            requires is_constructible_v<T, Args...>
+        constexpr explicit expected(in_place_t, Args &&...args)
+            : value_(minstd::forward<Args>(args)...),
+              has_value_(true)
+        {
+        }
+
+        template <typename U, typename... Args>
+            requires is_constructible_v<T, ::std::initializer_list<U> &, Args...>
+        constexpr explicit expected(in_place_t, ::std::initializer_list<U> list, Args &&...args)
+            : value_(list, minstd::forward<Args>(args)...),
+              has_value_(true)
+        {
+        }
+
+        template <typename... Args>
+            requires is_constructible_v<E, Args...>
+        constexpr explicit expected(unexpect_t, Args &&...args)
+            : error_(minstd::forward<Args>(args)...),
+              has_value_(false)
+        {
+        }
+
+        template <typename U, typename... Args>
+            requires is_constructible_v<E, ::std::initializer_list<U> &, Args...>
+        constexpr explicit expected(unexpect_t, ::std::initializer_list<U> list, Args &&...args)
+            : error_(list, minstd::forward<Args>(args)...),
+              has_value_(false)
+        {
+        }
+
+        constexpr ~expected()
+            requires(is_trivially_destructible_v<T> && is_trivially_destructible_v<E>)
+        = default;
+
+        constexpr ~expected()
+        {
+            if (has_value_)
+            {
+                expected_detail::destroy_member(value_);
+            }
+            else
+            {
+                expected_detail::destroy_member(error_);
+            }
+        }
+
+        //  Assignment between two values or two errors assigns the member; otherwise the old member is destroyed.
+        //      One of T and E must be nothrow move constructible.
+
+        constexpr expected &operator=(const expected &) = delete;
+
+        constexpr expected &operator=(const expected &other)
+            requires(expected_detail::copy_assignable_member<T> && expected_detail::copy_assignable_member<E> &&
+                     (is_nothrow_move_constructible_v<T> || is_nothrow_move_constructible_v<E>))
+        {
+            if (other.has_value_)
+            {
+                assign_value(other.value_);
+            }
+            else
+            {
+                assign_error(other.error_);
+            }
+
+            return *this;
+        }
+
+        constexpr expected &operator=(expected &&other) noexcept(is_nothrow_move_assignable_v<T> &&
+                                                                 is_nothrow_move_constructible_v<T> &&
+                                                                 is_nothrow_move_assignable_v<E> &&
+                                                                 is_nothrow_move_constructible_v<E>)
+            requires(expected_detail::move_assignable_member<T> && expected_detail::move_assignable_member<E> &&
+                     (is_nothrow_move_constructible_v<T> || is_nothrow_move_constructible_v<E>))
+        {
+            if (other.has_value_)
+            {
+                assign_value(minstd::move(other.value_));
+            }
+            else
+            {
+                assign_error(minstd::move(other.error_));
+            }
+
+            return *this;
+        }
+
+        template <typename U = remove_cv_t<T>>
+            requires(!is_same_v<remove_cvref_t<U>, expected> &&
+                     !expected_detail::is_unexpected_v<remove_cvref_t<U>> && is_constructible_v<T, U> &&
+                     is_assignable_v<T &, U> &&
+                     (is_nothrow_constructible_v<T, U> || is_nothrow_move_constructible_v<T> ||
+                      is_nothrow_move_constructible_v<E>))
+        constexpr expected &operator=(U &&value)
+        {
+            assign_value(minstd::forward<U>(value));
+            return *this;
+        }
+
+        template <typename G>
+            requires(is_constructible_v<E, const G &> && is_assignable_v<E &, const G &> &&
+                     (is_nothrow_constructible_v<E, const G &> || is_nothrow_move_constructible_v<T> ||
+                      is_nothrow_move_constructible_v<E>))
+        constexpr expected &operator=(const unexpected<G> &error)
+        {
+            assign_error(error.error());
+            return *this;
+        }
+
+        template <typename G>
+            requires(is_constructible_v<E, G> && is_assignable_v<E &, G> &&
+                     (is_nothrow_constructible_v<E, G> || is_nothrow_move_constructible_v<T> ||
+                      is_nothrow_move_constructible_v<E>))
+        constexpr expected &operator=(unexpected<G> &&error)
+        {
+            assign_error(minstd::move(error).error());
+            return *this;
+        }
+
+        template <typename... Args>
+            requires is_nothrow_constructible_v<T, Args...>
+        constexpr T &emplace(Args &&...args) noexcept
+        {
+            return emplace_value(minstd::forward<Args>(args)...);
+        }
+
+        template <typename U, typename... Args>
+            requires is_nothrow_constructible_v<T, ::std::initializer_list<U> &, Args...>
+        constexpr T &emplace(::std::initializer_list<U> list, Args &&...args) noexcept
+        {
+            return emplace_value(list, minstd::forward<Args>(args)...);
+        }
+
+        constexpr void swap(expected &other) noexcept(is_nothrow_move_constructible_v<T> && is_nothrow_swappable_v<T> &&
+                                                      is_nothrow_move_constructible_v<E> && is_nothrow_swappable_v<E>)
+            requires(expected_detail::swappable_member<T> && expected_detail::swappable_member<E> &&
+                     (is_nothrow_move_constructible_v<T> || is_nothrow_move_constructible_v<E>))
+        {
+            using MINIMAL_STD_NAMESPACE::swap;
+
+            if (has_value_ && other.has_value_)
+            {
+                swap(value_, other.value_);
+            }
+            else if (has_value_)
+            {
+                exchange_value_for_error(*this, other);
+            }
+            else if (other.has_value_)
+            {
+                exchange_value_for_error(other, *this);
+            }
+            else
+            {
+                swap(error_, other.error_);
+            }
+        }
+
+        friend constexpr void swap(expected &lhs, expected &rhs) noexcept(noexcept(lhs.swap(rhs)))
+            requires requires { lhs.swap(rhs); }
+        {
+            lhs.swap(rhs);
+        }
+
+        constexpr bool has_value() const noexcept
+        {
+            return has_value_;
+        }
+
+        constexpr explicit operator bool() const noexcept
+        {
+            return has_value_;
+        }
+
+        //  operator-> and operator* are unchecked: has_value() must be true.
+
+        constexpr T *operator->() noexcept
+        {
+            return __builtin_addressof(value_);
+        }
+
+        constexpr const T *operator->() const noexcept
+        {
+            return __builtin_addressof(value_);
+        }
+
+        constexpr T &operator*() & noexcept
+        {
+            return value_;
+        }
+
+        constexpr const T &operator*() const & noexcept
+        {
+            return value_;
+        }
+
+        constexpr T &&operator*() && noexcept
+        {
+            return minstd::move(value_);
+        }
+
+        constexpr const T &&operator*() const && noexcept
+        {
+            return minstd::move(value_);
+        }
+
+        //  The static_asserts are std::expected's requirements, where it copies the error into its exception.
+
+        constexpr T &value() &
+        {
+            static_assert(is_copy_constructible_v<E>);
+            require_value();
+            return value_;
+        }
+
+        constexpr const T &value() const &
+        {
+            static_assert(is_copy_constructible_v<E>);
+            require_value();
+            return value_;
+        }
+
+        constexpr T &&value() &&
+        {
+            static_assert(is_copy_constructible_v<E> && is_constructible_v<E, E &&>);
+            require_value();
+            return minstd::move(value_);
+        }
+
+        constexpr const T &&value() const &&
+        {
+            static_assert(is_copy_constructible_v<E> && is_constructible_v<E, const E &&>);
+            require_value();
+            return minstd::move(value_);
+        }
+
+        constexpr E &error() & noexcept
+        {
+            require_error();
+            return error_;
+        }
+
+        constexpr const E &error() const & noexcept
+        {
+            require_error();
+            return error_;
+        }
+
+        constexpr E &&error() && noexcept
+        {
+            require_error();
+            return minstd::move(error_);
+        }
+
+        constexpr const E &&error() const && noexcept
+        {
+            require_error();
+            return minstd::move(error_);
+        }
+
+        template <typename U = remove_cv_t<T>>
+        constexpr T value_or(U &&default_value) const &
+        {
+            static_assert(is_copy_constructible_v<T> && is_convertible_v<U, T>);
+
+            if (has_value_)
+            {
+                return value_;
+            }
+
+            return static_cast<T>(minstd::forward<U>(default_value));
+        }
+
+        template <typename U = remove_cv_t<T>>
+        constexpr T value_or(U &&default_value) &&
+        {
+            static_assert(is_move_constructible_v<T> && is_convertible_v<U, T>);
+
+            if (has_value_)
+            {
+                return minstd::move(value_);
+            }
+
+            return static_cast<T>(minstd::forward<U>(default_value));
+        }
+
+        template <typename G = E>
+        constexpr E error_or(G &&default_error) const &
+        {
+            static_assert(is_copy_constructible_v<E> && is_convertible_v<G, E>);
+
+            if (!has_value_)
+            {
+                return error_;
+            }
+
+            return minstd::forward<G>(default_error);
+        }
+
+        template <typename G = E>
+        constexpr E error_or(G &&default_error) &&
+        {
+            static_assert(is_move_constructible_v<E> && is_convertible_v<G, E>);
+
+            if (!has_value_)
+            {
+                return minstd::move(error_);
+            }
+
+            return minstd::forward<G>(default_error);
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &>
+        constexpr auto and_then(F &&f) &
+        {
+            return and_then_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &>
+        constexpr auto and_then(F &&f) const &
+        {
+            return and_then_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &&>
+        constexpr auto and_then(F &&f) &&
+        {
+            return and_then_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &&>
+        constexpr auto and_then(F &&f) const &&
+        {
+            return and_then_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, T &>
+        constexpr auto or_else(F &&f) &
+        {
+            return or_else_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, const T &>
+        constexpr auto or_else(F &&f) const &
+        {
+            return or_else_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, T &&>
+        constexpr auto or_else(F &&f) &&
+        {
+            return or_else_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, const T &&>
+        constexpr auto or_else(F &&f) const &&
+        {
+            return or_else_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &>
+        constexpr auto transform(F &&f) &
+        {
+            return transform_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &>
+        constexpr auto transform(F &&f) const &
+        {
+            return transform_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &&>
+        constexpr auto transform(F &&f) &&
+        {
+            return transform_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &&>
+        constexpr auto transform(F &&f) const &&
+        {
+            return transform_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, T &>
+        constexpr auto transform_error(F &&f) &
+        {
+            return transform_error_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, const T &>
+        constexpr auto transform_error(F &&f) const &
+        {
+            return transform_error_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, T &&>
+        constexpr auto transform_error(F &&f) &&
+        {
+            return transform_error_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<T, const T &&>
+        constexpr auto transform_error(F &&f) const &&
+        {
+            return transform_error_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename T2, typename E2>
+            requires(!is_void_v<T2> && expected_detail::equality_checkable<T, T2> &&
+                     expected_detail::equality_checkable<E, E2>)
+        friend constexpr bool operator==(const expected &lhs, const expected<T2, E2> &rhs)
+        {
+            if (lhs.has_value() != rhs.has_value())
+            {
+                return false;
+            }
+
+            if (lhs.has_value())
+            {
+                return *lhs == *rhs;
+            }
+
+            return lhs.error() == rhs.error();
+        }
+
+        template <typename T2>
+            requires(!expected_detail::expected_like<T2> && expected_detail::equality_checkable<T, T2>)
+        friend constexpr bool operator==(const expected &lhs, const T2 &value)
+        {
+            return lhs.has_value() && static_cast<bool>(*lhs == value);
+        }
+
+        template <typename E2>
+            requires expected_detail::equality_checkable<E, E2>
+        friend constexpr bool operator==(const expected &lhs, const unexpected<E2> &error)
+        {
+            return !lhs.has_value() && static_cast<bool>(lhs.error() == error.error());
+        }
+
+    private:
+        template <typename, typename>
+        friend class expected;
+
+        union
+        {
+            char empty_;
+            T value_;
+            E error_;
+        };
+
+        bool has_value_;
+
+        template <typename F, typename... Args>
+        constexpr expected(expected_detail::invoke_value_t, F &&f, Args &&...args)
+            : value_(minstd::__invoke(minstd::forward<F>(f), minstd::forward<Args>(args)...)),
+              has_value_(true)
+        {
+        }
+
+        template <typename F, typename... Args>
+        constexpr expected(expected_detail::invoke_error_t, F &&f, Args &&...args)
+            : error_(minstd::__invoke(minstd::forward<F>(f), minstd::forward<Args>(args)...)),
+              has_value_(false)
+        {
+        }
+
+        constexpr void require_value() const
+        {
+            if (!has_value_)
+            {
+                minstd::invalid_expected_access(__FILE__, __LINE__);
+            }
+        }
+
+        constexpr void require_error() const
+        {
+            if (has_value_)
+            {
+                minstd::invalid_expected_access(__FILE__, __LINE__);
+            }
+        }
+
+        //  has_value_ must already match other's.
+        template <typename Other>
+        constexpr void construct_from(Other &&other)
+        {
+            if (has_value_)
+            {
+                expected_detail::construct_member(value_, minstd::forward<Other>(other).value_);
+            }
+            else
+            {
+                expected_detail::construct_member(error_, minstd::forward<Other>(other).error_);
+            }
+        }
+
+        template <typename U>
+        constexpr void assign_value(U &&value)
+        {
+            if (has_value_)
+            {
+                value_ = minstd::forward<U>(value);
+            }
+            else
+            {
+                expected_detail::replace_member(value_, error_, minstd::forward<U>(value));
+                has_value_ = true;
+            }
+        }
+
+        template <typename G>
+        constexpr void assign_error(G &&error)
+        {
+            if (has_value_)
+            {
+                expected_detail::replace_member(error_, value_, minstd::forward<G>(error));
+                has_value_ = false;
+            }
+            else
+            {
+                error_ = minstd::forward<G>(error);
+            }
+        }
+
+        template <typename... Args>
+        constexpr T &emplace_value(Args &&...args)
+        {
+            if (has_value_)
+            {
+                expected_detail::destroy_member(value_);
+            }
+            else
+            {
+                expected_detail::destroy_member(error_);
+                has_value_ = true;
+            }
+
+            expected_detail::construct_member(value_, minstd::forward<Args>(args)...);
+            return value_;
+        }
+
+        //  The member that can be moved without throwing is the one held aside.
+        static constexpr void exchange_value_for_error(expected &with_value, expected &with_error)
+        {
+            if constexpr (is_nothrow_move_constructible_v<E>)
+            {
+                E held(minstd::move(with_error.error_));
+                expected_detail::destroy_member(with_error.error_);
+                expected_detail::construct_member(with_error.value_, minstd::move(with_value.value_));
+                expected_detail::destroy_member(with_value.value_);
+                expected_detail::construct_member(with_value.error_, minstd::move(held));
+            }
+            else
+            {
+                T held(minstd::move(with_value.value_));
+                expected_detail::destroy_member(with_value.value_);
+                expected_detail::construct_member(with_value.error_, minstd::move(with_error.error_));
+                expected_detail::destroy_member(with_error.error_);
+                expected_detail::construct_member(with_error.value_, minstd::move(held));
+            }
+
+            with_value.has_value_ = false;
+            with_error.has_value_ = true;
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto and_then_on(Self &&self, F &&f)
+        {
+            using result_type = remove_cvref_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).value_))>>;
+            static_assert(expected_detail::expected_like<result_type>, "and_then's function must return an expected");
+            static_assert(is_same_v<typename result_type::error_type, E>, "and_then cannot change the error type");
+
+            if (self.has_value_)
+            {
+                return minstd::__invoke(minstd::forward<F>(f), minstd::forward<Self>(self).value_);
+            }
+
+            return result_type(unexpect, minstd::forward<Self>(self).error_);
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto or_else_on(Self &&self, F &&f)
+        {
+            using result_type = remove_cvref_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).error_))>>;
+            static_assert(expected_detail::expected_like<result_type>, "or_else's function must return an expected");
+            static_assert(is_same_v<typename result_type::value_type, T>, "or_else cannot change the value type");
+
+            if (self.has_value_)
+            {
+                return result_type(in_place, minstd::forward<Self>(self).value_);
+            }
+
+            return result_type(minstd::__invoke(minstd::forward<F>(f), minstd::forward<Self>(self).error_));
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto transform_on(Self &&self, F &&f)
+        {
+            using new_value_type = remove_cv_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).value_))>>;
+            using result_type = expected<new_value_type, E>;
+
+            if (!self.has_value_)
+            {
+                return result_type(unexpect, minstd::forward<Self>(self).error_);
+            }
+
+            if constexpr (is_void_v<new_value_type>)
+            {
+                minstd::__invoke(minstd::forward<F>(f), minstd::forward<Self>(self).value_);
+                return result_type();
+            }
+            else
+            {
+                return result_type(expected_detail::invoke_value_t{}, minstd::forward<F>(f),
+                                   minstd::forward<Self>(self).value_);
+            }
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto transform_error_on(Self &&self, F &&f)
+        {
+            using new_error_type = remove_cv_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).error_))>>;
+            using result_type = expected<T, new_error_type>;
+
+            if (self.has_value_)
+            {
+                return result_type(in_place, minstd::forward<Self>(self).value_);
+            }
+
+            return result_type(expected_detail::invoke_error_t{}, minstd::forward<F>(f),
+                               minstd::forward<Self>(self).error_);
+        }
+    };
+
+    template <typename T, typename E>
+        requires is_void_v<T>
+    class expected<T, E>
+    {
+        static_assert(expected_detail::valid_error<E>, "E cannot be used as an error type");
+
+    public:
+        using value_type = T;
+        using error_type = E;
+        using unexpected_type = unexpected<E>;
+
+        template <typename U>
+        using rebind = expected<U, error_type>;
+
+        constexpr expected() noexcept
+            : empty_(),
+              has_value_(true)
+        {
+        }
+
+        constexpr expected(const expected &) = delete;
+
+        constexpr expected(const expected &)
+            requires expected_detail::trivially_copy_constructible_members<E>
+        = default;
+
+        constexpr expected(const expected &other)
+            requires expected_detail::copy_constructible_members<E>
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(other);
+        }
+
+        constexpr expected(expected &&)
+            requires expected_detail::trivially_move_constructible_members<E>
+        = default;
+
+        constexpr expected(expected &&other) noexcept(is_nothrow_move_constructible_v<E>)
+            requires expected_detail::move_constructible_members<E>
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(minstd::move(other));
+        }
+
+        template <typename U, typename G>
+            requires expected_detail::convertible_expected<T, E, U, G, void, const G &>
+        constexpr explicit(!is_convertible_v<const G &, E>) expected(const expected<U, G> &other)
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(other);
+        }
+
+        template <typename U, typename G>
+            requires expected_detail::convertible_expected<T, E, U, G, void, G>
+        constexpr explicit(!is_convertible_v<G, E>) expected(expected<U, G> &&other)
+            : empty_(),
+              has_value_(other.has_value_)
+        {
+            construct_from(minstd::move(other));
+        }
+
+        template <typename G>
+            requires is_constructible_v<E, const G &>
+        constexpr explicit(!is_convertible_v<const G &, E>) expected(const unexpected<G> &error)
+            : error_(error.error()),
+              has_value_(false)
+        {
+        }
+
+        template <typename G>
+            requires is_constructible_v<E, G>
+        constexpr explicit(!is_convertible_v<G, E>) expected(unexpected<G> &&error)
+            : error_(minstd::move(error).error()),
+              has_value_(false)
+        {
+        }
+
+        constexpr explicit expected(in_place_t) noexcept
+            : empty_(),
+              has_value_(true)
+        {
+        }
+
+        template <typename... Args>
+            requires is_constructible_v<E, Args...>
+        constexpr explicit expected(unexpect_t, Args &&...args)
+            : error_(minstd::forward<Args>(args)...),
+              has_value_(false)
+        {
+        }
+
+        template <typename U, typename... Args>
+            requires is_constructible_v<E, ::std::initializer_list<U> &, Args...>
+        constexpr explicit expected(unexpect_t, ::std::initializer_list<U> list, Args &&...args)
+            : error_(list, minstd::forward<Args>(args)...),
+              has_value_(false)
+        {
+        }
+
+        constexpr ~expected()
+            requires is_trivially_destructible_v<E>
+        = default;
+
+        constexpr ~expected()
+        {
+            if (!has_value_)
+            {
+                expected_detail::destroy_member(error_);
+            }
+        }
+
+        constexpr expected &operator=(const expected &) = delete;
+
+        constexpr expected &operator=(const expected &other)
+            requires expected_detail::copy_assignable_member<E>
+        {
+            if (other.has_value_)
+            {
+                emplace();
+            }
+            else
+            {
+                assign_error(other.error_);
+            }
+
+            return *this;
+        }
+
+        constexpr expected &operator=(expected &&other) noexcept(is_nothrow_move_constructible_v<E> &&
+                                                                 is_nothrow_move_assignable_v<E>)
+            requires expected_detail::move_assignable_member<E>
+        {
+            if (other.has_value_)
+            {
+                emplace();
+            }
+            else
+            {
+                assign_error(minstd::move(other.error_));
+            }
+
+            return *this;
+        }
+
+        template <typename G>
+            requires(is_constructible_v<E, const G &> && is_assignable_v<E &, const G &>)
+        constexpr expected &operator=(const unexpected<G> &error)
+        {
+            assign_error(error.error());
+            return *this;
+        }
+
+        template <typename G>
+            requires(is_constructible_v<E, G> && is_assignable_v<E &, G>)
+        constexpr expected &operator=(unexpected<G> &&error)
+        {
+            assign_error(minstd::move(error).error());
+            return *this;
+        }
+
+        constexpr void emplace() noexcept
+        {
+            if (!has_value_)
+            {
+                expected_detail::destroy_member(error_);
+                has_value_ = true;
+            }
+        }
+
+        constexpr void swap(expected &other) noexcept(is_nothrow_move_constructible_v<E> &&
+                                                      is_nothrow_swappable_v<E>)
+            requires expected_detail::swappable_member<E>
+        {
+            using MINIMAL_STD_NAMESPACE::swap;
+
+            if (has_value_ && !other.has_value_)
+            {
+                move_error(other, *this);
+            }
+            else if (!has_value_ && other.has_value_)
+            {
+                move_error(*this, other);
+            }
+            else if (!has_value_)
+            {
+                swap(error_, other.error_);
+            }
+        }
+
+        friend constexpr void swap(expected &lhs, expected &rhs) noexcept(noexcept(lhs.swap(rhs)))
+            requires requires { lhs.swap(rhs); }
+        {
+            lhs.swap(rhs);
+        }
+
+        constexpr bool has_value() const noexcept
+        {
+            return has_value_;
+        }
+
+        constexpr explicit operator bool() const noexcept
+        {
+            return has_value_;
+        }
+
+        //  Unchecked: has_value() must be true.
+
+        constexpr void operator*() const noexcept
+        {
+        }
+
+        constexpr void value() const &
+        {
+            static_assert(is_copy_constructible_v<E>);
+            require_value();
+        }
+
+        constexpr void value() &&
+        {
+            static_assert(is_copy_constructible_v<E> && is_move_constructible_v<E>);
+            require_value();
+        }
+
+        constexpr E &error() & noexcept
+        {
+            require_error();
+            return error_;
+        }
+
+        constexpr const E &error() const & noexcept
+        {
+            require_error();
+            return error_;
+        }
+
+        constexpr E &&error() && noexcept
+        {
+            require_error();
+            return minstd::move(error_);
+        }
+
+        constexpr const E &&error() const && noexcept
+        {
+            require_error();
+            return minstd::move(error_);
+        }
+
+        template <typename G = E>
+        constexpr E error_or(G &&default_error) const &
+        {
+            static_assert(is_copy_constructible_v<E> && is_convertible_v<G, E>);
+
+            if (!has_value_)
+            {
+                return error_;
+            }
+
+            return minstd::forward<G>(default_error);
+        }
+
+        template <typename G = E>
+        constexpr E error_or(G &&default_error) &&
+        {
+            static_assert(is_move_constructible_v<E> && is_convertible_v<G, E>);
+
+            if (!has_value_)
+            {
+                return minstd::move(error_);
+            }
+
+            return minstd::forward<G>(default_error);
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &>
+        constexpr auto and_then(F &&f) &
+        {
+            return and_then_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &>
+        constexpr auto and_then(F &&f) const &
+        {
+            return and_then_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &&>
+        constexpr auto and_then(F &&f) &&
+        {
+            return and_then_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &&>
+        constexpr auto and_then(F &&f) const &&
+        {
+            return and_then_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto or_else(F &&f) &
+        {
+            return or_else_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto or_else(F &&f) const &
+        {
+            return or_else_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto or_else(F &&f) &&
+        {
+            return or_else_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto or_else(F &&f) const &&
+        {
+            return or_else_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &>
+        constexpr auto transform(F &&f) &
+        {
+            return transform_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &>
+        constexpr auto transform(F &&f) const &
+        {
+            return transform_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, E &&>
+        constexpr auto transform(F &&f) &&
+        {
+            return transform_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+            requires is_constructible_v<E, const E &&>
+        constexpr auto transform(F &&f) const &&
+        {
+            return transform_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto transform_error(F &&f) &
+        {
+            return transform_error_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto transform_error(F &&f) const &
+        {
+            return transform_error_on(*this, minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto transform_error(F &&f) &&
+        {
+            return transform_error_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename F>
+        constexpr auto transform_error(F &&f) const &&
+        {
+            return transform_error_on(minstd::move(*this), minstd::forward<F>(f));
+        }
+
+        template <typename T2, typename E2>
+            requires(is_void_v<T2> && expected_detail::equality_checkable<E, E2>)
+        friend constexpr bool operator==(const expected &lhs, const expected<T2, E2> &rhs)
+        {
+            if (lhs.has_value() != rhs.has_value())
+            {
+                return false;
+            }
+
+            return lhs.has_value() || static_cast<bool>(lhs.error() == rhs.error());
+        }
+
+        template <typename E2>
+            requires expected_detail::equality_checkable<E, E2>
+        friend constexpr bool operator==(const expected &lhs, const unexpected<E2> &error)
+        {
+            return !lhs.has_value() && static_cast<bool>(lhs.error() == error.error());
+        }
+
+    private:
+        template <typename, typename>
+        friend class expected;
+
+        union
+        {
+            char empty_;
+            E error_;
+        };
+
+        bool has_value_;
+
+        template <typename F, typename... Args>
+        constexpr expected(expected_detail::invoke_error_t, F &&f, Args &&...args)
+            : error_(minstd::__invoke(minstd::forward<F>(f), minstd::forward<Args>(args)...)),
+              has_value_(false)
+        {
+        }
+
+        constexpr void require_value() const
+        {
+            if (!has_value_)
+            {
+                minstd::invalid_expected_access(__FILE__, __LINE__);
+            }
+        }
+
+        constexpr void require_error() const
+        {
+            if (has_value_)
+            {
+                minstd::invalid_expected_access(__FILE__, __LINE__);
+            }
+        }
+
+        //  has_value_ must already match other's.
+        template <typename Other>
+        constexpr void construct_from(Other &&other)
+        {
+            if (!has_value_)
+            {
+                expected_detail::construct_member(error_, minstd::forward<Other>(other).error_);
+            }
+        }
+
+        template <typename G>
+        constexpr void assign_error(G &&error)
+        {
+            if (has_value_)
+            {
+                expected_detail::construct_member(error_, minstd::forward<G>(error));
+                has_value_ = false;
+            }
+            else
+            {
+                error_ = minstd::forward<G>(error);
+            }
+        }
+
+        static constexpr void move_error(expected &from, expected &to)
+        {
+            expected_detail::construct_member(to.error_, minstd::move(from.error_));
+            expected_detail::destroy_member(from.error_);
+            to.has_value_ = false;
+            from.has_value_ = true;
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto and_then_on(Self &&self, F &&f)
+        {
+            using result_type = remove_cvref_t<invoke_result_t<F>>;
+            static_assert(expected_detail::expected_like<result_type>, "and_then's function must return an expected");
+            static_assert(is_same_v<typename result_type::error_type, E>, "and_then cannot change the error type");
+
+            if (self.has_value_)
+            {
+                return minstd::__invoke(minstd::forward<F>(f));
+            }
+
+            return result_type(unexpect, minstd::forward<Self>(self).error_);
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto or_else_on(Self &&self, F &&f)
+        {
+            using result_type = remove_cvref_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).error_))>>;
+            static_assert(expected_detail::expected_like<result_type>, "or_else's function must return an expected");
+            static_assert(is_same_v<typename result_type::value_type, T>, "or_else cannot change the value type");
+
+            if (self.has_value_)
+            {
+                return result_type();
+            }
+
+            return result_type(minstd::__invoke(minstd::forward<F>(f), minstd::forward<Self>(self).error_));
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto transform_on(Self &&self, F &&f)
+        {
+            using new_value_type = remove_cv_t<invoke_result_t<F>>;
+            using result_type = expected<new_value_type, E>;
+
+            if (!self.has_value_)
+            {
+                return result_type(unexpect, minstd::forward<Self>(self).error_);
+            }
+
+            if constexpr (is_void_v<new_value_type>)
+            {
+                minstd::__invoke(minstd::forward<F>(f));
+                return result_type();
+            }
+            else
+            {
+                return result_type(expected_detail::invoke_value_t{}, minstd::forward<F>(f));
+            }
+        }
+
+        template <typename Self, typename F>
+        static constexpr auto transform_error_on(Self &&self, F &&f)
+        {
+            using new_error_type = remove_cv_t<invoke_result_t<F, decltype((minstd::forward<Self>(self).error_))>>;
+            using result_type = expected<T, new_error_type>;
+
+            if (self.has_value_)
+            {
+                return result_type();
+            }
+
+            return result_type(expected_detail::invoke_error_t{}, minstd::forward<F>(f),
+                               minstd::forward<Self>(self).error_);
+        }
+    };
+} // namespace MINIMAL_STD_NAMESPACE

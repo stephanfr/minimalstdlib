@@ -160,6 +160,28 @@ namespace MINIMAL_STD_NAMESPACE
 #error "Invalid MINIMAL_STD_FAILURE_POLICY value"
 #endif
     }
+
+    //  value() on an expected holding an error, or error() on one holding a value: std::expected would throw.
+
+    inline void invalid_expected_access(const char *file,
+                                        int line)
+    {
+        failure_hook_type hook = failure_hook_storage();
+
+        if (hook != nullptr)
+        {
+            hook("invalid_expected_access", "invalid_expected_access", file, line);
+        }
+
+#if MINIMAL_STD_FAILURE_POLICY == MINIMAL_STD_FAILURE_POLICY_DEFAULT
+        __builtin_trap();
+        __builtin_unreachable();
+#elif MINIMAL_STD_FAILURE_POLICY == MINIMAL_STD_FAILURE_POLICY_TEST
+        return;
+#else
+#error "Invalid MINIMAL_STD_FAILURE_POLICY value"
+#endif
+    }
 }
 
 #define MINIMAL_STD_ASSERT(expression)                                                  \
@@ -224,6 +246,5 @@ constexpr size_t DEFAULT_FIXED_STRING_MAX_SIZE = 64;
 
 constexpr size_t DEFAULT_DYNAMIC_STRING_SIZE = 64;
 constexpr size_t DEFAULT_DYNAMIC_STRING_MAX_SIZE = 16384;
-constexpr double DYNAMIC_STRING_OVERALLOCATION_PERCENTAGE = 1.25;
 
 

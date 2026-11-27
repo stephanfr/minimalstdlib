@@ -75,6 +75,7 @@
 #include <__type_traits/is_trivially_assignable.h>
 #include <__type_traits/is_trivially_constructible.h>
 #include <__type_traits/is_trivially_copyable.h>
+#include <__type_traits/is_trivially_destructible.h>
 #include <__type_traits/underlying_type.h>
 #include <__type_traits/is_union.h>
 #include <__type_traits/is_unsigned.h>

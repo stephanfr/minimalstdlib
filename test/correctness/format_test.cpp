@@ -353,7 +353,43 @@ namespace
         STRCMP_EQUAL("  inf", minstd::format(buffer, "{:5}", __builtin_inff()).c_str());
         STRCMP_EQUAL("2000000000000000.0000", minstd::format(buffer, "{}", 2e15).c_str());
         STRCMP_EQUAL("100000000000000000000.00", minstd::format(buffer, "{:.2}", 1e20).c_str());
-        STRCMP_EQUAL("-30000000000000000000000000000000.0", minstd::format(buffer, "{:.1}", -3e31).c_str());
+        STRCMP_EQUAL("-29999999999999998907688884895744.0", minstd::format(buffer, "{:.1}", -3e31).c_str());
+        STRCMP_EQUAL("99999999999999991611392", minstd::format(buffer, "{:.0}", 1e23).c_str());
+        STRCMP_EQUAL("18446744073709551616", minstd::format(buffer, "{:.0}", 18446744073709551616.0).c_str());
+    }
+
+    TEST(FormatTests, FloatsFormatFromTheirExactBits)
+    {
+        minstd::fixed_string<128> buffer;
+
+        STRCMP_EQUAL("1.5000", minstd::format(buffer, "{}", __builtin_bit_cast(double, uint64_t{0x3FF8000000000000})).c_str());
+        STRCMP_EQUAL("-0.0000", minstd::format(buffer, "{}", __builtin_bit_cast(double, uint64_t{0x8000000000000000})).c_str());
+        STRCMP_EQUAL("-inf", minstd::format(buffer, "{}", __builtin_bit_cast(double, uint64_t{0xFFF0000000000000})).c_str());
+        STRCMP_EQUAL("nan", minstd::format(buffer, "{}", __builtin_bit_cast(double, uint64_t{0x7FF8000000000000})).c_str());
+        STRCMP_EQUAL("0.000", minstd::format(buffer, "{:.3}", __builtin_bit_cast(double, uint64_t{1})).c_str());
+        STRCMP_EQUAL("  +2.50", minstd::format(buffer, "{:+7.2}", 2.5).c_str());
+    }
+
+    TEST(FormatTests, RandomDeviceReportsItsEntropy)
+    {
+        class unknown_source : public minstd::random_device
+        {
+        public:
+            result_type operator()() override { return 0; }
+        };
+
+        class measured_source : public unknown_source
+        {
+        public:
+            double entropy() const noexcept override { return 32.0; }
+        };
+
+        unknown_source unknown;
+        measured_source measured;
+        const minstd::random_device &through_base = measured;
+
+        CHECK_TRUE(unknown.entropy() == 0.0);
+        CHECK_TRUE(through_base.entropy() == 32.0);
     }
 
     TEST(FormatTests, FullBufferKeepsTheSignAndLeadingDigits)

@@ -16,6 +16,16 @@
 
 namespace MINIMAL_STD_NAMESPACE
 {
+    namespace
+    {
+        //  A quarter again, in integers: the string must work in a build without the FP registers.
+
+        constexpr size_t dynamic_string_overallocation(size_t length)
+        {
+            return length + (length / 4);
+        }
+    }
+
     template <typename T, size_t MAX_SIZE> //  Default value for MAX_SIZE is in the forward declaration at the top of the file
     class basic_dynamic_string : public basic_string<T>
     {
@@ -111,7 +121,7 @@ namespace MINIMAL_STD_NAMESPACE
 
         static size_t compute_buffer_size( size_t length)
         {
-            return minstd::min( (size_t)((length + 1) * DYNAMIC_STRING_OVERALLOCATION_PERCENTAGE), MAX_SIZE + 1);
+            return minstd::min( dynamic_string_overallocation(length + 1), MAX_SIZE + 1);
         }
 
         void grow_buffer_for_string(const T *str) override
@@ -130,7 +140,7 @@ namespace MINIMAL_STD_NAMESPACE
 
             if (basic_string<T>::length_ + chars_needed + 1 > basic_string<T>::buffer_size_)
             {
-                size_t new_buffer_size = minstd::min((size_t)((basic_string<T>::length_ + chars_needed + 1) * DYNAMIC_STRING_OVERALLOCATION_PERCENTAGE), basic_string<T>::max_size_ + 1 );
+                size_t new_buffer_size = minstd::min(dynamic_string_overallocation(basic_string<T>::length_ + chars_needed + 1), basic_string<T>::max_size_ + 1 );
 
                 T *new_buffer = allocator_traits_type::allocate(allocator_, new_buffer_size);
 

@@ -1,0 +1,119 @@
+// Copyright 2026 Stephan Friedl. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "minstdconfig.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "array"
+#include "string_view"
+#include "type_traits"
+
+namespace MINIMAL_STD_NAMESPACE
+{
+    template <typename E>
+    struct statistic_descriptor
+    {
+        E                   which_;
+        string_view         name_;
+        string_view         description_;
+    };
+
+    //  Specialized for each enum a statistics_table is built over: one descriptor per value, in enum order.
+    //
+    //      template <>
+    //      struct minstd::statistics_traits<stack_counters>
+    //      {
+    //          static constexpr array<statistic_descriptor<stack_counters>, 47> DESCRIPTORS = {{ ... }};
+    //      };
+
+    template <typename E>
+    struct statistics_traits;
+
+    template <typename E>
+    concept statistics_enum = is_enum_v<E> && requires {
+        E::COUNT;
+        statistics_traits<E>::DESCRIPTORS;
+    };
+
+    template <statistics_enum E>
+    consteval bool descriptors_in_enum_order() noexcept
+    {
+        const auto &descriptors = statistics_traits<E>::DESCRIPTORS;
+
+        if (descriptors.size() != static_cast<size_t>(E::COUNT))
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < descriptors.size(); i++)
+        {
+            if ((descriptors[i].which_ != static_cast<E>(i)) || descriptors[i].name_.empty())
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    //  Named counters over an enum.  One writer.  Readers on any core see each value whole, never torn, but two
+    //      values read one after the other may be from different moments.
+    //
+    //      statistics_table<stack_counters> statistics;
+    //
+    //      statistics.increment(stack_counters::IP_RECEIVED);
+    //      statistics.for_each([](const auto &descriptor, uint64_t value) { ... descriptor.name_ ... });
+
+    template <statistics_enum E>
+    class statistics_table
+    {
+    private:
+        static_assert(descriptors_in_enum_order<E>(), "one named descriptor per enum value, in enum order");
+
+    public:
+        using descriptor_type = statistic_descriptor<E>;
+
+        static constexpr size_t SIZE = static_cast<size_t>(E::COUNT);
+
+        constexpr statistics_table() noexcept = default;
+
+        statistics_table( const statistics_table & ) = delete;
+        statistics_table &operator=( const statistics_table & ) = delete;
+
+        //  A load and a store, not a read-modify-write: only the one writer may call it.
+        void increment( E which, uint64_t amount = 1 ) noexcept
+        {
+            uint64_t &slot = values_[static_cast<size_t>(which)];
+
+            __atomic_store_n(&slot, slot + amount, __ATOMIC_RELAXED);
+        }
+
+        uint64_t value( E which ) const noexcept
+        {
+            return __atomic_load_n(&values_[static_cast<size_t>(which)], __ATOMIC_RELAXED);
+        }
+
+        static constexpr const descriptor_type &describe( E which ) noexcept
+        {
+            return statistics_traits<E>::DESCRIPTORS[static_cast<size_t>(which)];
+        }
+
+        //  f(const descriptor_type &, uint64_t value), in enum order.
+        template <typename F>
+        void for_each( F &&f ) const
+        {
+            for (size_t i = 0; i < SIZE; i++)
+            {
+                f(statistics_traits<E>::DESCRIPTORS[i], value(static_cast<E>(i)));
+            }
+        }
+
+    private:
+        array<uint64_t, SIZE>      values_{};
+    };
+}
