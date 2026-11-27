@@ -7,6 +7,7 @@
 #include "minstdconfig.h"
 
 #include <format_arg>
+#include <string_view>
 
 namespace FMT_FORMATTERS_NAMESPACE
 {
@@ -230,6 +231,7 @@ namespace FMT_FORMATTERS_NAMESPACE
     DECLARE_TYPE_FORMATTER(const char *, CharacterStringFormatter, DEFAULT_STRING_FORMAT)
 
     DECLARE_TYPE_FORMATTER(const minstd::string &, StdStringFormatter, DEFAULT_STRING_FORMAT)
+    DECLARE_TYPE_FORMATTER(const minstd::string_view &, StringViewFormatter, DEFAULT_STRING_FORMAT)
 
     DECLARE_TYPE_FORMATTER(const uint64_t, Unsigned64BitIntFormatter, DEFAULT_INTEGER_FORMAT)
     DECLARE_TYPE_FORMATTER(const int64_t, Signed64BitIntFormatter, DEFAULT_INTEGER_FORMAT)
